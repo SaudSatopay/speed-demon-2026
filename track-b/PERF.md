@@ -6,9 +6,9 @@
 
 ## Where it loses
 
-- M is 127 MB locally, about 3× the 44 MB where more savings stop counting. Each thread's list is held alongside the final lists while they're built, and postings are 4 bytes each.
-- S is 700 code lines against the reference's 91, which costs about 6.6 speed points.
-- Every token costs a byte-at-a-time hash and at least one table probe.
+- M is about 100 MB locally, more than twice the 44 MB where more savings stop counting.
+- S is 806 code lines against the reference's 91, which costs about 7.1 speed points.
+- Reading a posting list walks a chain, which is slower than reading an array.
 
 ## Where the reference spends its time
 
@@ -21,7 +21,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Step | Change | Why we expected it to help | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | — | — | 56.35 | 2,200 | 0 |
-| 1 | v1: query terms only, bitmaps for common terms, phrases anchored on the rarest term, 12 threads | Most of the corpus's terms aren't asked about, and most tokens trigger no phrase check | run-… | 0.203 *local* | 127.4 *local* | 61.4 *local* |
+| 1 | v1: query terms only, bitmaps for common terms, phrases anchored on the rarest term, 12 threads | Most of the corpus's terms aren't asked about, and most tokens trigger no phrase check | run-35592356e93c | 0.360 | 137.6 | 60.3 |
+| 2 | Block scan, a term table with keys inline, and postings as chains of 2-byte offsets | The profile showed the scan at 75% of the time, and postings were held twice | run-… | 0.194 *local* | 99.3 *local* | 62.4 *local* |
 
 ## Decision log
 
@@ -29,9 +30,13 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D2. Anchor each phrase on its rarest term, not Aho-Corasick.** Context: phrases need matching against 36M tokens. Options: an automaton stepping on every token, or a check around each occurrence of one rare term. Chose: the anchor, which is simpler, and any term gives correct answers. A wrong guess from the sample only costs more checks. Cost: each document's tokens are buffered, which is small. Outcome: kept for now.
 
+**D3. Chains of 2-byte offsets instead of a list and a final copy.** Context: v1 held each posting twice for a moment, 4 bytes in a thread's list and 4 in the final array. Options: compress the lists, or write postings straight to their final place. Chose: a chain of 32-byte blocks per term per thread, each with 14 offsets from a part's first document. Threads cover document order, so no merge or sort is needed. A part holds at most 65,535 documents, and running with few threads exercises several parts. Cost: reading a list now walks a chain, and S grew. Evidence: M 127.4 -> 99.3 MB, T 0.203 -> 0.194 s (local). Outcome: kept.
+
 ## What didn't work
 
-Nothing tried yet.
+| Experiment | What we expected | What we measured | Where | Kept? |
+|---|---|---|---|---|
+| Disabling transparent huge pages, to stop per-thread arenas rounding up to 2 MB | M down by about 39 MB, the part we couldn't account for | M 105.8 -> 97.2 MB, T 0.224 -> 0.190 s on B, but A flat and C and D about 15% slower | local | not kept |
 
 ## The final design
 

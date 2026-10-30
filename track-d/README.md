@@ -13,7 +13,7 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Limits
 
-- M was 70.1 to 70.7 MB over the latest two board runs; the graph takes about 54 MB.
+- M was 67.9 MB on the latest u16-directory board run, down from 70.1 MB before it; the graph takes about 54 MB.
 - The label-page index is 16 bits; a guard rejects graphs if renumbering needs a larger page id.
 - Label-page indexes use 16 bits; a guard rejects a graph if its renumbered pages exceed that range.
 - A query whose distances pass 2^32 runs twice, first in 32 bits and then in 64. There are only a few of these.

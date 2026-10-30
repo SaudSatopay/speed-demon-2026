@@ -5,9 +5,9 @@
 //! allows it, and with block loads where it doesn't. One lock-free table, shared by all threads,
 //! turns endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
 //! where each thread reserves small blocks. When the log is done, threads claim hours: each groups one
-//! hour's array in place, selects its percentiles, formats it, frees it, and waits for its turn to
-//! append to the file. So the output is in a fixed order whatever the scheduling, and never sits in
-//! memory whole.
+//! hour's array with four stable radix passes, formats it, frees it, and waits for its turn to append
+//! to the file. The output vector doubles as aligned radix scratch before it holds text, so output is
+//! in a fixed order whatever the scheduling and never sits in memory whole.
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -310,55 +310,41 @@ fn push_decimal(out: &mut Vec<u8>, value: u64) {
     out.truncate(end);
 }
 
-/// Moves an hour's records into runs by endpoint rank, in place: each record swaps straight into its
-/// endpoint's next free position. Nearly all groups are small, so this one pass does most of the work
-/// of a full sort, and only `select_nth_unstable` remains per group.
-fn group_by_rank(records: &mut [u32], ranks: &[u32]) {
-    let rank_of = |record: u32| ranks[(record >> ID_SHIFT) as usize] as usize;
-    let (mut next, mut ends) = ([0u32; SLOTS], [0u32; SLOTS]);
-    for &record in records.iter() {
-        ends[rank_of(record)] += 1;
+/// One stable pass of an LSD radix sort. The digit is always below `SLOTS`.
+fn radix_pass(from: &[u32], to: &mut [u32], digit: impl Fn(u32) -> usize) {
+    let mut next = [0u32; SLOTS];
+    for &record in from {
+        next[digit(record)] += 1;
     }
-    for rank in 1..SLOTS {
-        ends[rank] += ends[rank - 1];
+    let mut total = 0;
+    for count in &mut next {
+        total += std::mem::replace(count, total);
     }
-    next[1..].copy_from_slice(&ends[..SLOTS - 1]);
-    for rank in 0..SLOTS {
-        while next[rank] < ends[rank] {
-            let here = next[rank] as usize;
-            let target = rank_of(records[here]);
-            records.swap(here, next[target] as usize);
-            next[target] += 1;
-        }
+    for &record in from {
+        let position = &mut next[digit(record)];
+        to[*position as usize] = record;
+        *position += 1;
     }
 }
 
-/// Appends one hour's output lines, given its records in runs by endpoint rank, and its big latencies
-/// sorted by endpoint rank and then value.
-fn format_hour(hour: usize, runs: &mut [u32], mut big: &[u64], keys: &[&[u8]], out: &mut Vec<u8>) {
+/// Appends one hour's output lines, given its records sorted by endpoint rank and then latency, and
+/// its big latencies in the same order.
+fn format_hour(hour: usize, sorted: &[u32], mut big: &[u64], keys: &[&[u8]], out: &mut Vec<u8>) {
     let clock = hour + 18;
     let stamp = format!("{}T{:02}:00:00Z ", DATES[clock / 24], clock % 24);
-    for group in runs.chunk_by_mut(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
+    for group in sorted.chunk_by(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
         let n = group.len();
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
-        // A group's big latencies sort last, and are next in the side list, which is in the same order.
         let big_count = group.iter().filter(|&&r| latency(r) == BIG_LATENCY).count();
         let (bigs, rest) = big.split_at(big_count);
         big = rest;
-        // Nearest rank, 1-indexed: ceil(p * n / 100). Each selection only searches above the last, and
-        // going upward leaves it the least: the p50 pass splits the group, and the rest is a tail.
-        let mut above = 0;
-        let mut pct = |p: usize| {
+        let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
-            if let Some(&entry) = bigs.get(index.wrapping_sub(n - big_count)) {
-                return entry & 0xFFFF_FFFF;
+            match bigs.get(index.wrapping_sub(n - big_count)) {
+                Some(&entry) => entry & 0xFFFF_FFFF,
+                None => u64::from(latency(group[index])),
             }
-            if index >= above {
-                group[above..].select_nth_unstable(index - above);
-                above = index + 1;
-            }
-            u64::from(latency(group[index]))
         };
         let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         out.extend_from_slice(stamp.as_bytes());
@@ -372,9 +358,6 @@ fn format_hour(hour: usize, runs: &mut [u32], mut big: &[u64], keys: &[&[u8]], o
     }
 }
 
-/// Threads claim hours in order, and each waits for the hour before it to reach the file. The wait
-/// is short, because hours cost about the same. Each hour's array is freed once formatted, so the
-/// output on tmpfs grows as the records shrink, and the two don't add up in the memory peak.
 fn write_summary(file: File, keys: &[&[u8]], ranks: &[u32], hours: Vec<Hour>, threads: usize) {
     let queue = Mutex::new(hours.into_iter().enumerate());
     let written = AtomicUsize::new(0);
@@ -382,12 +365,23 @@ fn write_summary(file: File, keys: &[&[u8]], ranks: &[u32], hours: Vec<Hour>, th
         let mut text = Vec::new();
         for (hour, (mut slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
             let records = AtomicU32::get_mut_slice(&mut slots[..next.into_inner()]);
-            group_by_rank(records, ranks);
+            // Four stable passes sort by latency first and rank last. The current text buffer is
+            // scratch, then its storage is reused for the output bytes.
+            text.resize(records.len() * 4 + 3, 0);
+            // SAFETY: four spare bytes cover any alignment prefix; assert the aligned slice fits.
+            let (_, scratch, _) = unsafe { text.align_to_mut::<u32>() };
+            assert!(scratch.len() >= records.len());
+            radix_pass(records, scratch, |r| ((r >> 1) & 127) as usize);
+            radix_pass(scratch, records, |r| ((r >> 8) & 63) as usize);
+            radix_pass(records, scratch, |r| ((r >> 14) & 63) as usize);
+            radix_pass(scratch, records, |r| {
+                ranks[(r >> ID_SHIFT) as usize] as usize
+            });
             let zeros = records.partition_point(|&record| record == 0);
             let mut big = big.into_inner().unwrap();
             big.sort_unstable_by_key(|entry| (ranks[(entry >> 32) as usize], *entry));
             text.clear();
-            format_hour(hour, &mut records[zeros..], &big, keys, &mut text);
+            format_hour(hour, &records[zeros..], &big, keys, &mut text);
             drop(slots);
             while written.load(Acquire) != hour {
                 thread::yield_now();

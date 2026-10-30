@@ -8,19 +8,19 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 |---|---|
 | Headline numbers and their board run IDs | [PERF.md](PERF.md), first lines |
 | Why each decision was made, reverted ones included | [PERF.md](PERF.md#decision-log) |
-| The hot loop | `src/main.rs`, function `aggregate` |
+| The hot loop | `src/main.rs`, function `parse` |
 | How correctness was checked | [Correctness](#correctness), below |
 
 ## Limits
 
 - It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
-- Latencies of 2^19 or more take a slower path through a side list, about 3% of requests.
+- Latencies of 524,287 or more take a slower path through a side list, about 3% of requests.
 - It relies on the spec's promise of 1,842 endpoints per seed. Past 3,584 it aborts rather than risk a wrong answer.
-- S is 284 code lines after the current line-cut change, against the reference's 56.
+- S is 283 code lines after the radix change, against the reference's 56.
 
 ## Approach
 
-The log is memory-mapped, followed by readable padding so that block loads can run past its end, and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Two 32-byte loads find the end of the endpoint, and one 8-byte load usually parses the latency. One lock-free table, shared by all threads, turns endpoints into ids, always comparing the full key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves blocks of 256. When the log is done, threads claim hours. Each one rewrites an hour's endpoint ids to byte-order ranks, groups the array by endpoint in place, selects each group's percentiles, formats it, frees it, and appends the text to the file in turn.
+The log is memory-mapped, followed by readable padding so that block loads can run past its end, and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Two 32-byte loads find the end of the endpoint, and one 8-byte load usually parses the latency. One lock-free table, shared by all threads, turns endpoints into ids, always comparing the full key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves blocks of 256. When the log is done, threads claim hours. Each performs four stable radix passes over latency and endpoint rank; the output vector's storage holds the aligned scratch array, then is reused for text. Latencies at or above 524,287 live in a side list sorted by endpoint rank and value. The hour's records are formatted, freed, and appended to the file in turn.
 
 ## Why it's fast
 
@@ -30,9 +30,9 @@ See [PERF.md](PERF.md) for run IDs.
 2. **No per-line objects.** A line costs no allocation, except when a latency list grows.
 3. **The log isn't read into memory.** Mapped dataset pages don't count toward the memory peak.
 4. **No byte loops on the hot path.** Finding the endpoint's end, hashing it and parsing the latency are all block operations, so a line costs few branch mispredictions.
-5. **One sortable 32-bit integer per request.** With the endpoint's byte-order rank in the top bits and the latency below it, sorting an hour's records as integers gives every group and every percentile at once.
-6. **Selection instead of sorting.** Only three order statistics per group are needed, so a counting pass groups each hour in place, and `select_nth_unstable` does the rest.
-7. **Output and records don't add up.** The output on tmpfs counts toward memory, so each hour's records are freed as its text is written.
+5. **One sortable 32-bit integer per request.** With the endpoint's byte-order rank in the top bits and latency below it, stable radix passes produce ordered groups and latencies.
+6. **Four linear passes per hour.** Three small latency digits and one endpoint rank determine the order; only latencies at or above 524,287 need a separate sort in the side list.
+7. **Output and records don't add up.** Each hour's records are freed as its text is written, and the output vector's storage doubles as radix scratch.
 
 ## Ideas and where they came from
 

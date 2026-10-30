@@ -23,6 +23,11 @@ use std::thread;
 /// INF, and the other side's label is checked first.
 const INF: u64 = u64::MAX;
 
+/// A search stops sorting keys inside a block of `1 << COARSE_BITS` distances. A block this size mostly
+/// holds nodes that don't depend on each other, so few expand twice. Far wider, and the repeat work
+/// outweighs the sorting saved.
+const COARSE_BITS: u32 = 7;
+
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
@@ -375,10 +380,11 @@ const KEPT_ENTRIES: usize = 1 << 15;
 /// unreached, and every empty directory entry points at it, so reading a label needs no branch. A
 /// zeroed directory stays untouched until it's used, which the 64-bit search rarely is.
 ///
-/// The queue relies on keys never going below the last one popped, as in Dijkstra. Bucket `i` holds the
-/// keys whose highest bit differing from `last` is bit `i - 1`, and bucket 0 the keys equal to it. When
-/// bucket 0 runs dry, the lowest bucket in use spreads into the ones below, so a key moves a few times
-/// in all, with no comparisons against other keys.
+/// The queue relies on keys never going below `last`, the smallest key when the current block began.
+/// Bucket 0 holds the keys in the same block of `1 << COARSE_BITS` distances as `last`, unsorted, and
+/// pops the newest first. Bucket `i` holds the keys whose highest differing bit above the block is bit
+/// `i - 1 + COARSE_BITS`. When bucket 0 runs dry, the lowest bucket in use spreads into the ones below,
+/// so a key moves a few times in all, with no comparisons against other keys.
 struct Side<D> {
     directory: Vec<u32>,
     pages: Vec<D>,
@@ -396,7 +402,7 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
             directory: vec![0; entries / PAGE + 1],
             pages: vec![!D::default(); PAGE],
             used: Vec::new(),
-            buckets: vec![Vec::new(); 65],
+            buckets: vec![Vec::new(); 65 - COARSE_BITS as usize],
             last: !D::default(),
         }
     }
@@ -418,10 +424,12 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
 
     fn push(&mut self, key: D, node: u32) {
         let (wide, last): (u64, u64) = (key.into(), self.last.into());
-        self.buckets[64 - (wide ^ last).leading_zeros() as usize].push((key, node));
+        let bucket = 64 - ((wide ^ last) >> COARSE_BITS).leading_zeros();
+        self.buckets[bucket as usize].push((key, node));
     }
 
-    /// The smallest key, which bucket 0 then holds, or None if the queue is empty.
+    /// A lower bound on every key queued, with bucket 0 then not empty, or None if the queue is empty.
+    /// The bound lags the true smallest key by less than a block.
     fn top(&mut self) -> Option<D> {
         if self.buckets[0].is_empty() {
             let lowest = self.buckets.iter().position(|bucket| !bucket.is_empty())?;
@@ -455,6 +463,12 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
     /// `best` holds the shortest path seen so far, and the search stops when the two queue tops add
     /// up to at least `best`, which is exact for any non-negative weights, including 0. When a queue
     /// empties, that side has settled all it can reach, so `best` is exact too.
+    ///
+    /// Inside a block the keys pop in no sorted order, so a node can expand again when a shorter path
+    /// reaches it. That costs less than sorting them did. It's safe because a top only moves past keys
+    /// no longer queued: any node whose true distance is below a side's top has its exact label and
+    /// has expanded with it. So a top still bounds what that side has yet to find, for the stop test
+    /// and the pruning below, and the later of two exact labels on a node sees the other.
     ///
     /// The side with less work so far goes next. Choosing the smaller top instead would let the
     /// backward side settle the whole main body on queries from a small island.

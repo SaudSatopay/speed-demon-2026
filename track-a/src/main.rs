@@ -67,26 +67,14 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     }
 }
 
-/// Loads 8 bytes, little-endian, which may run into the padding.
+/// Loads a `T` at `pos`, little-endian and with no alignment, which may run into the padding. It's
+/// a `u64` for 8 bytes, or two AVX2 registers for a block of 64.
 ///
 /// # Safety
-/// `log` must come from `map_file`, and `pos + 8` must be at most `log.len() + PADDING`.
-unsafe fn load_u64(log: &[u8], pos: usize) -> u64 {
+/// `log` must come from `map_file`, and `pos + size_of::<T>()` must be at most `log.len() + PADDING`.
+unsafe fn load<T: Copy>(log: &[u8], pos: usize) -> T {
     // SAFETY: the caller keeps the load inside the mapping, and the load needs no alignment.
-    unsafe { log.as_ptr().add(pos).cast::<u64>().read_unaligned() }
-}
-
-/// The 64 bytes at `pos`, which may run into the padding.
-///
-/// # Safety
-/// `log` must come from `map_file`, and `pos + 64` must be at most `log.len() + PADDING`.
-unsafe fn load_block(log: &[u8], pos: usize) -> [__m256i; 2] {
-    // SAFETY: the caller keeps both loads inside the mapping, they need no alignment, and the build
-    // targets x86-64-v3, which has AVX2.
-    unsafe {
-        let at = log.as_ptr().add(pos).cast::<__m256i>();
-        [_mm256_loadu_si256(at), _mm256_loadu_si256(at.add(1))]
-    }
+    unsafe { log.as_ptr().add(pos).cast::<T>().read_unaligned() }
 }
 
 /// One bit per byte of two blocks, set where they're equal.
@@ -112,7 +100,7 @@ unsafe fn offset_of_space(log: &[u8], pos: usize) -> usize {
     loop {
         // SAFETY: the caller vouches for the first block, and the assert below for the later ones,
         // since `PADDING` is more than a block.
-        let mask = equal_bytes(unsafe { load_block(log, pos + offset) }, [spaces; 2]);
+        let mask = equal_bytes(unsafe { load(log, pos + offset) }, [spaces; 2]);
         if mask != 0 {
             return offset + mask.trailing_zeros() as usize;
         }
@@ -160,9 +148,9 @@ unsafe fn id_of(table: &[AtomicU32], log: &[u8], start: usize, end: usize) -> u3
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
     // SAFETY, for this load and the next two: all three start inside the log.
-    let first = unsafe { load_u64(log, start) } << outside;
-    let last = unsafe { load_u64(log, end - 8) } >> outside;
-    let block = unsafe { load_block(log, start) };
+    let first = unsafe { load::<u64>(log, start) } << outside;
+    let last = unsafe { load::<u64>(log, end - 8) } >> outside;
+    let block = unsafe { load(log, start) };
     let position = start as u32;
     let mut index = (hash(first, last, len) >> 52) as usize;
     loop {
@@ -176,7 +164,7 @@ unsafe fn id_of(table: &[AtomicU32], log: &[u8], start: usize, end: usize) -> u3
         // memcmp would branch on the length. The rest of a long key may be longer than what's left of
         // the log after `first`, if that key is shorter and on the last line, hence the `get`.
         // SAFETY: `first` is the `start` of an earlier call, which was inside the log.
-        if (!equal_bytes(unsafe { load_block(log, first) }, block)).trailing_zeros() as usize
+        if (!equal_bytes(unsafe { load(log, first) }, block)).trailing_zeros() as usize
             > len.min(63)
             && (len < 64 || log.get(first + 64..=first + len) == Some(&log[start + 64..=end]))
         {
@@ -198,9 +186,7 @@ fn rank_ids<'a>(table: &[AtomicU32], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<u32>)
     let mut ids: Vec<usize> = (0..SLOTS).collect();
     ids.sort_unstable_by_key(|&id| keys[id]);
     let mut ranks = vec![0; SLOTS];
-    for (rank, &id) in ids.iter().enumerate() {
-        ranks[id] = rank as u32;
-    }
+    ids.iter().zip(0..).for_each(|(&id, rank)| ranks[id] = rank);
     (keys, ranks)
 }
 
@@ -218,7 +204,7 @@ type Hour = (Vec<AtomicU32>, AtomicUsize, Mutex<Vec<u64>>);
 /// `log` must come from `map_file`, and `line` must be inside the log.
 unsafe fn hour_index(log: &[u8], line: usize) -> usize {
     // SAFETY: the load ends within 14 bytes of `line`, so inside the padding at the latest.
-    let bytes = unsafe { load_u64(log, line + 6) }.to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
+    let bytes = unsafe { load::<u64>(log, line + 6) }.to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
     let day = (bytes[0] & 1) + (bytes[3] & 3);
     let hour = 10 * (bytes[5] & 15) + (bytes[6] & 15);
     24 * usize::from(day) + usize::from(hour) - 18
@@ -232,7 +218,7 @@ unsafe fn hour_index(log: &[u8], line: usize) -> usize {
 /// `log` must come from `map_file`, and `pos + 8` must be at most `log.len() + PADDING`.
 unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
     // SAFETY: the caller vouches for this load, and the loop below uses checked indexing.
-    let word = unsafe { load_u64(log, pos) };
+    let word = unsafe { load::<u64>(log, pos) };
     let mut digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
     let aligned = (word << (64 - 8 * digits)) & 0x0F0F_0F0F_0F0F_0F0F;
     let pairs = aligned.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
@@ -265,7 +251,7 @@ fn parse(log: &[u8], table: &[AtomicU32], hours: &[Hour], cursor: &AtomicUsize, 
             // Reads at a fixed distance from `line` need no check, since `line` is inside the log and
             // the padding is longer than any such distance. A truncated line just reads zeros.
             // SAFETY: the load ends 39 bytes after `line`, so inside the padding at the latest.
-            let method_len = METHOD_LENS >> (4 * (unsafe { load_u64(log, line + 31) } & 15)) & 15;
+            let method_len = METHOD_LENS >> 4 * (unsafe { load::<u64>(log, line + 31) } & 15) & 15;
             let key_start = line + 29 + method_len as usize;
             // SAFETY: the method's length is at most 15, so the first block ends within 108 bytes of
             // `line`, inside the padding at the latest.

@@ -13,7 +13,7 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 
 ## Limits
 
-- It relies on two spec guarantees: a mid-file BOM only ever starts a record, and a CR only ever starts a CRLF. A file with no CRLF would still be right, but wouldn't get split across threads.
+- It relies on section 2.2 of the spec: a mid-file BOM only ever starts a record, a CR only ever starts a CRLF, numbers fit in 8 bytes, and there are 240 countries. A file with no CRLF would still be right, but wouldn't get split across threads. More than 255 countries aborts.
 - The name table is 8.4 MB, which keeps M above the 7.3 MB where more savings stop counting.
 
 ## Approach

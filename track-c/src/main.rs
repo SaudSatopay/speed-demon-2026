@@ -18,6 +18,7 @@ use std::hint;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::ptr::null_mut;
 use std::sync::atomic::{
     AtomicU64, AtomicUsize,
     Ordering::{Acquire, Relaxed, Release},
@@ -29,14 +30,7 @@ const CODES: usize = 26 * 26 * 26;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
+    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -45,25 +39,27 @@ const PADDING: usize = 4096;
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
 /// scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
 fn map_file(path: &Path) -> io::Result<&'static [u8]> {
-    const PROT_READ: c_int = 1;
-    const MAP_PRIVATE: c_int = 2;
-    const MAP_FIXED: c_int = 0x10;
-    const MAP_ANONYMOUS: c_int = 0x20;
+    let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
-    let null = std::ptr::null_mut();
+    let checked = |mapped: *mut c_void| match mapped as isize {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(mapped),
+    };
     // SAFETY: the first call reserves fresh zero pages for the file and its padding, and the second
     // maps the file over the start of them. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
-        let base = mmap(null, len + PADDING, PROT_READ, anonymous, -1, 0);
-        if base as isize == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let fixed = MAP_PRIVATE | MAP_FIXED;
-        if len > 0 && mmap(base, len, PROT_READ, fixed, file.as_raw_fd(), 0) as isize == -1 {
-            return Err(io::Error::last_os_error());
+        let base = checked(mmap(
+            null_mut(),
+            len + PADDING,
+            read,
+            private | anonymous,
+            -1,
+            0,
+        ))?;
+        if len > 0 {
+            checked(mmap(base, len, read, private | fixed, file.as_raw_fd(), 0))?;
         }
         Ok(std::slice::from_raw_parts(base as *const u8, len))
     }
@@ -112,35 +108,22 @@ fn parse_eight_digits(word: u64) -> u64 {
 /// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
 /// box's 12 threads.
 fn thread_count() -> usize {
-    match std::env::var("SD_THREADS")
+    let asked = std::env::var("SD_THREADS")
         .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        Some(threads) if threads > 0 => threads,
-        _ => thread::available_parallelism().map_or(1, |n| n.get().min(12)),
-    }
+        .and_then(|v| v.parse().ok());
+    let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
+    asked.filter(|&threads| threads > 0).unwrap_or_else(allowed)
 }
 
-/// Reads the digits at `pos` and steps past the separator after them. One 8-byte load settles all but
-/// the longest numbers: digits have bit 4 set, and commas and line ends don't, so the first clear bit
-/// marks the end, with no byte loop to mispredict.
+/// Reads the digits at `pos` and steps past the separator after them. Ids and region ids have at most
+/// 8 digits (spec sections 2.2 and 3), so one 8-byte load settles them: digits have bit 4 set, and
+/// commas and line ends don't, so the first clear bit marks the end, with no loop to mispredict.
 #[inline]
 fn next_number(text: &[u8], pos: &mut usize) -> u64 {
     let word = load_u64(text, *pos);
-    let ends = !word & 0x1010_1010_1010_1010;
-    if ends != 0 {
-        let digits = ends.trailing_zeros() as usize / 8;
-        *pos += digits + 1;
-        return parse_eight_digits(word << (64 - 8 * digits));
-    }
-    let mut value = parse_eight_digits(word);
-    *pos += 8;
-    while text[*pos] >= b'0' {
-        value = value * 10 + u64::from(text[*pos] - b'0');
-        *pos += 1;
-    }
-    *pos += 1;
-    value
+    let digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
+    *pos += digits + 1;
+    parse_eight_digits(word << (64 - 8 * digits))
 }
 
 /// The position just past the first LF, where the first data line starts.
@@ -162,7 +145,7 @@ fn next_boundary(file: &[u8], pos: usize) -> usize {
 /// order, so printing by index sorts the output. The last index stands for `_UNMATCHED`, which sorts
 /// after every code because `_` is above `Z`.
 struct Regions {
-    country_of: Vec<u16>,
+    country_of: Vec<u8>,
     keys: Vec<String>,
 }
 
@@ -185,18 +168,20 @@ fn parse_regions(file: &[u8]) -> Regions {
         seen[code] = true;
         highest_id = highest_id.max(id);
     }
-    let mut index_of = vec![0u16; CODES];
+    let mut index_of = vec![0u8; CODES];
     let mut keys = Vec::new();
     for code in (0..CODES).filter(|&code| seen[code]) {
-        index_of[code] = keys.len() as u16;
+        index_of[code] = keys.len() as u8;
         let letter = |value: usize| char::from(b'A' + (value % 26) as u8);
-        keys.push(String::from_iter([
-            letter(code / 26 / 26),
+        keys.push(format!(
+            "{}{}{}",
+            letter(code / 676),
             letter(code / 26),
-            letter(code),
-        ]));
+            letter(code)
+        ));
     }
-    let unmatched = keys.len() as u16;
+    assert!(keys.len() < 256, "the spec has 240 countries");
+    let unmatched = keys.len() as u8;
     keys.push("_UNMATCHED".to_string());
     let mut country_of = vec![unmatched; highest_id + 1];
     for (id, code) in lines() {
@@ -222,26 +207,6 @@ fn hash(key_words: &[u64; 3], len: usize) -> u64 {
 fn hash(_key_words: &[u64; 3], _len: usize) -> u64 {
     0
 }
-
-/// For a name of each length up to 24 bytes, which bytes of its three words belong to it.
-const KEY_MASKS: [[u64; 3]; 25] = {
-    let mut masks = [[0; 3]; 25];
-    let mut len = 0;
-    while len <= 24 {
-        let mut word = 0;
-        while word < 3 {
-            let bytes = if len > word * 8 { len - word * 8 } else { 0 };
-            masks[len][word] = if bytes >= 8 {
-                !0
-            } else {
-                (1 << (8 * bytes)) - 1
-            };
-            word += 1;
-        }
-        len += 1;
-    }
-    masks
-};
 
 /// Slots to start with: 2^17 for the generator's pool of 100,000 names. A test build starts tiny, to
 /// exercise the restart that a larger pool would need.
@@ -356,13 +321,10 @@ impl<'a> NameTable<'a> {
     }
 }
 
-/// A text field's raw bytes, which encode its value one to one, and the length of its value.
+/// A text field: where its raw bytes start, their length, and the length of its value. The raw bytes
+/// encode the value one to one.
 #[derive(Clone, Copy, Default)]
-struct TextField {
-    start: usize,
-    raw_len: usize,
-    value_len: usize,
-}
+struct TextField(usize, usize, usize);
 
 /// Parses the text field at `pos` and steps past the comma after it. A quoted field ends at the first
 /// `"` that isn't part of a `""` pair, and inside quotes every other byte is data, commas and LFs
@@ -375,33 +337,22 @@ fn text_field(file: &[u8], pos: &mut usize) -> TextField {
             *pos += 1;
         }
         *pos += 1;
-        let raw_len = *pos - 1 - start;
-        return TextField {
-            start,
-            raw_len,
-            value_len: raw_len,
-        };
+        return TextField(start, *pos - 1 - start, *pos - 1 - start);
     }
     let mut scan = start + 1;
     let mut pairs = 0;
     loop {
         let quotes = quote_mask(file, scan);
+        let at = scan + quotes.trailing_zeros() as usize;
         if quotes == 0 {
             scan += 64;
-            continue;
-        }
-        let at = scan + quotes.trailing_zeros() as usize;
-        if file[at + 1] != b'"' {
+        } else if file[at + 1] == b'"' {
+            pairs += 1;
+            scan = at + 2;
+        } else {
             *pos = at + 2; // The closing quote and the comma.
-            let raw_len = at - start - 1;
-            return TextField {
-                start: start + 1,
-                raw_len,
-                value_len: raw_len - pairs,
-            };
+            return TextField(start + 1, at - start - 1, at - start - 1 - pairs);
         }
-        pairs += 1;
-        scan = at + 2;
     }
 }
 
@@ -414,27 +365,11 @@ fn amount_cents(file: &[u8], pos: &mut usize) -> i64 {
     let negative = file[*pos] == b'-';
     *pos += usize::from(negative);
     let word = load_u64(file, *pos);
-    let ends = !word & 0x2020_2020_2020_2020;
-    let chars = if ends != 0 {
-        ends.trailing_zeros() as usize / 8
-    } else {
-        8
-    };
-    let cents = if ends != 0 || file[*pos + 8] & 0x20 == 0 {
-        *pos += chars;
-        let aligned = word << (64 - 8 * chars);
-        let squeezed = (aligned & 0xFFFF_0000_0000_0000) | (aligned & 0x0000_00FF_FFFF_FFFF) << 8;
-        parse_eight_digits(squeezed) as i64
-    } else {
-        let mut cents = 0;
-        while file[*pos] & 0x20 != 0 {
-            if file[*pos] != b'.' {
-                cents = cents * 10 + i64::from(file[*pos] - b'0');
-            }
-            *pos += 1;
-        }
-        cents
-    };
+    let chars = (!word & 0x2020_2020_2020_2020).trailing_zeros() as usize / 8;
+    *pos += chars;
+    let aligned = word << (64 - 8 * chars);
+    let squeezed = (aligned & 0xFFFF_0000_0000_0000) | (aligned & 0x0000_00FF_FFFF_FFFF) << 8;
+    let cents = parse_eight_digits(squeezed) as i64;
     if negative { -cents } else { cents }
 }
 
@@ -515,12 +450,13 @@ fn parse_records(
         // the end of the file, the padding is zeros, which don't count as a CR.
         pos += 1 + usize::from(file.get(pos) == Some(&b'\r'));
 
-        let masks = KEY_MASKS[name.raw_len.min(INLINE_BYTES)];
+        // The name's first 24 bytes, with whatever follows it masked off.
         let mut key_words = [0; 3];
-        for (index, (word, mask)) in key_words.iter_mut().zip(masks).enumerate() {
-            *word = load_u64(file, name.start + 8 * index) & mask;
+        for (word, key_word) in key_words.iter_mut().enumerate() {
+            let bytes = name.1.saturating_sub(8 * word).min(8);
+            *key_word = load_u64(file, name.0 + 8 * word) & ((1u128 << (8 * bytes)) - 1) as u64;
         }
-        let hash = hash(&key_words, name.raw_len);
+        let hash = hash(&key_words, name.1);
         prefetch(names.slot_header(hash));
         prefetch(&regions.country_of[region.min(regions.country_of.len() - 1)]);
         batch[count] = Pending {
@@ -528,7 +464,7 @@ fn parse_records(
             cents,
             region,
             name,
-            note_bytes: note.value_len,
+            note_bytes: note.2,
             key_words,
             hash,
         };
@@ -561,9 +497,9 @@ fn add_records(
         row.amount_sum += record.cents;
         row.amount_min = row.amount_min.min(record.cents);
         row.amount_max = row.amount_max.max(record.cents);
-        row.name_bytes += record.name.value_len as u64;
+        row.name_bytes += record.name.2 as u64;
         row.note_bytes += record.note_bytes as u64;
-        let key = &file[record.name.start..record.name.start + record.name.raw_len];
+        let key = &file[record.name.0..record.name.0 + record.name.1];
         row.names_distinct += u64::from(names.mark(key, &record.key_words, record.hash, country));
     }
 }

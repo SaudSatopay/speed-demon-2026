@@ -7,7 +7,7 @@
 ## Where it loses
 
 - M is 22 MB locally, against the 7.3 MB where more savings stop counting. The name table takes 8.4 MB of that.
-- S is 549 code lines against the reference's 108, which costs about 5.3 speed points.
+- S is 485 code lines against the reference's 108, which costs about 4.9 speed points.
 
 ## Where the reference spends its time
 
@@ -23,6 +23,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 1 | v1: scalar parser from the spec, no strings, interned names, one thread | Removes Python objects and all decoding | run-7908768d3243 | 0.770 | 10.6 | 44.2 |
 | 2 | 12 threads: cuts at CRLF, a lock-free shared name table with one cache line per name | Records are independent, and name lookups dominate the time | run-e9b10f4d8fed | 0.086 | 14 | 65.4 |
 | 3 | Block loads for every field, and lookups batched with prefetching | About 470 cycles per record, with a mispredicted loop exit per field and a stall per name lookup | run-239daeb7287a | 0.055 | 14.2 | 69.3 |
+| 4 | Slow paths the spec rules out removed, 1-byte region entries | Sanjay Sah passed us with half our lines and less memory, and S and M were costing more than T | run-… | 0.028 *local* | 20.8 *local* | 69.1 *local* |
 
 ## Decision log
 
@@ -33,6 +34,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D3. One shared name table instead of one per thread.** Context: 12 tables and bitsets would cost about 58 MB, and 2x of memory is worth 3 speed points. Options: per-thread tables merged at the end, or one lock-free table. Chose: one table, where each 64-byte slot holds a header, the first 24 bytes of the name, and one bit per country. On seed 1, 99.99% of names fit inline, so a lookup usually costs one cache miss, without touching the file. Cost: 8.4 MB for the table. If a file ever holds more names than the table, the pass restarts with a bigger table. A test build starts with 16 slots, to exercise that path. Evidence: T 0.404 -> 0.041 s, K 7.11 -> 20.11 (local). Sweep passes at 1, 2, 3, 7, 12 and 64 threads, and at full scale on seeds 1 and 7. Outcome: kept.
 
 **D4. Block loads, and batched lookups.** Context: a record cost about 470 cycles. Each field's byte loop mispredicted its exit, and each name lookup stalled on a cache miss. Chose: 64-byte quote masks for text fields, one 8-byte load per number, and an amount squeezed into 8 digits by moving the digits before the point up a byte. Records then wait in batches of 16 while their table slots and region entries are prefetched. The padded mapping means no tail code. Cost: S 410 -> 549. Evidence: T 0.041 -> 0.028 s, K 20.11 -> 23.44 (local), and the sweep, including `lf-except-last`, still passes. Outcome: kept.
+
+**D5. Remove what the spec rules out.** Context: Sanjay Sah took 1st with T 0.066 s against our 0.051, but S 275 against our 549. Section 2.2 caps ids, region ids and amounts at 8 bytes, so their byte-loop fallbacks could go, and 240 countries fit in a byte, which frees 1 MB. More than 255 countries now aborts rather than risking a wrong answer. Cost: none in time. Evidence: S 549 -> 485, M 22.2 -> 20.8 MB, K 23.46 -> 24.09 (local). Outcome: see the journey table.
 
 ## What didn't work
 

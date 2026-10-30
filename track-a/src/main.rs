@@ -4,8 +4,8 @@
 //! thread that falls behind simply claims fewer. Each line is read at fixed offsets where the format
 //! allows it, and with block loads where it doesn't. One lock-free table, shared by all threads,
 //! turns endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
-//! where each thread reserves small blocks. When the log is done, threads claim hours: each sorts one
-//! hour's array in place, formats it, frees it, takes the next stretch of the output file in hour
+//! where each thread reserves small blocks. When the log is done, threads claim hours: each groups one
+//! hour's array in place, selects its percentiles, formats it, frees it, takes the next stretch of the output file in hour
 //! order, and copies its text there. So the output is in a fixed order whatever the scheduling, never
 //! sits in memory whole, and is written by all threads at once.
 
@@ -394,11 +394,37 @@ fn push_decimal(out: &mut Vec<u8>, value: u64) {
     out.truncate(end);
 }
 
-/// Appends one hour's output lines, given its records in integer order and its big latencies sorted
-/// by endpoint rank and then value.
+/// Moves an hour's records into runs by endpoint rank, in place: each record swaps straight into its
+/// endpoint's next free position. Nearly all groups are small, so this one pass does most of the work
+/// of a full sort, and only `select_nth_unstable` remains per group.
+fn group_by_rank(records: &mut [u32], counts: &mut Vec<u32>, rank_count: usize) {
+    counts.clear();
+    counts.resize(2 * rank_count + 2, 0);
+    let (next, ends) = counts.split_at_mut(rank_count + 1);
+    for record in records.iter() {
+        ends[(record >> ID_SHIFT) as usize] += 1;
+    }
+    let mut total = 0;
+    for (start, end) in next.iter_mut().zip(ends.iter_mut()) {
+        *start = total;
+        total += *end;
+        *end = total;
+    }
+    for rank in 0..=rank_count {
+        while next[rank] < ends[rank] {
+            let here = next[rank] as usize;
+            let target = (records[here] >> ID_SHIFT) as usize;
+            records.swap(here, next[target] as usize);
+            next[target] += 1;
+        }
+    }
+}
+
+/// Appends one hour's output lines, given its records in runs by endpoint rank, and its big latencies
+/// sorted by endpoint rank and then value.
 fn format_hour(
     hour: usize,
-    records: &[u32],
+    records: &mut [u32],
     big_latencies: &[u64],
     endpoints: &[&[u8]],
     text: &mut Vec<u8>,
@@ -407,35 +433,33 @@ fn format_hour(
     let stamp = format!("{}T{:02}:00:00Z ", DATES[clock / 24], clock % 24);
     let mut big = big_latencies.iter().map(|&entry| entry & 0xFFFF_FFFF);
     let mut bigs = Vec::new();
-    for group in records.chunk_by(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
+    for group in records.chunk_by_mut(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
         let n = group.len();
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
+        let rank = group[0] >> ID_SHIFT;
+        let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
         // A group's big latencies sort last, and are next in the side list, which is in the same order.
-        let big_count = group
-            .iter()
-            .rev()
-            .take_while(|&&r| latency(r) == BIG_LATENCY)
-            .count();
+        let big_count = group.iter().filter(|&&r| latency(r) == BIG_LATENCY).count();
         bigs.clear();
         bigs.extend(big.by_ref().take(big_count));
-        // Nearest rank, 1-indexed: ceil(p * n / 100).
-        let pct = |p: usize| {
+        // Nearest rank, 1-indexed: ceil(p * n / 100). Each selection only searches below the last.
+        let mut below = n;
+        let mut pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
-            let big_value = bigs.get(index.wrapping_sub(n - big_count));
-            big_value.map_or_else(|| u64::from(latency(group[index])), |&value| value)
+            if let Some(&value) = bigs.get(index.wrapping_sub(n - big_count)) {
+                return value;
+            }
+            if index < below {
+                group[..below].select_nth_unstable(index);
+                below = index;
+            }
+            u64::from(latency(group[index]))
         };
-        let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
+        let (p99, p95, p50) = (pct(99), pct(95), pct(50));
         text.extend_from_slice(stamp.as_bytes());
-        text.extend_from_slice(endpoints[(group[0] >> ID_SHIFT) as usize - 1]);
+        text.extend_from_slice(endpoints[rank as usize - 1]);
         let count = n as u64;
-        for value in [
-            count,
-            pct(50),
-            pct(95),
-            pct(99),
-            errors,
-            errors * 1_000_000 / count,
-        ] {
+        for value in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
             text.push(b' ');
             push_decimal(text, value);
         }
@@ -533,7 +557,8 @@ fn write_summary(
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let (mut big_latencies, mut text) = (Vec::new(), Vec::new());
+                let (mut big_latencies, mut text, mut counts) =
+                    (Vec::new(), Vec::new(), Vec::new());
                 loop {
                     let hour = next_hour.fetch_add(1, Relaxed);
                     if hour >= HOURS {
@@ -558,15 +583,21 @@ fn write_summary(
                         *record =
                             rank[(*record >> ID_SHIFT) as usize] << ID_SHIFT | *record & id_mask;
                     }
-                    sorted.sort_unstable();
+                    group_by_rank(sorted, &mut counts, endpoints.len());
                     big_latencies.clear();
                     big_latencies.extend(big_lists.iter().flat_map(|lists| &lists[hour]).map(
                         |entry| u64::from(rank[(entry >> 32) as usize]) << 32 | entry & 0xFFFF_FFFF,
                     ));
                     big_latencies.sort_unstable();
-                    let real = sorted.partition_point(|&record| record == 0);
+                    let zeros = sorted.iter().take_while(|&&record| record == 0).count();
                     text.clear();
-                    format_hour(hour, &sorted[real..], &big_latencies, &endpoints, &mut text);
+                    format_hour(
+                        hour,
+                        &mut sorted[zeros..],
+                        &big_latencies,
+                        &endpoints,
+                        &mut text,
+                    );
                     drop(records);
                     output.write_hour(hour, &text);
                 }

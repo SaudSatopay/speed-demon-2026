@@ -9,12 +9,10 @@
 //! sums into its own rows, and one shared table counts the distinct names per country.
 
 use std::arch::x86_64::*;
-use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
@@ -24,7 +22,7 @@ const CODES: usize = 26 * 26 * 26;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -40,7 +38,14 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len + PADDING,
+            read,
+            private | anonymous,
+            -1,
+            0,
+        );
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -48,7 +53,6 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
-#[inline]
 fn load_u64(file: &[u8], pos: usize) -> u64 {
     assert!(pos + 8 <= file.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and the load needs no alignment.
@@ -56,14 +60,12 @@ fn load_u64(file: &[u8], pos: usize) -> u64 {
 }
 
 /// Asks for the cache line holding `item`, so that a later access doesn't stall on it.
-#[inline]
 fn prefetch<T>(item: &T) {
     // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) }
 }
 
 /// One bit per byte of the 64 at `pos`, set where there's a double quote.
-#[inline]
 fn quote_mask(file: &[u8], pos: usize) -> u64 {
     assert!(pos + 64 <= file.len() + PADDING);
     // SAFETY: the assert keeps both loads inside the mapping, they need no alignment, and the build
@@ -79,7 +81,6 @@ fn quote_mask(file: &[u8], pos: usize) -> u64 {
 }
 
 /// Parses 8 digit bytes, in three multiplications. The lowest byte is the most significant digit.
-#[inline]
 fn parse_eight_digits(word: u64) -> u64 {
     let digits = word & 0x0F0F_0F0F_0F0F_0F0F;
     let pairs = digits.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
@@ -92,9 +93,7 @@ fn parse_eight_digits(word: u64) -> u64 {
 fn thread_count() -> usize {
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    Some(asked)
-        .filter(|&threads| threads > 0)
-        .unwrap_or_else(allowed)
+    Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
 }
 
 /// Runs `work` on `threads` threads, and waits for them all.
@@ -109,7 +108,6 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
 /// Reads the digits at `pos` and steps past the separator after them. Ids and region ids have at most
 /// 8 digits (spec sections 2.2 and 3), so one 8-byte load settles them: digits have bit 4 set, and
 /// commas and line ends don't, so the first clear bit marks the end, with no loop to mispredict.
-#[inline]
 fn next_number(text: &[u8], pos: &mut usize) -> u64 {
     let word = load_u64(text, *pos);
     let digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
@@ -173,7 +171,6 @@ fn parse_regions(file: &[u8]) -> Regions {
 /// Mixes a name's first 24 bytes and its length. A test build swaps it for a constant, so that every
 /// key collides and any logic that trusts a hash without comparing the key shows up as a wrong
 /// answer.
-#[inline]
 fn hash(key_words: &[u64; 3], len: usize) -> u64 {
     let hash = key_words.iter().fold(len as u64, |hash, &word| {
         let mixed = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -225,7 +222,6 @@ impl<'a> NameTable<'a> {
 
     /// Marks this name as seen in `country`, and returns whether that's new for the country. When the
     /// table is full it gives up, and `aggregate` throws the whole pass away.
-    #[inline]
     fn mark(&self, key: &[u8], key_words: &[u64; 3], hash: u64, country: usize) -> bool {
         // The top half of the hash and the length, plus 2 to stay clear of EMPTY and BUSY.
         let published = (hash & 0xFFFF_FFFF_0000_0000) | (key.len() as u64 + 2);
@@ -282,7 +278,6 @@ struct TextField(usize, usize, usize);
 /// Parses the text field at `pos` and steps past the comma after it. A quoted field ends at the first
 /// `"` that isn't part of a `""` pair, and inside quotes every other byte is data, commas and LFs
 /// included. An empty unquoted field and `""` both give empty raw bytes, so they are one value.
-#[inline]
 fn text_field(file: &[u8], pos: &mut usize) -> TextField {
     let start = *pos;
     if file[start] != b'"' {
@@ -313,7 +308,6 @@ fn text_field(file: &[u8], pos: &mut usize) -> TextField {
 /// if the last one is missing. Digits and the point have bit 5 set, and line ends don't. Amounts are
 /// at most 8 bytes (spec section 2.2), so one load holds them. It's aligned to the end, and the point
 /// is squeezed out by moving the digits before it up a byte, which leaves 8 digits to parse.
-#[inline]
 fn amount_cents(file: &[u8], pos: &mut usize) -> i64 {
     let negative = file[*pos] == b'-';
     *pos += usize::from(negative);
@@ -331,8 +325,6 @@ fn amount_cents(file: &[u8], pos: &mut usize) -> i64 {
 /// jobs: adding a record to its country, and adding up the threads' rows.
 type Row = [i64; 8];
 const EMPTY_ROW: Row = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
-
-#[inline]
 fn merge(row: &mut Row, other: &Row) {
     for (i, (total, &value)) in row.iter_mut().zip(other).enumerate() {
         *total = match i {
@@ -395,8 +387,6 @@ fn parse_records(
     }
     add_records(&batch[..count], regions, names, rows);
 }
-
-#[inline]
 fn add_records(batch: &[Pending], regions: &Regions, names: &NameTable, rows: &mut [Row]) {
     for &(id, cents, region, name, note_bytes, key_words, hash) in batch {
         let country = usize::from(regions.country_of[region]);

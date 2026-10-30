@@ -11,12 +11,10 @@
 //! 32-byte blocks, then answer the queries in batches, appending their answers to the file in order.
 
 use std::arch::x86_64::*;
-use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
@@ -43,7 +41,7 @@ const PADDING: usize = 4096;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -56,7 +54,14 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len + PADDING,
+            read,
+            private | anonymous,
+            -1,
+            0,
+        );
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -64,7 +69,6 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 }
 
 /// The offset of the first LF at or after `pos`.
-#[inline]
 fn offset_of_line_feed(file: &[u8], pos: usize) -> usize {
     let mut offset = 0;
     loop {
@@ -84,7 +88,6 @@ fn offset_of_line_feed(file: &[u8], pos: usize) -> usize {
 
 /// One bit per byte of the 32 at `pos`, set for the token bytes, `[A-Za-z0-9]`. Bytes of 0x80 and
 /// above compare as negative, so they are separators, even inside a letter (spec section 2.2).
-#[inline]
 fn token_mask(file: &[u8], pos: usize) -> u32 {
     assert!(pos + 32 <= file.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, it needs no alignment, and the build
@@ -107,9 +110,7 @@ fn token_mask(file: &[u8], pos: usize) -> u32 {
 fn thread_count() -> usize {
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    Some(asked)
-        .filter(|&threads| threads > 0)
-        .unwrap_or_else(allowed)
+    Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
 }
 
 /// Runs `work` on `threads` threads, and waits for them all.
@@ -123,7 +124,6 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
 
 /// A token's key: its first 16 bytes, lowercased and zero-padded, from one load and a mask. Setting
 /// this bit in every byte lowercases ASCII letters, and digits already have it set.
-#[inline]
 fn token_key(file: &[u8], start: usize, len: usize) -> u128 {
     assert!(start + 16 <= file.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and the load needs no alignment.
@@ -303,7 +303,6 @@ fn parse_queries(text: &[u8]) -> Queries<'_> {
 
 /// Visits the documents whose lines start in `start..end`, passing each one's id, where its text
 /// starts, and its LF. A line belongs to the range holding its first byte.
-#[inline]
 fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32, usize, usize)) {
     let mut line = start;
     while line > 0 && docs[line - 1] != b'\n' {
@@ -336,7 +335,6 @@ fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32
 /// Visits each token of the text in `start..lf`, passing where it starts and ends. Each 32-byte block
 /// gives a mask of its token bytes, and the set bits of the mask XORed with itself shifted are where
 /// tokens start and end, so a token costs a few bit operations and no byte loop.
-#[inline]
 fn for_each_token(docs: &[u8], start: usize, lf: usize, mut visit: impl FnMut(usize, usize)) {
     let mut block = start;
     let mut token_start = start;

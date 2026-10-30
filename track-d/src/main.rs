@@ -9,12 +9,10 @@
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
 use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
-use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
@@ -25,7 +23,7 @@ const INF: u64 = 1 << 62;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -41,7 +39,14 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len + PADDING,
+            read,
+            private | anonymous,
+            -1,
+            0,
+        );
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -49,7 +54,6 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 }
 
 /// Asks for the cache line holding `item`, so that a later access doesn't stall on it.
-#[inline]
 fn prefetch<T>(item: &T) {
     // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
     unsafe { _mm_prefetch::<_MM_HINT_T1>(std::ptr::from_ref(item).cast()) }
@@ -60,9 +64,7 @@ fn prefetch<T>(item: &T) {
 fn thread_count() -> usize {
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    Some(asked)
-        .filter(|&threads| threads > 0)
-        .unwrap_or_else(allowed)
+    Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
 }
 
 /// Runs `work` on `threads` threads, and waits for them all.
@@ -77,7 +79,6 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
 /// Reads the number at `pos` and steps past the separator after it. One 8-byte load settles all but
 /// the longest numbers: digits have bit 4 set, and spaces and LFs don't, so the first clear bit marks
 /// the end, and three multiplications parse the digits, with no byte loop to mispredict.
-#[inline]
 fn next_number(text: &[u8], pos: &mut usize) -> u64 {
     assert!(*pos + 8 <= text.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and it needs no alignment.
@@ -238,12 +239,9 @@ impl Graph {
     }
 
     /// Reserves a slot for one more arc of `node`.
-    #[inline]
     fn reserve(&self, node: u32) -> usize {
         self.offsets[node as usize].fetch_sub(1, Relaxed) as usize - 1
     }
-
-    #[inline]
     fn store(&self, slot: usize, neighbour: u32, weight: u32) {
         let heavy = (1 << self.weight_bits) - 1;
         if weight >= heavy {
@@ -259,7 +257,6 @@ impl Graph {
     }
 
     /// The first arc number of `node`, and its arcs.
-    #[inline]
     fn arcs_of(&self, node: u32) -> (usize, &[AtomicU32]) {
         let start = self.offsets[node as usize].load(Relaxed) as usize;
         let end = self.offsets[node as usize + 1].load(Relaxed) as usize;
@@ -267,7 +264,6 @@ impl Graph {
     }
 
     /// A packed arc's neighbour and weight, given its arc number.
-    #[inline]
     fn unpack(&self, slot: usize, arc: u32) -> (u32, u64) {
         let heavy = (1 << self.weight_bits) - 1;
         let weight = arc & heavy;
@@ -437,14 +433,10 @@ impl<D: Distance> Side<D> {
         }
         Some(self.last)
     }
-
-    #[inline]
     fn label(&self, node: u32) -> D {
         let page = self.directory[node as usize / PAGE] as usize;
         self.pages[page * PAGE + node as usize % PAGE]
     }
-
-    #[inline]
     fn set_label(&mut self, node: u32, dist: D) {
         let entry = node as usize / PAGE;
         if self.directory[entry] == 0 {

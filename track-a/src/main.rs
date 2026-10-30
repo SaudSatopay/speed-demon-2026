@@ -10,12 +10,10 @@
 //! memory whole.
 
 use std::arch::x86_64::*;
-use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
@@ -50,8 +48,8 @@ const START_BITS: u32 = 40;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn prctl(option: c_int, a: u64, b: u64, c: u64, d: u64) -> c_int;
-    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
+    fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -64,7 +62,14 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len + PADDING,
+            read,
+            private | anonymous,
+            -1,
+            0,
+        );
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -72,7 +77,6 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
-#[inline]
 fn load_u64(log: &[u8], pos: usize) -> u64 {
     assert!(pos + 8 <= log.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and the load needs no alignment.
@@ -81,7 +85,6 @@ fn load_u64(log: &[u8], pos: usize) -> u64 {
 
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
 /// within 64, so two 32-byte loads almost always settle it, with no byte loop to mispredict.
-#[inline]
 fn offset_of_space(log: &[u8], pos: usize) -> usize {
     let mut offset = 0;
     loop {
@@ -108,9 +111,7 @@ fn offset_of_space(log: &[u8], pos: usize) -> usize {
 fn thread_count() -> usize {
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    Some(asked)
-        .filter(|&threads| threads > 0)
-        .unwrap_or_else(allowed)
+    Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
 }
 
 /// Runs `work` on `threads` threads, and waits for them all.
@@ -125,7 +126,6 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
 /// Mixes an endpoint's length with its first and last 8 bytes, which tell nearly all templated paths
 /// apart. A test build swaps it for a constant, so that every key collides and any logic that trusts
 /// a hash without comparing the key shows up as a wrong answer.
-#[inline]
 fn hash(words: [u64; 2], len: usize) -> u64 {
     let hash = words.iter().fold(len as u64, |hash, &word| {
         let mixed = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -138,7 +138,6 @@ fn hash(words: [u64; 2], len: usize) -> u64 {
 /// that all threads share with no locks: one compare-and-swap publishes a whole slot, and a published
 /// slot never changes. A key is always compared in full, against its first occurrence in the log,
 /// because templated paths share prefixes, suffixes and lengths. Slot 0 stays free: see `Hour`.
-#[inline]
 fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
@@ -193,7 +192,6 @@ type Hour = (Vec<AtomicU32>, AtomicUsize, Mutex<Vec<u64>>);
 /// Hours since the start of the span, read from four timestamp bytes without parsing a date.
 /// Oct 30, Oct 31, Nov 1 and Nov 2 differ in the last digit of the month and of the day:
 /// (month & 1) + (day & 3) gives 0, 1, 2 and 3.
-#[inline]
 fn hour_index(log: &[u8], line: usize) -> usize {
     let bytes = load_u64(log, line + 6).to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
     let day = (bytes[0] & 1) + (bytes[3] & 3);
@@ -204,7 +202,6 @@ fn hour_index(log: &[u8], line: usize) -> usize {
 /// Reads the latency at `pos`, and returns it with the number of digits. Digits have bit 4 set and an
 /// LF doesn't, so one load finds the end of up to 8 digits, and three multiplications parse them,
 /// which leaves only the rarest latencies to the loop.
-#[inline]
 fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
     let word = load_u64(log, pos);
     let mut digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
@@ -266,7 +263,6 @@ fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, 
 /// The 8 decimal digits of a value below 10^8, as bytes with the most significant first, and with
 /// no ASCII offset yet. Each step splits every number in its lane in two, in parallel, by multiplying
 /// by a scaled reciprocal: 10^8 into two of 10^4, those into 10^2, and those into digits.
-#[inline]
 fn eight_digits(value: u64) -> u64 {
     let high_low = value / 10_000 | (value % 10_000) << 32;
     let hundreds = (high_low * 10486 >> 20) & 0x0000_007F_0000_007F;
@@ -276,7 +272,6 @@ fn eight_digits(value: u64) -> u64 {
 }
 
 /// Appends a number in decimal, with no loop or mispredicted branch for values below 10^8.
-#[inline]
 fn push_decimal(out: &mut Vec<u8>, value: u64) {
     if value >= 100_000_000 {
         write!(out, "{value}").unwrap();

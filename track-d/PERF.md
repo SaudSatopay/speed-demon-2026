@@ -27,7 +27,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 5 | Arcs packed into 4 bytes, with a side table for heavy weights | 8 bytes per arc cost 80 MB, and fewer arcs fit in a cache line | run-b0774bc3ff3f | 0.389 | 123.9 | 57.6 |
 | 6 | A 32-bit search with a 64-bit fallback | Nearly every distance fits in 32 bits, which halves labels and queue entries | run-… | 0.180 *local* | 93.2 *local* | 63.9 *local* |
 | 7 | Numbering seeds claimed in blocks, and a read before each locked swap | On the board, step 5 was far slower than our scorer predicted, and all threads were queueing on one counter | run-9453b8f82b3d | 0.272 | 91.8 | 62.5 |
-| 8 | Labels in pages found through a directory, no hash table, new numbers given at the first visit, and 104 fewer lines | A directory read and a page read replace probing and key compares, and each side fills only its own pages | RUN8 | T8 | M8 | P8 |
+| 8 | Labels in pages found through a directory, no hash table, new numbers given at the first visit, and 104 fewer lines | A directory read and a page read replace probing and key compares, and each side fills only its own pages | run-d47336fddad4 | 0.238 | 78.0 | 65.4 |
 
 ## Decision log
 

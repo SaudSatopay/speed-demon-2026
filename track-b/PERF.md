@@ -25,6 +25,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 2 | Block scan, a term table with keys inline, and postings as chains of 2-byte offsets | The profile showed the scan at 75% of the time, and postings were held twice | run-… | 0.194 *local* | 99.3 *local* | 62.4 *local* |
 | 3 | AND and NOT runs reordered, rarest first, and a skip while R is empty | Most queries have small answers, so most list reads were wasted | run-1408d1e22436 | 0.297 | 70.2 | 64.7 |
 | 4 | Bitmaps for more terms, at df >= N/48 instead of N/18 | Setting a bit is cheaper than extending a chain, and memory barely moved | run-5908f2d87a23 | 0.273 | 72.9 | 65.5 |
+| 5 | Answer BOOL queries during the scan, from term stamps, and store postings only for queries anchored on a common term | Chains held most of the memory, and nine queries in ten have a rare term in every match | RUN5 | T5 | M5 | P5 |
 
 ## Decision log
 
@@ -37,6 +38,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D4. Reorder AND and NOT runs.** Context: answering took 55 of 195 ms, with every step reading its whole list, even with R already empty. AND and NOT both intersect, so a run of them between two ORs can go in any order, and the query's first term counts as an AND. Chose: the rarest ANDs first, by the sample's counts, then NOTs, skipping every step while R is empty. A wrong guess only costs time. Cost: 26 lines. Evidence: T 0.194 -> 0.175 s, M 99.3 -> 71.2 MB, K 17.73 -> 19.88 (local). Outcome: kept.
 
 **D5. Move the bitmap threshold by measuring.** Context: we set the threshold from memory alone, at N/18. We then compared N/18, N/24, N/32, N/48 and N/64 on our scorer, and N/48 looked best. `ab.sh` over 9 runs gave -7.1% with 3.7% noise, just inside its twice-the-noise bar, so the board decided: T 0.297 -> 0.273 s, M 70.2 -> 72.9 MB, K 19.70 -> 20.40. Cost: one number. Outcome: kept.
+
+**D6. Answer most BOOL queries in the scan.** Context: M was 73 MB, with the cap at 44 MB, and chains took most of it. Options: compress the chains, or not store them. Chose the second. Every document matching a BOOL query contains an anchor: the rarest AND of its last run, or else each OR term. So at an anchor's first occurrence in a document, each term's stamp (the last document holding it) gives the whole formula in six compares with no branch. Counts and sums accumulate per part of the corpus, and the ten smallest sit behind a lock per query. Evidence: on seed 1, 28,346 of 31,000 BOOL queries are answered this way, in 13.6M evaluations, and 71K terms store nothing. Local M 73 -> 41 MB, T flat, and S 832 -> 790, because the reordering and list modes went too. What would change our minds: a board T above 0.30 s, since this adds to the scan.
 
 ## What didn't work
 

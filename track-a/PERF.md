@@ -22,8 +22,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 0 | The reference, unchanged | — | — | 32.05 | 228 | 0 |
 | 1 | v1: mmap, fixed-offset parsing, full-key table, one thread | Removes `strptime` and per-line objects | run-45e4054a9bf6 | 0.443 | 35.3 | 50.3 |
 | 2 | 12 threads: segments from an atomic cursor, one sortable record per request, ordered appends | Parsing and sorting are independent per segment and per hour | run-4817f2d2cc47 | 0.062 | 48.3 | 69.4 |
-| 3 | Block loads on the hot path: AVX2 space search, word hashing, SWAR latency, one shared lock-free table | We measured about 350 cycles per line, and only 15% of the time in the kernel | run-… | 0.025 *local* | 54.4 *local* | 70.9 *local* |
-| 4 | 32-bit records in one shared array per hour, sorted in place and freed as the text is written | The output counts toward M, and records were 8 bytes, with a copy to sort | run-… | 0.022 *local* | 26.8 *local* | 74.2 *local* |
+| 3 | Block loads on the hot path: AVX2 space search, word hashing, SWAR latency, one shared lock-free table | We measured about 350 cycles per line, and only 15% of the time in the kernel | run-d35f7df5c506 | 0.039 | 48.0 | 73.4 |
+| 4 | 32-bit records in one shared array per hour, sorted in place and freed as the text is written | The output counts toward M, and records were 8 bytes, with a copy to sort | run-f1c9f21494d2 | 0.036 | 20.3 | 77.1 |
 
 ## Decision log
 

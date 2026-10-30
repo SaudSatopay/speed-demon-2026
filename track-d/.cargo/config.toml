@@ -1,5 +1,4 @@
 # Never also set RUSTFLAGS, which replaces these flags entirely.
 [build]
-# x86-64-v3 is AVX2, BMI2, POPCNT and friends, and no AVX-512, like the scoring box. PREFETCHW is on
-# the box too, but x86-64-v3 leaves it out.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+prfchw"]
+# x86-64-v3 is AVX2, BMI2, POPCNT and friends, and no AVX-512, like the scoring box.
+rustflags = ["-C", "target-cpu=x86-64-v3"]

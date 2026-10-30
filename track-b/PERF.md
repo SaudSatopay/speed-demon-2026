@@ -23,7 +23,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 0 | The reference, unchanged | — | — | 56.35 | 2,200 | 0 |
 | 1 | v1: query terms only, bitmaps for common terms, phrases anchored on the rarest term, 12 threads | Most of the corpus's terms aren't asked about, and most tokens trigger no phrase check | run-35592356e93c | 0.360 | 137.6 | 60.3 |
 | 2 | Block scan, a term table with keys inline, and postings as chains of 2-byte offsets | The profile showed the scan at 75% of the time, and postings were held twice | run-… | 0.194 *local* | 99.3 *local* | 62.4 *local* |
-| 3 | AND and NOT runs reordered, rarest first, and a skip while R is empty | Most queries have small answers, so most list reads were wasted | run-… | 0.175 *local* | 71.2 *local* | 64.9 *local* |
+| 3 | AND and NOT runs reordered, rarest first, and a skip while R is empty | Most queries have small answers, so most list reads were wasted | run-1408d1e22436 | 0.297 | 70.2 | 64.7 |
 
 ## Decision log
 

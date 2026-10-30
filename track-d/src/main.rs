@@ -7,7 +7,7 @@
 //! with its own search state, and run a two-ended Dijkstra that gives both sides equal work. Answers
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
-use std::arch::x86_64::{_MM_HINT_ET0, _MM_HINT_T0, _mm_prefetch};
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::{c_int, c_void};
@@ -70,14 +70,6 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 fn prefetch<T>(item: &T) {
     // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) }
-}
-
-/// Asks for the cache line holding `item`, ready to write to. Fetching it just to read would leave
-/// an atomic update stalling on another core's copy, which is slow on the box.
-#[inline]
-fn prefetch_write<T>(item: &T) {
-    // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
-    unsafe { _mm_prefetch::<_MM_HINT_ET0>(std::ptr::from_ref(item).cast()) }
 }
 
 /// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
@@ -350,9 +342,9 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     let links = zeroed_u32s(nodes * LINKS);
     for_each_batch(edge_lines, threads, |batch| {
         for &(tail, head, _) in batch {
-            prefetch_write(&out_counts[tail as usize]);
-            prefetch_write(&in_counts[head as usize]);
-            prefetch_write(&links[tail as usize * LINKS]);
+            prefetch(&out_counts[tail as usize]);
+            prefetch(&in_counts[head as usize]);
+            prefetch(&links[tail as usize * LINKS]);
         }
         for &(tail, head, _) in batch {
             let seen = out_counts[tail as usize].fetch_add(1, Relaxed) as usize;
@@ -390,14 +382,14 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
                 numbers[head as usize].load(Relaxed),
             );
             *new = (tail, head, weight);
-            prefetch_write(&forward.offsets[tail as usize]);
-            prefetch_write(&backward.offsets[head as usize]);
+            prefetch(&forward.offsets[tail as usize]);
+            prefetch(&backward.offsets[head as usize]);
         }
         // Atomic updates wait for earlier stores, so reserve every slot first, and store afterwards.
         for (slot, &(tail, head, _)) in slots.iter_mut().zip(&renumbered[..batch.len()]) {
             *slot = (forward.reserve(tail), backward.reserve(head));
-            prefetch_write(&forward.arcs[slot.0]);
-            prefetch_write(&backward.arcs[slot.1]);
+            prefetch(&forward.arcs[slot.0]);
+            prefetch(&backward.arcs[slot.1]);
         }
         for (slot, &(tail, head, weight)) in slots.iter().zip(&renumbered[..batch.len()]) {
             forward.store(slot.0, head, weight);

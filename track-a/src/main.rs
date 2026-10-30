@@ -364,20 +364,21 @@ fn format_hour(hour: usize, runs: &mut [u32], mut big: &[u64], keys: &[&[u8]], o
         let big_count = group.iter().filter(|&&r| latency(r) == BIG_LATENCY).count();
         let (bigs, rest) = big.split_at(big_count);
         big = rest;
-        // Nearest rank, 1-indexed: ceil(p * n / 100). Each selection only searches below the last.
-        let mut below = n;
+        // Nearest rank, 1-indexed: ceil(p * n / 100). Each selection only searches above the last, and
+        // going upward leaves it the least: the p50 pass splits the group, and the rest is a tail.
+        let mut above = 0;
         let mut pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
             if let Some(&entry) = bigs.get(index.wrapping_sub(n - big_count)) {
                 return entry & 0xFFFF_FFFF;
             }
-            if index < below {
-                group[..below].select_nth_unstable(index);
-                below = index;
+            if index >= above {
+                group[above..].select_nth_unstable(index - above);
+                above = index + 1;
             }
             u64::from(latency(group[index]))
         };
-        let (p99, p95, p50) = (pct(99), pct(95), pct(50));
+        let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         out.extend_from_slice(stamp.as_bytes());
         out.extend_from_slice(keys[(group[0] >> ID_SHIFT) as usize]);
         let count = n as u64;

@@ -22,7 +22,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 0 | The reference, unchanged | — | — | 14.44 | 367 | 0 |
 | 1 | v1: scalar parser from the spec, no strings, interned names, one thread | Removes Python objects and all decoding | run-7908768d3243 | 0.770 | 10.6 | 44.2 |
 | 2 | 12 threads: cuts at CRLF, a lock-free shared name table with one cache line per name | Records are independent, and name lookups dominate the time | run-e9b10f4d8fed | 0.086 | 14 | 65.4 |
-| 3 | Block loads for every field, and lookups batched with prefetching | About 470 cycles per record, with a mispredicted loop exit per field and a stall per name lookup | run-… | 0.028 *local* | 22.2 *local* | 68.5 *local* |
+| 3 | Block loads for every field, and lookups batched with prefetching | About 470 cycles per record, with a mispredicted loop exit per field and a stall per name lookup | run-239daeb7287a | 0.055 | 14.2 | 69.3 |
 
 ## Decision log
 
@@ -36,7 +36,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 ## What didn't work
 
-Nothing tried yet.
+| Experiment | What we expected | What we measured | Where | Kept? |
+|---|---|---|---|---|
+| Counting distinct names in a second phase, one partition per thread, with no shared writes per record | Nearly every record sets a new country bit in a shared cache line, and the box's cross-core traffic is slow, so T should fall a lot | T 0.055 -> 0.059 s, M 14.2 -> 37.4 MB, K 24.35 -> 19.08. Shared bits weren't the bottleneck | run-be17f3a6a2e0 | reverted |
 
 ## The final design
 

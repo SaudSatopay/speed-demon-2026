@@ -28,6 +28,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 6 | A smaller endpoint table, comparing keys against the log | Inline keys cost 262 KB of table and 20 lines, for just 1,842 endpoints | run-e1d40bd48c9a | 0.034 | 19.9 | 77.8 |
 | 7 | Group each hour by counting, in place, and select percentiles | A full sort was about half the output stage, for three order statistics per group | run-c17dc23201a0 | 0.033 | 20.3 | 77.9 |
 | 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-5289b7130599 | 0.033 | 20.0 | 78.5 |
+| 9 | Same design in 307 lines: one word per table slot, published by one compare-and-swap, and no separate rank pass | Rivals were at our T with 210 lines, and 2x S is worth 2.26 points. Cutting needed no speed | RUN9 | T9 | M9 | P9 |
 
 ## Decision log
 
@@ -44,6 +45,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D6. Write the output through a shared mapping.** Context: SpeedDEMONS passed us on the board with T 0.032 s. A profile showed the output stage at about half of T, with `write` calls serial, because tmpfs takes the file's lock for each. Chose: stretch the file to an upper bound, map it, let each thread claim its stretch in hour order, copy without waiting, and cut the file to length at the end. Numbers now print with no digit loop. We also dropped both restart paths, which cost lines for inputs the spec rules out: each hour's array now has room for every line, in pages that stay untouched, and more than 3,584 endpoints aborts. Cost: one `unsafe impl Sync`. Evidence: T 0.022 -> 0.021 s, K 30.48 -> 31.44 (local), but the board stayed at T 0.036 s, so `write` wasn't the bottleneck there. Kept for now. Outcome: removed again in step 8, when it cost lines and still hadn't gained time on the board. T held at 0.033 s and K rose from 36.19 to 37.15.
 
 **D7. Remove the inline keys.** Context: with only 1,842 endpoints, the key texts in the log fit in the caches anyway, so a 64-byte slot per endpoint might not earn its 20 lines. Chose: a 16-byte slot, and a compare against the key's first occurrence in the log. It came out both simpler and faster, because the table now fits the L1 cache. Evidence: T 0.021 -> 0.018 s, S 519 -> 492, K 31.44 -> 34.06 (local). Outcome: kept.
+
+**D8. Cut the code, not the design.** Context: ttimesai took first place with our T and 210 lines to our 468, so code size was what cost us. Options: drop the fast paths, or find what the fast paths don't need. Chose: the second. A table slot became one word (16 bits of hash, the length, the key's first position), so one compare-and-swap publishes it, with no busy state to spin on, and the table halved to 32 KB. Grouping looks up each record's rank itself, so the rank pass went. The method table became a 40-bit constant. Safe code replaced the cast from atomics, and arrays of counts moved onto the stack. Evidence: S 468 -> 307, with local T unchanged at 19.2 ms, and all checks passing. What would change our minds: a board T above 0.036 s.
 
 ## What didn't work
 

@@ -357,11 +357,14 @@ fn parse_records(
         // the end of the file, the padding is zeros, which don't count as a CR.
         pos += 1 + usize::from(file.get(pos) == Some(&b'\r'));
 
-        // The name's first 24 bytes, with whatever follows it masked off.
+        // The name's first 24 bytes, with whatever follows it masked off. BZHI reads only the low 8
+        // bits of its count, so a name of 32 bytes or more can lose a word here. That's still the same
+        // words for the same name, and only the hash uses them: longer names are compared in full.
         let mut key_words = [0; 3];
         for (word, key_word) in key_words.iter_mut().enumerate() {
-            let bytes = name.1.saturating_sub(8 * word).min(8);
-            *key_word = load_u64(file, name.0 + 8 * word) & ((1u128 << (8 * bytes)) - 1) as u64;
+            let bytes = name.1.saturating_sub(8 * word) as u32;
+            // SAFETY: BZHI is in BMI2, which x86-64-v3 includes, and it only touches registers.
+            *key_word = unsafe { _bzhi_u64(load_u64(file, name.0 + 8 * word), 8 * bytes) };
         }
         let hash = hash(&key_words, name.1);
         prefetch(&names.words[names.first + (hash as usize & names.mask) * SLOT_WORDS]);

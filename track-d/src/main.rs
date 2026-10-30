@@ -7,7 +7,7 @@
 //! with its own search state, and run a two-ended Dijkstra that gives both sides equal work. Answers
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::{c_int, c_void};
@@ -53,7 +53,7 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 #[inline]
 fn prefetch<T>(item: &T) {
     // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
-    unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) }
+    unsafe { _mm_prefetch::<_MM_HINT_T1>(std::ptr::from_ref(item).cast()) }
 }
 
 /// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
@@ -149,8 +149,9 @@ fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
 /// Seeds and new numbers a thread takes at a time when numbering.
 const SEED_BLOCK: usize = 1 << 12;
 const NUMBER_BLOCK: u32 = 1 << 10;
-/// Out-neighbours kept per node for numbering. Nodes average 2.9, so this sees most edges.
-const LINKS: usize = 3;
+/// A node's entry while counting: its out-degree, then up to three out-neighbours + 1 for numbering.
+/// Nodes average 2.9, so this sees most edges, and it fits one cache line, unlike two arrays.
+const RECORD: usize = 4;
 
 /// Numbers the nodes so that neighbours sit close in memory, because the input's ids are random, which
 /// makes every hop a cache miss. Each thread walks depth first from a seed, giving each node it
@@ -158,7 +159,7 @@ const LINKS: usize = 3;
 /// themselves, so all of them get a number. Any numbering gives the same answers, and numbers needn't
 /// be dense: a thread's last block has a few unused, and so does number 0, which means no number yet.
 /// Returns the numbers, and how many entries an array indexed by number needs, plus one.
-fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<AtomicU32>, usize) {
+fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<AtomicU32>, usize) {
     let numbers = zeroed_u32s(nodes);
     let (next_seed, next_number) = (AtomicUsize::new(0), AtomicU32::new(1));
     on_threads(threads, || {
@@ -189,11 +190,11 @@ fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<At
                     stack.push(seed);
                 }
                 while let Some(node) = stack.pop() {
-                    for link in &links[node * LINKS..][..LINKS] {
+                    for link in &records[node * RECORD + 1..][..RECORD - 1] {
                         let neighbour = link.load(Relaxed) as usize;
                         if neighbour != 0 && claim(neighbour - 1) {
                             stack.push(neighbour - 1);
-                            prefetch(&links[(neighbour - 1) * LINKS]);
+                            prefetch(&records[(neighbour - 1) * RECORD]);
                         }
                     }
                 }
@@ -289,34 +290,32 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     let nodes = next_number(graph_file, &mut pos) as usize;
     next_number(graph_file, &mut pos); // The edge count: the file's length says the same.
     let edge_lines = &graph_file[pos..];
-    let (out_counts, in_counts) = (zeroed_u32s(nodes), zeroed_u32s(nodes));
-    let links = zeroed_u32s(nodes * LINKS);
+    let (records, in_counts) = (zeroed_u32s(nodes * RECORD), zeroed_u32s(nodes));
     for_each_batch(edge_lines, threads, |batch| {
         for &(tail, head, _) in batch {
-            prefetch(&out_counts[tail as usize]);
+            prefetch(&records[tail as usize * RECORD]);
             prefetch(&in_counts[head as usize]);
-            prefetch(&links[tail as usize * LINKS]);
         }
         for &(tail, head, _) in batch {
-            let seen = out_counts[tail as usize].fetch_add(1, Relaxed) as usize;
-            if seen < LINKS {
-                links[tail as usize * LINKS + seen].store(head + 1, Relaxed);
+            let record = &records[tail as usize * RECORD..][..RECORD];
+            let seen = record[0].fetch_add(1, Relaxed) as usize;
+            if seen < RECORD - 1 {
+                record[seen + 1].store(head + 1, Relaxed);
             }
             in_counts[head as usize].fetch_add(1, Relaxed);
         }
     });
-    let (numbers, entries) = local_numbering(&links, nodes, threads);
-    drop(links);
+    let (numbers, entries) = local_numbering(&records, nodes, threads);
 
     let (out_new, in_new) = (zeroed_u32s(entries), zeroed_u32s(entries));
     for_ranges(nodes, threads, |start, end| {
         for node in start..end {
             let new = numbers[node].load(Relaxed) as usize;
-            out_new[new].store(out_counts[node].load(Relaxed), Relaxed);
+            out_new[new].store(records[node * RECORD].load(Relaxed), Relaxed);
             in_new[new].store(in_counts[node].load(Relaxed), Relaxed);
         }
     });
-    drop((out_counts, in_counts));
+    drop((records, in_counts));
     let mut forward = Graph::from_counts(out_new);
     let mut backward = Graph::from_counts(in_new);
 

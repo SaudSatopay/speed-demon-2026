@@ -23,7 +23,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 1 | v1: scalar parser from the spec, no strings, interned names, one thread | Removes Python objects and all decoding | run-7908768d3243 | 0.770 | 10.6 | 44.2 |
 | 2 | 12 threads: cuts at CRLF, a lock-free shared name table with one cache line per name | Records are independent, and name lookups dominate the time | run-e9b10f4d8fed | 0.086 | 14 | 65.4 |
 | 3 | Block loads for every field, and lookups batched with prefetching | About 470 cycles per record, with a mispredicted loop exit per field and a stall per name lookup | run-239daeb7287a | 0.055 | 14.2 | 69.3 |
-| 4 | Slow paths the spec rules out removed, 1-byte region entries | Sanjay Sah passed us with half our lines and less memory, and S and M were costing more than T | run-… | 0.028 *local* | 20.8 *local* | 69.1 *local* |
+| 4 | Slow paths the spec rules out removed, 1-byte region entries | Sanjay Sah passed us with half our lines and less memory, and S and M were costing more than T | run-c96eba9a4379 | 0.050 | 12.9 | 71.2 |
+| 5 | Same design in 369 lines: one exit from the table's loop, a row that is an array, and regions parsed once | Two passes over `regions.csv` were serial time, and rivals have half our lines | RUN5 | T5 | M5 | P5 |
 
 ## Decision log
 
@@ -36,6 +37,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D4. Block loads, and batched lookups.** Context: a record cost about 470 cycles. Each field's byte loop mispredicted its exit, and each name lookup stalled on a cache miss. Chose: 64-byte quote masks for text fields, one 8-byte load per number, and an amount squeezed into 8 digits by moving the digits before the point up a byte. Records then wait in batches of 16 while their table slots and region entries are prefetched. The padded mapping means no tail code. Cost: S 410 -> 549. Evidence: T 0.041 -> 0.028 s, K 20.11 -> 23.44 (local), and the sweep, including `lf-except-last`, still passes. Outcome: kept.
 
 **D5. Remove what the spec rules out.** Context: Sanjay Sah took 1st with T 0.066 s against our 0.051, but S 275 against our 549. Section 2.2 caps ids, region ids and amounts at 8 bytes, so their byte-loop fallbacks could go, and 240 countries fit in a byte, which frees 1 MB. More than 255 countries now aborts rather than risking a wrong answer. Cost: none in time. Evidence: S 549 -> 485, M 22.2 -> 20.8 MB, K 23.46 -> 24.09 (local). Outcome: see the journey table.
+
+**D6. Cut the code, not the design.** Context: on Track A, cutting lines without touching the hot paths took first place. Options: the same here. Chose: a row as an array of eight numbers, where a single record is a row too, so one `merge` adds a record to its country and adds up the threads' rows. Regions are parsed once, into a temporary list, instead of twice, because that stage is serial. Ids past the highest region share one last entry of the table, so finding a country has no branch. Evidence: S 485 -> 369, with local T -2.5% (noise 7.4%), and all checks passing. What would change our minds: a higher T on the board, over a few runs, since T swings between 0.050 and 0.063 s on the board with no change in the code.
 
 ## What didn't work
 

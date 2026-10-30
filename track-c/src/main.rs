@@ -90,15 +90,6 @@ fn thread_count() -> usize {
     Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
 }
 
-/// Runs `work` on `threads` threads, and waits for them all.
-fn on_threads(threads: usize, work: impl Fn() + Sync) {
-    thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(&work);
-        }
-    });
-}
-
 /// Reads the digits at `pos` and steps past the separator after them. Ids and region ids have at most
 /// 8 digits (spec sections 2.2 and 3), so one 8-byte load settles them: digits have bit 4 set, and
 /// commas and line ends don't, so the first clear bit marks the end, with no loop to mispredict.
@@ -107,13 +98,6 @@ fn next_number(text: &[u8], pos: &mut usize) -> u64 {
     let digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
     *pos += digits + 1;
     parse_eight_digits(word << (64 - 8 * digits))
-}
-
-/// The position just past the first LF, where the first data line starts.
-fn after_header(text: &[u8]) -> usize {
-    text.iter()
-        .position(|&c| c == b'\n')
-        .map_or(text.len(), |lf| lf + 1)
 }
 
 /// The first record boundary at or after `pos`: just past the next CRLF, or the end of the file.
@@ -127,16 +111,12 @@ fn next_boundary(file: &[u8], pos: usize) -> usize {
         .map_or(file.len(), |cr| pos + cr + 2)
 }
 
-/// The join table: country indices by region id, and each index's key. Index 0 is `_UNMATCHED`, and
-/// the codes take the next indices as they first appear, so the output is sorted when it's written.
-/// The table's last entry is past every region id, and stays unmatched, for every id above them.
-struct Regions {
-    country_of: Vec<u8>,
-    keys: Vec<String>,
-}
-
-fn parse_regions(file: &[u8]) -> Regions {
-    let mut pos = after_header(file);
+/// Returns the join table, country indices by region id, and each index's key. Index 0 is
+/// `_UNMATCHED`, and the codes take the next indices as they first appear, so the output is sorted
+/// when it's written. The table's last entry is past every region id, and stays unmatched, for every
+/// id above them.
+fn parse_regions(file: &[u8]) -> (Vec<u8>, Vec<String>) {
+    let mut pos = b"region_id,country\n".len(); // The header never varies (spec section 2.3).
     let (mut country_of, mut index_of) = (vec![0u8], vec![0u8; CODES]);
     let mut keys = vec!["_UNMATCHED".to_string()];
     while pos < file.len() {
@@ -155,7 +135,7 @@ fn parse_regions(file: &[u8]) -> Regions {
         }
         country_of[id] = index_of[code];
     }
-    Regions { country_of, keys }
+    (country_of, keys)
 }
 
 /// Mixes a name's first 24 bytes and its length. A test build swaps it for a constant, so that every
@@ -267,15 +247,13 @@ struct TextField(usize, usize, usize);
 
 /// Parses the text field at `pos` and steps past the comma after it. A quoted field ends at the first
 /// `"` that isn't part of a `""` pair, and inside quotes every other byte is data, commas and LFs
-/// included. An empty unquoted field and `""` both give empty raw bytes, so they are one value.
+/// included. An unquoted name or note is always empty (spec section 2.2), and it gives the same empty
+/// raw bytes as `""`, so they are one value.
 fn text_field(file: &[u8], pos: &mut usize) -> TextField {
     let start = *pos;
     if file[start] != b'"' {
-        while file[*pos] != b',' {
-            *pos += 1;
-        }
         *pos += 1;
-        return TextField(start, *pos - 1 - start, *pos - 1 - start);
+        return TextField(start, 0, 0);
     }
     let mut scan = start + 1;
     let mut pairs = 0;
@@ -334,15 +312,9 @@ type Pending = (i64, i64, usize, TextField, usize, [u64; 3], u64);
 const BATCH: usize = 16;
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(
-    mut pos: usize,
-    end: usize,
-    regions: &Regions,
-    names: &NameTable,
-    rows: &mut [Row],
-) {
+fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, rows: &mut [Row]) {
     let file = names.file;
-    let last_region = regions.country_of.len() - 1;
+    let last_region = regions.len() - 1;
     let mut batch = [Pending::default(); BATCH];
     let mut count = 0;
     while pos < end {
@@ -368,7 +340,7 @@ fn parse_records(
         }
         let hash = hash(&key_words, name.1);
         prefetch(&names.words[names.first + (hash as usize & names.mask) * SLOT_WORDS]);
-        prefetch(&regions.country_of[region]);
+        prefetch(&regions[region]);
         batch[count] = (id, cents, region, name, note.2, key_words, hash);
         count += 1;
         if count == BATCH {
@@ -379,9 +351,9 @@ fn parse_records(
     add_records(&batch[..count], regions, names, rows);
 }
 
-fn add_records(batch: &[Pending], regions: &Regions, names: &NameTable, rows: &mut [Row]) {
+fn add_records(batch: &[Pending], regions: &[u8], names: &NameTable, rows: &mut [Row]) {
     for &(id, cents, region, name, note_bytes, key_words, hash) in batch {
-        let country = usize::from(regions.country_of[region]);
+        let country = usize::from(regions[region]);
         let key = &names.file[name.0..name.0 + name.1];
         let is_new = i64::from(names.mark(key, &key_words, hash, country));
         let (name_bytes, note_bytes) = (name.2 as i64, note_bytes as i64);
@@ -396,13 +368,13 @@ fn add_records(batch: &[Pending], regions: &Regions, names: &NameTable, rows: &m
 /// balances the load. Tying the size to the thread count also makes the SD_THREADS test sweep move
 /// every cut. The spec's pool of names is a distribution, not a promise: if a file holds more names
 /// than the table, the pass is thrown away and redone with a bigger table.
-fn aggregate(file: &[u8], regions: &Regions, threads: usize, slots: usize) -> Vec<Row> {
+fn aggregate(file: &[u8], regions: &[u8], groups: usize, threads: usize, slots: usize) -> Vec<Row> {
     let names = NameTable::new(file, slots);
     let segment = (file.len() / (threads * 8)).max(1);
     let cursor = AtomicUsize::new(0);
-    let totals = Mutex::new(vec![EMPTY_ROW; regions.keys.len()]);
-    on_threads(threads, || {
-        let mut rows = vec![EMPTY_ROW; regions.keys.len()];
+    let totals = Mutex::new(vec![EMPTY_ROW; groups]);
+    let work = || {
+        let mut rows = vec![EMPTY_ROW; groups];
         let claim = || Some(cursor.fetch_add(segment, Relaxed)).filter(|&s| s < file.len());
         while let Some(start) = claim() {
             let first = (start > 0).then(|| next_boundary(file, start)).unwrap_or(0);
@@ -412,9 +384,14 @@ fn aggregate(file: &[u8], regions: &Regions, threads: usize, slots: usize) -> Ve
         for (total, row) in totals.lock().unwrap().iter_mut().zip(&rows) {
             merge(total, row);
         }
+    };
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(&work);
+        }
     });
     if names.is_full() {
-        return aggregate(file, regions, threads, slots * 4);
+        return aggregate(file, regions, groups, threads, slots * 4);
     }
     totals.into_inner().unwrap()
 }
@@ -425,18 +402,15 @@ fn main() -> io::Result<()> {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let data_dir = Path::new(&data_dir);
     let threads = thread_count();
-    let regions = parse_regions(map_file(&data_dir.join("regions.csv"))?);
+    let (regions, keys) = parse_regions(map_file(&data_dir.join("regions.csv"))?);
     let records = map_file(&data_dir.join("records.csv"))?;
-    let totals = aggregate(
-        &records[after_header(records)..],
-        &regions,
-        threads,
-        INITIAL_SLOTS,
-    );
+    // The header always ends in CRLF (spec section 2.2).
+    let records = &records[next_boundary(records, 0)..];
+    let totals = aggregate(records, &regions, keys.len(), threads, INITIAL_SLOTS);
 
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are
     // already in output order, and a group without records gets no line.
-    let mut lines: Vec<_> = regions.keys.iter().zip(&totals).collect();
+    let mut lines: Vec<_> = keys.iter().zip(&totals).collect();
     lines.sort();
     let mut out = BufWriter::new(File::create(Path::new(&out_dir).join("aggregates.txt"))?);
     for (key, row) in lines.into_iter().filter(|(_, row)| row[0] > 0) {

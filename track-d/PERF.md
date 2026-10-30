@@ -27,6 +27,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 5 | Arcs packed into 4 bytes, with a side table for heavy weights | 8 bytes per arc cost 80 MB, and fewer arcs fit in a cache line | run-b0774bc3ff3f | 0.389 | 123.9 | 57.6 |
 | 6 | A 32-bit search with a 64-bit fallback | Nearly every distance fits in 32 bits, which halves labels and queue entries | run-… | 0.180 *local* | 93.2 *local* | 63.9 *local* |
 | 7 | Numbering seeds claimed in blocks, and a read before each locked swap | On the board, step 5 was far slower than our scorer predicted, and all threads were queueing on one counter | run-9453b8f82b3d | 0.272 | 91.8 | 62.5 |
+| 8 | Labels in pages found through a directory, no hash table, new numbers given at the first visit, and 104 fewer lines | A directory read and a page read replace probing and key compares, and each side fills only its own pages | RUN8 | T8 | M8 | P8 |
 
 ## Decision log
 
@@ -47,6 +48,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D8. Search in 32 bits first.** Context: labels took 24 bytes and queue entries 16, yet only the spec's huge-weight queries pass 2^32. Options: a narrower type with escapes, or generic code run twice. Chose: the same search, generic over the distance type. The 32-bit run gives up as soon as a distance doesn't fit, and that query runs again in 64 bits. Cost: S 465 -> 500. The first attempt compared before checking the fit, so a too-large candidate was silently dropped, and the bank caught it at once. Evidence: M 128.0 -> 93.2 MB, T 0.190 -> 0.180 s, K 17.50 -> 18.99 (local). Outcome: kept.
 
 **D9. Trust the board over our scorer.** Context: step 5 took 0.389 s on the board, where our scorer predicted 0.253 s, so K fell from 15.30 to 14.19 despite the local gains. Fitting earlier runs put the board's build at about 124 ms before step 4 and about 260 ms after it. The only new shared write was in numbering: near the end, every thread fetched seeds from one counter, about 1.74M locked increments on one cache line. That costs little on our single-CCD PC, and much more with the box's slower cross-core traffic. Chose: seeds in blocks of 4,096, and a plain read before each locked swap. Cost: S +8. Evidence: T 0.180 -> 0.157 s, K 18.99 -> 20.32 (local). The board confirmed it: T 0.389 -> 0.272 s, K 14.19 -> 17.80. Outcome: kept.
+
+**D10. Pages instead of a hash table.** Context: a review measured the search at 54% of the run, with the label table as its largest cost. Options: a bigger table, a node-sized array per thread (7 MB each), or pages. Chose: 64-node pages of 4-byte distances, through a directory of `nodes / 64` entries per side. Neighbours have nearby numbers, so the largest search fills about 585 KB, where the table and labels filled about 2 MB. Page 0 is all `UNREACHED` and empty directory entries point at it, so a read has no branch. With no key hash left, `sd_const_hash` has nothing to guard here. Evidence: local T 0.178 -> 0.138 s, M 87 -> 76 MB, and S 508 -> 404. What would change our minds: a lower K on the board.
 
 ## What didn't work
 

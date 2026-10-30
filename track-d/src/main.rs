@@ -15,8 +15,9 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::ptr::null_mut;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 /// Above any real distance, since node ids fit far below 2^30 and weights below 2^32, and low enough
@@ -25,14 +26,7 @@ const INF: u64 = 1 << 62;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
-    fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
+    fn mmap(at: *mut c_void, len: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut c_void;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -41,27 +35,17 @@ const PADDING: usize = 4096;
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
 /// scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
 fn map_file(path: &Path) -> io::Result<&'static [u8]> {
-    const PROT_READ: c_int = 1;
-    const MAP_PRIVATE: c_int = 2;
-    const MAP_FIXED: c_int = 0x10;
-    const MAP_ANONYMOUS: c_int = 0x20;
+    let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
-    let null = std::ptr::null_mut();
-    // SAFETY: the first call reserves fresh zero pages for the file and its padding, and the second
-    // maps the file over the start of them. Neither is ever unmapped, and nothing writes to the
+    // SAFETY: the first call reserves fresh zero pages, and the second maps the file over the start
+    // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
-        let base = mmap(null, len + PADDING, PROT_READ, anonymous, -1, 0);
-        if base as isize == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let fixed = MAP_PRIVATE | MAP_FIXED;
-        if len > 0 && mmap(base, len, PROT_READ, fixed, file.as_raw_fd(), 0) as isize == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(std::slice::from_raw_parts(base as *const u8, len))
+        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
+        let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
+        assert!(base as isize != -1 && (mapped == base || len == 0));
+        Ok(std::slice::from_raw_parts(base.cast(), len))
     }
 }
 
@@ -75,13 +59,20 @@ fn prefetch<T>(item: &T) {
 /// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
 /// box's 12 threads.
 fn thread_count() -> usize {
-    match std::env::var("SD_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        Some(threads) if threads > 0 => threads,
-        _ => thread::available_parallelism().map_or(1, |n| n.get().min(12)),
-    }
+    let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
+    let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
+    Some(asked)
+        .filter(|&threads| threads > 0)
+        .unwrap_or_else(allowed)
+}
+
+/// Runs `work` on `threads` threads, and waits for them all.
+fn on_threads(threads: usize, work: impl Fn() + Sync) {
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(&work);
+        }
+    });
 }
 
 /// Reads the number at `pos` and steps past the separator after it. One 8-byte load settles all but
@@ -92,29 +83,18 @@ fn next_number(text: &[u8], pos: &mut usize) -> u64 {
     assert!(*pos + 8 <= text.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and it needs no alignment.
     let word = unsafe { text.as_ptr().add(*pos).cast::<u64>().read_unaligned() };
-    let ends = !word & 0x1010_1010_1010_1010;
-    if ends != 0 {
-        let digits = ends.trailing_zeros() as usize / 8;
-        *pos += digits + 1;
-        return parse_digits(word, digits);
-    }
-    let mut value = parse_digits(word, 8);
-    *pos += 8;
-    while text[*pos] >= b'0' {
-        value = value * 10 + u64::from(text[*pos] - b'0');
+    let digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
+    let aligned = (word << (64 - 8 * digits)) & 0x0F0F_0F0F_0F0F_0F0F;
+    let pairs = aligned.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
+    let quads = pairs.wrapping_mul((100 << 16) + 1) >> 16 & 0x0000_FFFF_0000_FFFF;
+    let mut value = quads.wrapping_mul((10000 << 32) + 1) >> 32;
+    *pos += digits;
+    while let Some(digit @ b'0'..) = text.get(*pos) {
+        value = value * 10 + u64::from(digit - b'0');
         *pos += 1;
     }
     *pos += 1;
     value
-}
-
-/// Parses the digits in the low `count` bytes of `word` (1 to 8 of them), in three multiplications.
-#[inline]
-fn parse_digits(word: u64, count: usize) -> u64 {
-    let digits = (word << (64 - 8 * count)) & 0x0F0F_0F0F_0F0F_0F0F;
-    let pairs = digits.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
-    let quads = pairs.wrapping_mul((100 << 16) + 1) >> 16 & 0x0000_FFFF_0000_FFFF;
-    quads.wrapping_mul((10000 << 32) + 1) >> 32
 }
 
 /// Runs `work` on ranges of `0..len`, claimed from an atomic cursor. Eight ranges per thread balance
@@ -122,17 +102,10 @@ fn parse_digits(word: u64, count: usize) -> u64 {
 fn for_ranges(len: usize, threads: usize, work: impl Fn(usize, usize) + Sync) {
     let size = (len / (threads * 8)).max(1);
     let cursor = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let start = cursor.fetch_add(size, Relaxed);
-                    if start >= len {
-                        return;
-                    }
-                    work(start, (start + size).min(len));
-                }
-            });
+    on_threads(threads, || {
+        let claim = || Some(cursor.fetch_add(size, Relaxed)).filter(|&start| start < len);
+        while let Some(start) = claim() {
+            work(start, (start + size).min(len));
         }
     });
 }
@@ -173,78 +146,62 @@ fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
     vec![0u32; len].into_iter().map(AtomicU32::new).collect()
 }
 
-/// Seeds a thread takes at a time when numbering.
+/// Seeds and new numbers a thread takes at a time when numbering.
 const SEED_BLOCK: usize = 1 << 12;
+const NUMBER_BLOCK: u32 = 1 << 10;
 /// Out-neighbours kept per node for numbering. Nodes average 2.9, so this sees most edges.
 const LINKS: usize = 3;
 
 /// Numbers the nodes so that neighbours sit close in memory, because the input's ids are random, which
-/// makes every hop a cache miss. Each thread walks depth first from a seed, claiming nodes as it goes
-/// and listing them in order, and the lists joined together give the new numbers. Any numbering gives
-/// the same answers. Nodes the walks miss become seeds themselves, so all of them get a number.
-fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> Vec<AtomicU32> {
-    let claimed: Vec<AtomicBool> = (0..nodes).map(|_| AtomicBool::new(false)).collect();
-    let next_seed = AtomicUsize::new(0);
-    let lists: Vec<Vec<u32>> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    // Most claims fail, and a plain read of a flag costs far less than a locked swap.
-                    let claim = |node: usize| {
-                        !claimed[node].load(Relaxed) && !claimed[node].swap(true, Relaxed)
-                    };
-                    let (mut list, mut stack) = (Vec::new(), Vec::new());
-                    let (mut seed, mut seeds_end) = (0, 0);
-                    loop {
-                        let node = match stack.pop() {
-                            Some(node) => node,
-                            None => loop {
-                                // Seeds come in blocks, because near the end nearly all are taken,
-                                // and one shared counter hit per node would make the threads queue.
-                                if seed == seeds_end {
-                                    seed = next_seed.fetch_add(SEED_BLOCK, Relaxed);
-                                    seeds_end = (seed + SEED_BLOCK).min(nodes);
-                                    if seed >= nodes {
-                                        return list;
-                                    }
-                                }
-                                seed += 1;
-                                if claim(seed - 1) {
-                                    break seed as u32 - 1;
-                                }
-                            },
-                        };
-                        list.push(node);
-                        for link in &links[node as usize * LINKS..][..LINKS] {
-                            let neighbour = link.load(Relaxed) as usize;
-                            if neighbour != 0 && claim(neighbour - 1) {
-                                stack.push(neighbour as u32 - 1);
-                                prefetch(&links[(neighbour - 1) * LINKS]);
-                            }
+/// makes every hop a cache miss. Each thread walks depth first from a seed, giving each node it
+/// reaches first its next number, from a block of its own. Nodes the walks miss become seeds
+/// themselves, so all of them get a number. Any numbering gives the same answers, and numbers needn't
+/// be dense: a thread's last block has a few unused, and so does number 0, which means no number yet.
+/// Returns the numbers, and how many entries an array indexed by number needs, plus one.
+fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<AtomicU32>, usize) {
+    let numbers = zeroed_u32s(nodes);
+    let (next_seed, next_number) = (AtomicUsize::new(0), AtomicU32::new(1));
+    on_threads(threads, || {
+        let (mut number, mut numbers_end, mut stack) = (0, 0, Vec::new());
+        // Most claims fail, and a plain read costs far less than a locked update.
+        let mut claim = |node: usize| {
+            if number == numbers_end {
+                number = next_number.fetch_add(NUMBER_BLOCK, Relaxed);
+                numbers_end = number + NUMBER_BLOCK;
+            }
+            let free = numbers[node].load(Relaxed) == 0;
+            let won = free
+                && numbers[node]
+                    .compare_exchange(0, number, Relaxed, Relaxed)
+                    .is_ok();
+            number += u32::from(won);
+            won
+        };
+        loop {
+            // Seeds come in blocks, because near the end nearly all are taken, and one shared counter
+            // hit per node would make the threads queue.
+            let block = next_seed.fetch_add(SEED_BLOCK, Relaxed);
+            if block >= nodes {
+                return;
+            }
+            for seed in block..(block + SEED_BLOCK).min(nodes) {
+                if claim(seed) {
+                    stack.push(seed);
+                }
+                while let Some(node) = stack.pop() {
+                    for link in &links[node * LINKS..][..LINKS] {
+                        let neighbour = link.load(Relaxed) as usize;
+                        if neighbour != 0 && claim(neighbour - 1) {
+                            stack.push(neighbour - 1);
+                            prefetch(&links[(neighbour - 1) * LINKS]);
                         }
                     }
-                })
-            })
-            .collect();
-        let joined = handles.into_iter().map(|handle| handle.join());
-        joined
-            .map(|list| list.expect("panic = \"abort\" means a join can't fail"))
-            .collect()
-    });
-    let numbers = zeroed_u32s(nodes);
-    thread::scope(|scope| {
-        let mut first = 0;
-        for list in &lists {
-            let numbers = &numbers;
-            scope.spawn(move || {
-                for (i, &node) in list.iter().enumerate() {
-                    numbers[node as usize].store(first + i as u32, Relaxed);
                 }
-            });
-            first += list.len() as u32;
+            }
         }
     });
-    numbers
+    let entries = next_number.into_inner() as usize + 1;
+    (numbers, entries)
 }
 
 /// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
@@ -256,8 +213,8 @@ struct Graph {
     offsets: Vec<AtomicU32>,
     arcs: Vec<AtomicU32>,
     weight_bits: u32,
-    heavy: Mutex<Vec<(u32, u32)>>,
-    heavy_sorted: Vec<(u32, u32)>,
+    spilled: Mutex<Vec<(u32, u32)>>,
+    heavy: Vec<(u32, u32)>,
 }
 
 impl Graph {
@@ -275,8 +232,8 @@ impl Graph {
             offsets,
             arcs: zeroed_u32s(total as usize),
             weight_bits: nodes.leading_zeros(),
-            heavy: Mutex::new(Vec::new()),
-            heavy_sorted: Vec::new(),
+            spilled: Mutex::new(Vec::new()),
+            heavy: Vec::new(),
         }
     }
 
@@ -290,21 +247,15 @@ impl Graph {
     fn store(&self, slot: usize, neighbour: u32, weight: u32) {
         let heavy = (1 << self.weight_bits) - 1;
         if weight >= heavy {
-            let list = self.heavy.lock();
-            list.expect("panic = \"abort\" means a lock can't be poisoned")
-                .push((slot as u32, weight));
+            self.spilled.lock().unwrap().push((slot as u32, weight));
         }
         self.arcs[slot].store(neighbour << self.weight_bits | weight.min(heavy), Relaxed);
     }
 
     /// Sorts the heavy weights, once every thread has finished.
     fn seal(&mut self) {
-        let list = self
-            .heavy
-            .get_mut()
-            .expect("panic = \"abort\" means a lock can't be poisoned");
-        self.heavy_sorted = std::mem::take(list);
-        self.heavy_sorted.sort_unstable();
+        self.heavy = std::mem::take(self.spilled.get_mut().unwrap());
+        self.heavy.sort_unstable();
     }
 
     /// The first arc number of `node`, and its arcs.
@@ -324,9 +275,9 @@ impl Graph {
             return (arc >> self.weight_bits, u64::from(weight));
         }
         let at = self
-            .heavy_sorted
+            .heavy
             .partition_point(|entry| (entry.0 as usize) < slot);
-        (arc >> self.weight_bits, u64::from(self.heavy_sorted[at].1))
+        (arc >> self.weight_bits, u64::from(self.heavy[at].1))
     }
 }
 
@@ -354,10 +305,10 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
             in_counts[head as usize].fetch_add(1, Relaxed);
         }
     });
-    let numbers = local_numbering(&links, nodes, threads);
+    let (numbers, entries) = local_numbering(&links, nodes, threads);
     drop(links);
 
-    let (out_new, in_new) = (zeroed_u32s(nodes + 1), zeroed_u32s(nodes + 1));
+    let (out_new, in_new) = (zeroed_u32s(entries), zeroed_u32s(entries));
     for_ranges(nodes, threads, |start, end| {
         for node in start..end {
             let new = numbers[node].load(Relaxed) as usize;
@@ -370,6 +321,7 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     let mut backward = Graph::from_counts(in_new);
 
     for_each_batch(edge_lines, threads, |batch| {
+        let number = |node: u32| numbers[node as usize].load(Relaxed);
         let mut renumbered = [(0, 0, 0); BATCH];
         let mut slots = [(0, 0); BATCH];
         for &(tail, head, _) in batch {
@@ -377,10 +329,7 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
             prefetch(&numbers[head as usize]);
         }
         for (new, &(tail, head, weight)) in renumbered.iter_mut().zip(batch) {
-            let (tail, head) = (
-                numbers[tail as usize].load(Relaxed),
-                numbers[head as usize].load(Relaxed),
-            );
+            let (tail, head) = (number(tail), number(head));
             *new = (tail, head, weight);
             prefetch(&forward.offsets[tail as usize]);
             prefetch(&backward.offsets[head as usize]);
@@ -403,112 +352,67 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
 
 /// A distance type for the search. Nearly every distance fits in 32 bits, which halves the labels and
 /// the queues. The few that don't make the 32-bit search give up, and that query runs again in 64 bits.
-trait Distance: Copy + Ord {
+trait Distance: Copy + Ord + TryFrom<u64> + Into<u64> {
     const UNREACHED: Self;
-    /// Converts a real distance, or returns None if it doesn't fit.
-    fn narrow(wide: u64) -> Option<Self>;
-    fn widen(self) -> u64;
 }
 
 impl Distance for u32 {
     const UNREACHED: u32 = u32::MAX;
-    #[inline]
-    fn narrow(wide: u64) -> Option<u32> {
-        u32::try_from(wide)
-            .ok()
-            .filter(|&narrow| narrow != u32::MAX)
-    }
-    #[inline]
-    fn widen(self) -> u64 {
-        u64::from(self)
-    }
 }
 
 impl Distance for u64 {
     const UNREACHED: u64 = INF;
+}
+
+/// Nodes per page of the label store.
+const PAGE: usize = 64;
+
+/// One side of a search: its tentative distances and its queue. Distances live in pages of `PAGE`
+/// nodes, found through a directory indexed by node, which persists across queries and is reset through
+/// the list of entries a query used. Neighbours have nearby numbers, so a search fills few pages, and
+/// finding a label costs one directory read and one page read, with no key to compare. Page 0 is all
+/// `UNREACHED`, and every empty directory entry points at it, so reading a label needs no branch. A
+/// zeroed directory stays untouched until it's used, which the 64-bit search rarely is.
+struct Side<D> {
+    directory: Vec<u32>,
+    pages: Vec<D>,
+    used: Vec<u32>,
+    queue: BinaryHeap<Reverse<(D, u32)>>,
+}
+
+impl<D: Distance> Side<D> {
+    fn new(entries: usize) -> Side<D> {
+        Side {
+            directory: vec![0; entries / PAGE + 1],
+            pages: vec![D::UNREACHED; PAGE],
+            used: Vec::new(),
+            queue: BinaryHeap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for entry in self.used.drain(..) {
+            self.directory[entry as usize] = 0;
+        }
+        self.pages.truncate(PAGE);
+        self.queue.clear();
+    }
+
     #[inline]
-    fn narrow(wide: u64) -> Option<u64> {
-        Some(wide)
+    fn label(&self, node: u32) -> D {
+        let page = self.directory[node as usize / PAGE] as usize;
+        self.pages[page * PAGE + node as usize % PAGE]
     }
+
     #[inline]
-    fn widen(self) -> u64 {
-        self
-    }
-}
-
-/// One node's tentative distances, from the source and to the target.
-#[derive(Clone, Copy)]
-struct Label<D> {
-    node: u32,
-    dist: [D; 2],
-}
-
-/// Node ids to table slots. A test build swaps this for a constant, so that every node collides and
-/// any logic that trusts a hash without comparing the key shows up as a wrong answer.
-#[cfg(not(sd_const_hash))]
-fn hash(node: u32) -> usize {
-    ((u64::from(node) * 0x9E37_79B9_7F4A_7C15) >> 32) as usize
-}
-
-#[cfg(sd_const_hash)]
-fn hash(_node: u32) -> usize {
-    0
-}
-
-/// A new query's table: enough for the median search, which labels about 200 nodes.
-const SMALL_TABLE: usize = 1 << 10;
-
-/// One thread's reusable search state. Labels sit in a list, in discovery order, and a hash table
-/// finds a node's label. A query's table starts small and grows with its search, so a small search
-/// stays in the fastest caches, and the largest on seed 1 needs about 1 MB per thread, where a
-/// node-sized array would cost 7 MB per thread.
-struct Search<D> {
-    table: Vec<u32>, // Label number + 1, or 0 when free. The length is a power of two.
-    labels: Vec<Label<D>>,
-    queues: [BinaryHeap<Reverse<(D, u32)>>; 2],
-}
-
-impl<D: Distance> Search<D> {
-    fn new() -> Search<D> {
-        Search {
-            table: Vec::new(),
-            labels: Vec::new(),
-            queues: [BinaryHeap::new(), BinaryHeap::new()],
+    fn set_label(&mut self, node: u32, dist: D) {
+        let entry = node as usize / PAGE;
+        if self.directory[entry] == 0 {
+            self.directory[entry] = (self.pages.len() / PAGE) as u32;
+            self.pages.resize(self.pages.len() + PAGE, D::UNREACHED);
+            self.used.push(entry as u32);
         }
-    }
-
-    fn label_index(&mut self, node: u32) -> usize {
-        let mask = self.table.len() - 1;
-        let mut slot = hash(node) & mask;
-        while self.table[slot] != 0 {
-            let label = self.table[slot] as usize - 1;
-            if self.labels[label].node == node {
-                return label;
-            }
-            slot = (slot + 1) & mask;
-        }
-        self.labels.push(Label {
-            node,
-            dist: [D::UNREACHED; 2],
-        });
-        self.table[slot] = self.labels.len() as u32;
-        if self.labels.len() * 2 > self.table.len() {
-            self.grow_table();
-        }
-        self.labels.len() - 1
-    }
-
-    fn grow_table(&mut self) {
-        let size = self.table.len() * 4;
-        self.table.clear();
-        self.table.resize(size, 0);
-        for (number, label) in self.labels.iter().enumerate() {
-            let mut slot = hash(label.node) & (size - 1);
-            while self.table[slot] != 0 {
-                slot = (slot + 1) & (size - 1);
-            }
-            self.table[slot] = number as u32 + 1;
-        }
+        self.pages[self.directory[entry] as usize * PAGE + node as usize % PAGE] = dist;
     }
 
     /// Two-ended Dijkstra, returning INF if there is no path, or None if a distance doesn't fit in D.
@@ -518,54 +422,48 @@ impl<D: Distance> Search<D> {
     ///
     /// The side with less work so far goes next. Choosing the smaller top instead would let the
     /// backward side settle the whole main body on queries from a small island.
-    fn distance(&mut self, graphs: &[Graph; 2], source: u32, target: u32) -> Option<u64> {
-        if source == target {
+    fn distance(sides: &mut [Self; 2], graphs: &[Graph; 2], from: u32, to: u32) -> Option<u64> {
+        if from == to {
             return Some(0);
         }
-        self.table.clear();
-        self.table.resize(SMALL_TABLE, 0);
-        self.labels.clear();
-        self.queues[0].clear();
-        self.queues[1].clear();
-        for (side, node) in [source, target].into_iter().enumerate() {
-            let label = self.label_index(node);
-            self.labels[label].dist[side] = D::narrow(0)?;
-            self.queues[side].push(Reverse((D::narrow(0)?, node)));
+        let fit = |wide: u64| D::try_from(wide).ok().filter(|&dist| dist != D::UNREACHED);
+        let unreached: u64 = D::UNREACHED.into();
+        for (side, node) in sides.iter_mut().zip([from, to]) {
+            side.clear();
+            side.set_label(node, fit(0)?);
+            side.queue.push(Reverse((fit(0)?, node)));
         }
         let mut best = INF;
         let mut work = [0u64; 2];
-        while let (Some(top_f), Some(top_b)) = (self.queues[0].peek(), self.queues[1].peek()) {
-            let tops = [top_f.0.0.widen(), top_b.0.0.widen()];
+        while let (Some(top_f), Some(top_b)) = (sides[0].queue.peek(), sides[1].queue.peek()) {
+            let tops: [u64; 2] = [top_f.0.0.into(), top_b.0.0.into()];
             if tops[0] + tops[1] >= best {
                 break;
             }
             let side = usize::from(work[1] < work[0]);
             let other_top = tops[1 - side];
-            let Some(Reverse((dist, node))) = self.queues[side].pop() else {
-                break;
-            };
-            let label = self.label_index(node);
-            if dist > self.labels[label].dist[side] {
+            let Reverse((dist, node)) = sides[side].queue.pop()?;
+            if dist > sides[side].label(node) {
                 continue; // Stale: this node was queued again at a smaller distance.
             }
+            let dist: u64 = dist.into();
             let (first, arcs) = graphs[side].arcs_of(node);
             work[side] += 1 + arcs.len() as u64;
             for (index, arc) in arcs.iter().enumerate() {
                 let (neighbour, weight) = graphs[side].unpack(first + index, arc.load(Relaxed));
-                let candidate = dist.widen() + weight;
-                let narrow = D::narrow(candidate)?;
-                let label = self.label_index(neighbour);
-                if narrow < self.labels[label].dist[side] {
-                    self.labels[label].dist[side] = narrow;
-                    let other = self.labels[label].dist[1 - side];
-                    if other != D::UNREACHED {
-                        best = best.min(candidate + other.widen());
+                let candidate = dist + weight;
+                let narrow = fit(candidate)?;
+                if narrow < sides[side].label(neighbour) {
+                    sides[side].set_label(neighbour, narrow);
+                    let other: u64 = sides[1 - side].label(neighbour).into();
+                    if other != unreached {
+                        best = best.min(candidate + other);
                     }
                     // If the other side has settled this node, `best` just counted the path through
                     // it. If not, the rest of the way costs at least the other queue's top. So a
                     // node at or past `best` by that bound needn't be expanded.
                     if candidate + other_top < best {
-                        self.queues[side].push(Reverse((narrow, neighbour)));
+                        sides[side].queue.push(Reverse((narrow, neighbour)));
                     }
                 }
             }
@@ -581,43 +479,38 @@ fn main() -> io::Result<()> {
     let data_dir = Path::new(&data_dir);
     let threads = thread_count();
     let (graphs, numbers) = build_graphs(map_file(&data_dir.join("graph.txt"))?, threads);
+    let entries = graphs[0].offsets.len();
 
     let query_lines = map_file(&data_dir.join("queries.txt"))?;
+    let number = |id: u64| numbers[id as usize].load(Relaxed);
     let mut queries = Vec::new();
     let mut pos = 0;
     while pos < query_lines.len() {
-        let source = next_number(query_lines, &mut pos) as usize;
-        let target = next_number(query_lines, &mut pos) as usize;
-        queries.push((numbers[source].load(Relaxed), numbers[target].load(Relaxed)));
+        let source = number(next_number(query_lines, &mut pos));
+        let target = number(next_number(query_lines, &mut pos));
+        queries.push((source, target, AtomicU64::new(0)));
     }
-
     drop(numbers);
 
-    let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let next_query = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let (mut narrow, mut wide) = (Search::<u32>::new(), Search::<u64>::new());
-                loop {
-                    let index = next_query.fetch_add(1, Relaxed);
-                    let Some(&(source, target)) = queries.get(index) else {
-                        return;
-                    };
-                    let answer = narrow.distance(&graphs, source, target);
-                    let answer = answer.or_else(|| wide.distance(&graphs, source, target));
-                    answers[index].store(answer.unwrap_or(INF), Relaxed);
-                }
-            });
+    on_threads(threads, || {
+        let mut narrow = [Side::<u32>::new(entries), Side::new(entries)];
+        let mut wide = [Side::<u64>::new(entries), Side::new(entries)];
+        while let Some((from, to, answer)) = queries.get(next_query.fetch_add(1, Relaxed)) {
+            let distance = Side::distance(&mut narrow, &graphs, *from, *to);
+            let distance = distance.or_else(|| Side::distance(&mut wide, &graphs, *from, *to));
+            answer.store(distance.unwrap_or(INF), Relaxed);
         }
     });
 
     let mut out = BufWriter::new(File::create(Path::new(&out_dir).join("distances.txt"))?);
-    for answer in &answers {
-        match answer.load(Relaxed) {
-            INF => writeln!(out, "-1")?,
-            distance => writeln!(out, "{distance}")?,
-        }
+    for (_, _, answer) in &queries {
+        let distance = answer.load(Relaxed);
+        writeln!(
+            out,
+            "{}",
+            if distance == INF { -1 } else { distance as i64 }
+        )?;
     }
     out.flush()
 }

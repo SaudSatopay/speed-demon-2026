@@ -220,9 +220,11 @@ fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
 }
 
 /// Claims segments until the log runs out. Each line is `ts method endpoint status latency`, where
-/// the timestamp is always 27 bytes.
+/// the timestamp is always 27 bytes. A thread keeps its own unfilled block of each hour, as a slice,
+/// and its own big latencies, so the hot path reads and writes no line that other threads write.
 fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, size: usize) {
-    let mut positions = [0; HOURS]; // This thread's next free record per hour.
+    let mut blocks: [&[AtomicU32]; HOURS] = [&[]; HOURS];
+    let mut bigs = [const { Vec::new() }; HOURS];
     let claim = || Some(cursor.fetch_add(size, Relaxed)).filter(|&start| start < log.len());
     while let Some(start) = claim() {
         let end = (start + size).min(log.len());
@@ -241,22 +243,23 @@ fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, 
             // Three status digits sit between two spaces, so the latency starts 5 bytes on.
             let (latency, digits) = parse_latency(log, key_end + 5);
             let index = hour_index(log, line);
-            let (slots, next, big) = &hours[index];
             if latency >= BIG_LATENCY {
-                big.lock()
-                    .unwrap()
-                    .push(u64::from(id) << 32 | u64::from(latency));
+                bigs[index].push(u64::from(id) << 32 | u64::from(latency));
             }
             let stored = latency.min(BIG_LATENCY);
-            // Blocks start at multiples of their size, so this also catches the first use.
-            let position = &mut positions[index];
-            if *position % BLOCK_RECORDS == 0 {
-                *position = next.fetch_add(BLOCK_RECORDS, Relaxed);
+            let block = &mut blocks[index];
+            if block.is_empty() {
+                let (slots, next, _) = &hours[index];
+                let first = next.fetch_add(BLOCK_RECORDS, Relaxed);
+                *block = &slots[first..first + BLOCK_RECORDS];
             }
-            slots[*position].store(id << ID_SHIFT | stored << 1 | is_error, Relaxed);
-            *position += 1;
+            block[0].store(id << ID_SHIFT | stored << 1 | is_error, Relaxed);
+            *block = &block[1..];
             line = key_end + 5 + digits + 1;
         }
+    }
+    for ((_, _, big), mine) in hours.iter().zip(bigs) {
+        big.lock().unwrap().extend(mine);
     }
 }
 

@@ -29,7 +29,7 @@ See [PERF.md](PERF.md) for run IDs.
 2. **Sides alternate by work, not by the smaller top.** Queries from a small island, and queries to a target nothing reaches, finish after a few settles rather than crossing the whole main body.
 3. **Neighbours close in memory.** The input's ids are random, so renumbering takes the queries from about 190 ms to about 105 ms.
 4. **Batched build.** A batch of edges prefetches its cache lines and lets them arrive together.
-5. **Search state sized to the search.** The median query labels about 200 nodes, and its table stays in the fastest caches. A node-sized array would cost 7 MB per thread.
+5. **Search state sized to the search.** Labels live in 64-node pages, found through a small directory, so a median search stays in the fastest caches, and the largest fills about 585 KB. A node-sized array would cost 7 MB per thread.
 
 ## Ideas and where they came from
 

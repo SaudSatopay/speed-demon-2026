@@ -179,35 +179,72 @@ struct Label {
     dist: [u64; 2],
 }
 
-/// One thread's reusable search state. The labels are a sparse set (Briggs and Torczon): a node's
-/// label is valid when its slot points at a record naming that node. So a new query only has to
-/// empty the list, and the node-sized slot array is never cleared.
+/// Node ids to table slots. A test build swaps this for a constant, so that every node collides and
+/// any logic that trusts a hash without comparing the key shows up as a wrong answer.
+#[cfg(not(sd_const_hash))]
+fn hash(node: u32) -> usize {
+    ((u64::from(node) * 0x9E37_79B9_7F4A_7C15) >> 32) as usize
+}
+
+#[cfg(sd_const_hash)]
+fn hash(_node: u32) -> usize {
+    0
+}
+
+/// A new query's table: enough for the median search, which labels about 200 nodes.
+const SMALL_TABLE: usize = 1 << 10;
+
+/// One thread's reusable search state. Labels sit in a list, in discovery order, and a hash table
+/// finds a node's label. A query's table starts small and grows with its search, so a small search
+/// stays in the fastest caches, and the largest on seed 1 needs about 1 MB per thread, where a
+/// node-sized array would cost 7 MB per thread.
 struct Search {
-    slots: Vec<u32>,
+    table: Vec<u32>, // Label number + 1, or 0 when free. The length is a power of two.
     labels: Vec<Label>,
     queues: [BinaryHeap<Reverse<(u64, u32)>>; 2],
 }
 
 impl Search {
-    fn new(nodes: usize) -> Search {
+    fn new() -> Search {
         Search {
-            slots: vec![0; nodes],
+            table: Vec::new(),
             labels: Vec::new(),
             queues: [BinaryHeap::new(), BinaryHeap::new()],
         }
     }
 
     fn label_index(&mut self, node: u32) -> usize {
-        let slot = self.slots[node as usize] as usize;
-        if slot < self.labels.len() && self.labels[slot].node == node {
-            return slot;
+        let mask = self.table.len() - 1;
+        let mut slot = hash(node) & mask;
+        while self.table[slot] != 0 {
+            let label = self.table[slot] as usize - 1;
+            if self.labels[label].node == node {
+                return label;
+            }
+            slot = (slot + 1) & mask;
         }
-        self.slots[node as usize] = self.labels.len() as u32;
         self.labels.push(Label {
             node,
             dist: [INF, INF],
         });
+        self.table[slot] = self.labels.len() as u32;
+        if self.labels.len() * 2 > self.table.len() {
+            self.grow_table();
+        }
         self.labels.len() - 1
+    }
+
+    fn grow_table(&mut self) {
+        let size = self.table.len() * 4;
+        self.table.clear();
+        self.table.resize(size, 0);
+        for (number, label) in self.labels.iter().enumerate() {
+            let mut slot = hash(label.node) & (size - 1);
+            while self.table[slot] != 0 {
+                slot = (slot + 1) & (size - 1);
+            }
+            self.table[slot] = number as u32 + 1;
+        }
     }
 
     /// Two-ended Dijkstra, returning INF if there is no path. `best` holds the shortest path seen
@@ -221,6 +258,8 @@ impl Search {
         if source == target {
             return 0;
         }
+        self.table.clear();
+        self.table.resize(SMALL_TABLE, 0);
         self.labels.clear();
         self.queues[0].clear();
         self.queues[1].clear();
@@ -232,10 +271,12 @@ impl Search {
         let mut best = INF;
         let mut work = [0u64; 2];
         while let (Some(top_f), Some(top_b)) = (self.queues[0].peek(), self.queues[1].peek()) {
-            if top_f.0.0 + top_b.0.0 >= best {
+            let tops = [top_f.0.0, top_b.0.0];
+            if tops[0] + tops[1] >= best {
                 break;
             }
             let side = usize::from(work[1] < work[0]);
+            let other_top = tops[1 - side];
             let Some(Reverse((dist, node))) = self.queues[side].pop() else {
                 break;
             };
@@ -252,8 +293,13 @@ impl Search {
                 let label = self.label_index(neighbour);
                 if candidate < self.labels[label].dist[side] {
                     self.labels[label].dist[side] = candidate;
-                    self.queues[side].push(Reverse((candidate, neighbour)));
                     best = best.min(candidate + self.labels[label].dist[1 - side]);
+                    // If the other side has settled this node, `best` just counted the path through
+                    // it. If not, the rest of the way costs at least the other queue's top. So a
+                    // node at or past `best` by that bound needn't be expanded.
+                    if candidate + other_top < best {
+                        self.queues[side].push(Reverse((candidate, neighbour)));
+                    }
                 }
             }
         }
@@ -268,7 +314,6 @@ fn main() -> io::Result<()> {
     let data_dir = Path::new(&data_dir);
     let threads = thread_count();
     let graphs = build_graphs(map_file(&data_dir.join("graph.txt"))?, threads);
-    let nodes = graphs[0].offsets.len() - 1;
 
     let query_lines = map_file(&data_dir.join("queries.txt"))?;
     let mut queries = Vec::new();
@@ -284,7 +329,7 @@ fn main() -> io::Result<()> {
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut search = Search::new(nodes);
+                let mut search = Search::new();
                 loop {
                     let index = next_query.fetch_add(1, Relaxed);
                     let Some(&(source, target)) = queries.get(index) else {

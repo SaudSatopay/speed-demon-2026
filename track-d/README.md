@@ -13,12 +13,12 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Limits
 
-- Each thread has its own 7 MB slot array, which random node ids soon touch in full, so M is about 200 MB locally.
+- Each arc takes 8 bytes in each direction, so the graph is 94 MB, and M is about 130 MB locally.
 - Node ids are random, so nearly every hop is a cache miss.
 
 ## Approach
 
-The mapped graph file is parsed twice by 12 threads, which claim segments from an atomic cursor: once to count each node's edges, once to place them into forward and reverse compressed adjacency arrays. That way, no temporary edge list is ever held. Threads then claim queries from an atomic counter. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Labels live in a sparse set per thread, so a new query clears nothing. Each answer goes into its own slot, so the output order doesn't depend on scheduling.
+The mapped graph file is parsed twice by 12 threads, which claim segments from an atomic cursor: once to count each node's edges, once to place them into forward and reverse compressed adjacency arrays. That way, no temporary edge list is ever held. Threads then claim queries from an atomic counter. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Each thread keeps its labels in a list, found through a small hash table that starts at 1,024 slots for each query and grows with the search. Each answer goes into its own slot, so the output order doesn't depend on scheduling.
 
 ## Why it's fast
 
@@ -26,13 +26,13 @@ See [PERF.md](PERF.md) for run IDs.
 
 1. **Two-ended search.** The reference searches from the source only, so it settles everything closer than the target.
 2. **Sides alternate by work, not by the smaller top.** Queries from a small island, and queries to a target nothing reaches, finish after a few settles rather than crossing the whole main body.
-3. **No per-node objects.** The graph is two flat arrays, and the search state is reused.
+3. **Search state sized to the search.** The median query labels about 200 nodes, and its table stays in the fastest caches. A node-sized array would cost 7 MB per thread.
 
 ## Ideas and where they came from
 
 - The stopping rule: Goldberg and Harrelson.
 - Alternating by work: Haeupler et al. show this is instance-optimal, and alternating by smallest key isn't.
-- Sparse-set labels: Briggs and Torczon.
+- Pruning pushes against the other queue's top: a standard bidirectional search refinement.
 
 ## Correctness
 

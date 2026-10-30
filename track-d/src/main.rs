@@ -9,8 +9,6 @@
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
 use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -387,11 +385,17 @@ const PAGE: usize = 64;
 /// finding a label costs one directory read and one page read, with no key to compare. Page 0 is all
 /// `UNREACHED`, and every empty directory entry points at it, so reading a label needs no branch. A
 /// zeroed directory stays untouched until it's used, which the 64-bit search rarely is.
+///
+/// The queue relies on keys never going below the last one popped, as in Dijkstra. Bucket `i` holds the
+/// keys whose highest bit differing from `last` is bit `i - 1`, and bucket 0 the keys equal to it. When
+/// bucket 0 runs dry, the lowest bucket in use spreads into the ones below, so a key moves a few times
+/// in all, with no comparisons against other keys.
 struct Side<D> {
     directory: Vec<u32>,
     pages: Vec<D>,
     used: Vec<u32>,
-    queue: BinaryHeap<Reverse<(D, u32)>>,
+    buckets: Vec<Vec<(D, u32)>>,
+    last: D,
 }
 
 impl<D: Distance> Side<D> {
@@ -400,16 +404,38 @@ impl<D: Distance> Side<D> {
             directory: vec![0; entries / PAGE + 1],
             pages: vec![D::UNREACHED; PAGE],
             used: Vec::new(),
-            queue: BinaryHeap::new(),
+            buckets: vec![Vec::new(); 65],
+            last: D::UNREACHED,
         }
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self, zero: D) {
         for entry in self.used.drain(..) {
             self.directory[entry as usize] = 0;
         }
         self.pages.truncate(PAGE);
-        self.queue.clear();
+        self.buckets.iter_mut().for_each(Vec::clear);
+        self.last = zero;
+    }
+
+    fn push(&mut self, key: D, node: u32) {
+        let (wide, last): (u64, u64) = (key.into(), self.last.into());
+        self.buckets[64 - (wide ^ last).leading_zeros() as usize].push((key, node));
+    }
+
+    /// The smallest key, which bucket 0 then holds, or None if the queue is empty.
+    fn top(&mut self) -> Option<D> {
+        if self.buckets[0].is_empty() {
+            let lowest = self.buckets.iter().position(|bucket| !bucket.is_empty())?;
+            let mut bucket = std::mem::take(&mut self.buckets[lowest]);
+            self.last = bucket.iter().map(|entry| entry.0).min()?;
+            for &(key, node) in &bucket {
+                self.push(key, node);
+            }
+            bucket.clear();
+            self.buckets[lowest] = bucket;
+        }
+        Some(self.last)
     }
 
     #[inline]
@@ -443,20 +469,20 @@ impl<D: Distance> Side<D> {
         let fit = |wide: u64| D::try_from(wide).ok().filter(|&dist| dist != D::UNREACHED);
         let unreached: u64 = D::UNREACHED.into();
         for (side, node) in sides.iter_mut().zip([from, to]) {
-            side.clear();
+            side.clear(fit(0)?);
             side.set_label(node, fit(0)?);
-            side.queue.push(Reverse((fit(0)?, node)));
+            side.push(fit(0)?, node);
         }
         let mut best = INF;
         let mut work = [0u64; 2];
-        while let (Some(top_f), Some(top_b)) = (sides[0].queue.peek(), sides[1].queue.peek()) {
-            let tops: [u64; 2] = [top_f.0.0.into(), top_b.0.0.into()];
+        while let (Some(top_f), Some(top_b)) = (sides[0].top(), sides[1].top()) {
+            let tops: [u64; 2] = [top_f.into(), top_b.into()];
             if tops[0] + tops[1] >= best {
                 break;
             }
             let side = usize::from(work[1] < work[0]);
             let other_top = tops[1 - side];
-            let Reverse((dist, node)) = sides[side].queue.pop()?;
+            let (dist, node) = sides[side].buckets[0].pop()?;
             if dist > sides[side].label(node) {
                 continue; // Stale: this node was queued again at a smaller distance.
             }
@@ -477,7 +503,7 @@ impl<D: Distance> Side<D> {
                     // it. If not, the rest of the way costs at least the other queue's top. So a
                     // node at or past `best` by that bound needn't be expanded.
                     if candidate + other_top < best {
-                        sides[side].queue.push(Reverse((narrow, neighbour)));
+                        sides[side].push(narrow, neighbour);
                     }
                 }
             }

@@ -29,7 +29,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 7 | Numbering seeds claimed in blocks, and a read before each locked swap | On the board, step 5 was far slower than our scorer predicted, and all threads were queueing on one counter | run-9453b8f82b3d | 0.272 | 91.8 | 62.5 |
 | 8 | Labels in pages found through a directory, no hash table, new numbers given at the first visit, and 104 fewer lines | A directory read and a page read replace probing and key compares, and each side fills only its own pages | run-d47336fddad4 | 0.238 | 78.0 | 65.4 |
 | 9 | A node's out-count and links on one cache line, and prefetching into L2 | Each edge of the count pass touched three lines, and on a shared core the L1 prefetch queue is small | run-6c4a3ec99255 | 0.230 | 80.4 | 65.7 |
-| 10 | The reverse graph derived from the forward one, by sweeping it | After renumbering, neighbours are close, so a sweep has few misses, where the file's order made every edge a random touch of six lines | RUN10 | T10 | M10 | P10 |
+| 10 | The reverse graph derived from the forward one, by sweeping it | After renumbering, neighbours are close, so a sweep has few misses, where the file's order made every edge a random touch of six lines | run-3cffbc842db0 | 0.208 | 79.4 | 66.7 |
+| 11 | A radix queue instead of binary heaps | Keys never go below the last one popped, so a key moves a few times in all, with no comparisons against other keys | RUN11 | T11 | M11 | P11 |
 
 ## Decision log
 
@@ -54,6 +55,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D10. Pages instead of a hash table.** Context: a review measured the search at 54% of the run, with the label table as its largest cost. Options: a bigger table, a node-sized array per thread (7 MB each), or pages. Chose: 64-node pages of 4-byte distances, through a directory of `nodes / 64` entries per side. Neighbours have nearby numbers, so the largest search fills about 585 KB, where the table and labels filled about 2 MB. Page 0 is all `UNREACHED` and empty directory entries point at it, so a read has no branch. With no key hash left, `sd_const_hash` has nothing to guard here. Evidence: local T 0.178 -> 0.138 s, M 87 -> 76 MB, and S 508 -> 404. What would change our minds: a lower K on the board.
 
 **D11. Derive the reverse graph.** Context: Cause Of Death passed us with T 0.165 s against 0.230, at M 126 MB. Our stage timings were count 20 ms, numbering 12, moving counts 5, placing 43 and queries 64, so the build was over half the time, and a reader of the file can only visit edges in random order. Options: hold an edge list (costs M), or partition (a review found it slower). Chose: place only the forward arcs from the file, then fill the reverse array by sweeping them in node order. By then neighbours have nearby numbers, so in-degrees and reverse arcs land in memory that's nearly in cache, with no parsing and no number lookups, and the first pass no longer counts in-degrees. Evidence: local T -12.9% on `ab.sh`. What would change our minds: no gain on the board.
+
+**D12. A radix queue.** Context: a review measured -6 to -8% with a radix queue, and our heaps took a mispredict on most sift steps. Chose: 65 buckets by the highest bit differing from the last key popped. It relies on Dijkstra's keys never going below that key. Evidence: local T -11.8% (noise 5.5%) on `ab.sh`, for 26 more lines. What would change our minds: no gain on the board.
 
 ## What didn't work
 

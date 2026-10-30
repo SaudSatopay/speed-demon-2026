@@ -6,8 +6,7 @@
 //! loads in place of byte loops. It never unescapes anything: a quoted field's raw bytes, with its
 //! `""` pairs intact, encode its value one to one, and the value's length is the raw length minus the
 //! number of pairs. Records wait in small batches while their lookups are prefetched. Each thread
-//! sums into its own rows, and lists each (name, country) pair, and a second phase counts the
-//! distinct pairs, one partition per thread, so no cache line moves between cores for each record.
+//! sums into its own rows, and one shared table counts the distinct names per country.
 
 use std::arch::x86_64::{
     __m256i, _MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256,
@@ -249,33 +248,35 @@ const KEY_MASKS: [[u64; 3]; 25] = {
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 4 } else { 1 << 17 };
 /// Most names fit in the slot itself: on seed 1, 99.99% of them.
 const INLINE_BYTES: usize = 24;
-const STRIDE: usize = 4; // Words per slot: a header and the key's 24 bytes.
 const EMPTY: u64 = 0;
 const BUSY: u64 = 1;
 
-/// Names to slots, in one table shared by all threads, with no locks. A slot is half a cache line: a
-/// header, and the name's first 24 bytes (or its file offset if it's longer), so a lookup costs one
-/// cache miss, with no second memory access to compare the key. Names are compared in full, and never
-/// unescaped: the raw bytes encode the value one to one. Slots are insert-only, so once the table has
-/// warmed up, its cache lines stay shared between the cores.
+/// Distinct names per country, in one table shared by all threads, with no locks. Each slot is one
+/// cache line: a header, the name's first 24 bytes (or its file offset if it's longer), and one bit
+/// per country that has seen this name. So a lookup costs one cache miss, with no second memory
+/// access to compare the key. Names are compared in full, and never unescaped: the raw bytes encode
+/// the value one to one. The slots are insert-only, so a published slot never changes its key.
 struct NameTable<'a> {
     file: &'a [u8],
     words: Vec<AtomicU64>,
-    first: usize, // The word where the first slot starts, on a cache line boundary.
+    first: usize,  // The word where the first slot starts, on a cache line boundary.
+    stride: usize, // Words per slot.
     mask: usize,
     used: AtomicUsize,
     overflowed: AtomicU64,
 }
 
 impl<'a> NameTable<'a> {
-    fn new(file: &'a [u8], slots: usize) -> Self {
+    fn new(file: &'a [u8], slots: usize, countries: usize) -> Self {
+        let stride = (4 + countries.div_ceil(64)).next_multiple_of(8);
         // An untouched allocation stays out of the memory peak until a thread writes to it.
-        let zeroed = vec![0u64; slots * STRIDE + 8];
+        let zeroed = vec![0u64; slots * stride + 8];
         let words: Vec<AtomicU64> = zeroed.into_iter().map(AtomicU64::new).collect();
         NameTable {
             file,
             first: words.as_ptr().align_offset(64),
             words,
+            stride,
             mask: slots - 1,
             used: AtomicUsize::new(0),
             overflowed: AtomicU64::new(0),
@@ -285,29 +286,29 @@ impl<'a> NameTable<'a> {
     /// The first slot to try for a name with this hash.
     #[inline]
     fn slot_header(&self, hash: u64) -> &AtomicU64 {
-        &self.words[self.first + (hash as usize & self.mask) * STRIDE]
+        &self.words[self.first + (hash as usize & self.mask) * self.stride]
     }
 
-    /// The slot of this name, adding it if it's new.
+    /// Marks this name as seen in `country`, and returns whether that's new for the country.
     #[inline]
-    fn slot_of(&self, key: &[u8], key_words: &[u64; 3], hash: u64) -> usize {
+    fn mark(&self, key: &[u8], key_words: &[u64; 3], hash: u64, country: usize) -> bool {
         // The top half of the hash and the length, plus 2 to stay clear of EMPTY and BUSY.
         let published = (hash & 0xFFFF_FFFF_0000_0000) | (key.len() as u64 + 2);
         let mut slot = hash as usize & self.mask;
         loop {
-            let base = self.first + slot * STRIDE;
+            let base = self.first + slot * self.stride;
             let mut header = self.words[base].load(Acquire);
             if header == EMPTY {
                 if self.used.load(Relaxed) * 8 >= (self.mask + 1) * 7 {
                     self.overflowed.store(1, Relaxed);
-                    return 0; // This whole pass will be thrown away.
+                    return false; // This whole pass will be thrown away.
                 }
                 let claim = self.words[base].compare_exchange(EMPTY, BUSY, Acquire, Acquire);
                 match claim {
                     Ok(_) => {
                         self.fill_slot(base, key, key_words);
                         self.words[base].store(published, Release);
-                        return slot;
+                        return self.mark_country(base, country);
                     }
                     Err(current) => header = current,
                 }
@@ -317,7 +318,7 @@ impl<'a> NameTable<'a> {
                 header = self.words[base].load(Acquire);
             }
             if header == published && self.key_matches(base, key, key_words) {
-                return slot;
+                return self.mark_country(base, country);
             }
             slot = (slot + 1) & self.mask;
         }
@@ -335,7 +336,6 @@ impl<'a> NameTable<'a> {
         }
     }
 
-    #[inline]
     fn key_matches(&self, base: usize, key: &[u8], key_words: &[u64; 3]) -> bool {
         if key.len() <= INLINE_BYTES {
             let stored = |i: usize| self.words[base + 1 + i].load(Relaxed);
@@ -348,27 +348,11 @@ impl<'a> NameTable<'a> {
             &self.file[offset..offset + key.len()] == key
         }
     }
-}
 
-/// How (name slot, country) pairs are packed and shared out. Setting a country's bit for a name from
-/// any thread would move a cache line between cores for nearly every record, because most pairs are
-/// new, and the box's cross-core traffic is slow. So threads only list their pairs, per partition of
-/// the slots, and afterwards each partition's bits are set by one thread alone, with no shared writes.
-#[derive(Clone, Copy)]
-struct PairFormat {
-    country_bits: u32,
-    partition_shift: u32,
-}
-
-/// Name slots share out into this many partitions, for the distinct count.
-const PARTITIONS: usize = 64;
-
-impl PairFormat {
-    fn new(countries: usize, slots: usize) -> Self {
-        PairFormat {
-            country_bits: usize::BITS - countries.leading_zeros(),
-            partition_shift: (slots.trailing_zeros()).saturating_sub(PARTITIONS.trailing_zeros()),
-        }
+    fn mark_country(&self, base: usize, country: usize) -> bool {
+        let word = &self.words[base + 4 + country / 64];
+        let bit = 1u64 << (country % 64);
+        word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0
     }
 }
 
@@ -506,7 +490,7 @@ struct Pending {
 /// arrive together, instead of stalling on each in turn.
 const BATCH: usize = 16;
 
-/// Parses the records in `pos..end`, adding each to its country's row and to the pair lists.
+/// Parses the records in `pos..end`, adding each to its country's row.
 fn parse_records(
     file: &[u8],
     mut pos: usize,
@@ -514,8 +498,6 @@ fn parse_records(
     regions: &Regions,
     names: &NameTable,
     rows: &mut [Row],
-    pairs: &mut [Vec<u32>],
-    format: PairFormat,
 ) {
     let mut batch = [Pending::default(); BATCH];
     let mut count = 0;
@@ -552,11 +534,11 @@ fn parse_records(
         };
         count += 1;
         if count == BATCH {
-            add_records(file, &batch, regions, names, rows, pairs, format);
+            add_records(file, &batch, regions, names, rows);
             count = 0;
         }
     }
-    add_records(file, &batch[..count], regions, names, rows, pairs, format);
+    add_records(file, &batch[..count], regions, names, rows);
 }
 
 #[inline]
@@ -566,8 +548,6 @@ fn add_records(
     regions: &Regions,
     names: &NameTable,
     rows: &mut [Row],
-    pairs: &mut [Vec<u32>],
-    format: PairFormat,
 ) {
     let unmatched = regions.keys.len() - 1;
     for record in batch {
@@ -584,9 +564,7 @@ fn add_records(
         row.name_bytes += record.name.value_len as u64;
         row.note_bytes += record.note_bytes as u64;
         let key = &file[record.name.start..record.name.start + record.name.raw_len];
-        let slot = names.slot_of(key, &record.key_words, record.hash);
-        let pair = (slot as u32) << format.country_bits | country as u32;
-        pairs[slot >> format.partition_shift].push(pair);
+        row.names_distinct += u64::from(names.mark(key, &record.key_words, record.hash, country));
     }
 }
 
@@ -594,21 +572,18 @@ fn add_records(
 /// balances the load. Tying the size to the thread count also makes the SD_THREADS test sweep move
 /// every cut. Returns None if the name table filled up.
 fn aggregate(file: &[u8], regions: &Regions, threads: usize, slots: usize) -> Option<Vec<Row>> {
-    let names = NameTable::new(file, slots);
-    let countries = regions.keys.len();
-    let format = PairFormat::new(countries, slots);
+    let names = NameTable::new(file, slots, regions.keys.len());
     let segment = (file.len() / (threads * 8)).max(1);
     let cursor = AtomicUsize::new(0);
-    let parsed: Vec<(Vec<Row>, Vec<Vec<u32>>)> = thread::scope(|scope| {
+    let worker_rows: Vec<Vec<Row>> = thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut rows = vec![Row::EMPTY; countries];
-                    let mut pairs = vec![Vec::new(); PARTITIONS];
+                    let mut rows = vec![Row::EMPTY; regions.keys.len()];
                     loop {
                         let start = cursor.fetch_add(segment, Relaxed);
                         if start >= file.len() {
-                            return (rows, pairs);
+                            return rows;
                         }
                         let first = match start {
                             0 => after_header(file),
@@ -620,68 +595,23 @@ fn aggregate(file: &[u8], regions: &Regions, threads: usize, slots: usize) -> Op
                         } else {
                             next_boundary(file, cut)
                         };
-                        parse_records(
-                            file, first, last, regions, &names, &mut rows, &mut pairs, format,
-                        );
+                        parse_records(file, first, last, regions, &names, &mut rows);
                     }
                 })
             })
             .collect();
         let joined = handles.into_iter().map(|handle| handle.join());
         joined
-            .map(|parsed| parsed.expect("panic = \"abort\" means a join can't fail"))
+            .map(|rows| rows.expect("panic = \"abort\" means a join can't fail"))
             .collect()
     });
     if names.overflowed.load(Relaxed) != 0 {
         return None;
     }
-
-    // Each thread claims a partition, and alone sets its bits: one per country per name slot.
-    let row_words = countries.div_ceil(64);
-    let seen: Vec<AtomicU64> = vec![0u64; slots * row_words]
-        .into_iter()
-        .map(AtomicU64::new)
-        .collect();
-    let next_partition = AtomicUsize::new(0);
-    let distinct: Vec<Vec<u64>> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut distinct = vec![0; countries];
-                    loop {
-                        let partition = next_partition.fetch_add(1, Relaxed);
-                        if partition >= PARTITIONS {
-                            return distinct;
-                        }
-                        for (_, pairs) in &parsed {
-                            for &pair in &pairs[partition] {
-                                let slot = (pair >> format.country_bits) as usize;
-                                let country = pair as usize & ((1 << format.country_bits) - 1);
-                                let word = &seen[slot * row_words + country / 64];
-                                let (old, bit) = (word.load(Relaxed), 1u64 << (country % 64));
-                                word.store(old | bit, Relaxed);
-                                distinct[country] += u64::from(old & bit == 0);
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        let joined = handles.into_iter().map(|handle| handle.join());
-        joined
-            .map(|counts| counts.expect("panic = \"abort\" means a join can't fail"))
-            .collect()
-    });
-
-    let mut totals = vec![Row::EMPTY; countries];
-    for (rows, _) in &parsed {
+    let mut totals = vec![Row::EMPTY; regions.keys.len()];
+    for rows in &worker_rows {
         for (total, row) in totals.iter_mut().zip(rows) {
             total.merge(row);
-        }
-    }
-    for counts in &distinct {
-        for (total, &count) in totals.iter_mut().zip(counts) {
-            total.names_distinct += count;
         }
     }
     Some(totals)

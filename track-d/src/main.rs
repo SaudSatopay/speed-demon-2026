@@ -2,8 +2,9 @@
 //!
 //! Threads parse the mapped graph twice, in batches with prefetching. The first pass counts each
 //! node's edges and keeps a few neighbours, enough to renumber the nodes so that neighbours sit close
-//! in memory. The second places the edges into a forward and a reverse compressed adjacency array,
-//! so no temporary edge list is ever held. Threads then claim queries from an atomic counter, each
+//! in memory. The second places the edges into a compressed adjacency array, so no temporary edge
+//! list is ever held. Sweeping that array, where neighbours are close, then fills the reverse array
+//! with hardly a cache miss. Threads then claim queries from an atomic counter, each
 //! with its own search state, and run a two-ended Dijkstra that gives both sides equal work. Answers
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
@@ -275,10 +276,21 @@ impl Graph {
         if weight != heavy {
             return (arc >> self.weight_bits, u64::from(weight));
         }
-        let at = self
-            .heavy
-            .partition_point(|entry| (entry.0 as usize) < slot);
+        let at = self.heavy.partition_point(|e| (e.0 as usize) < slot);
         (arc >> self.weight_bits, u64::from(self.heavy[at].1))
+    }
+
+    /// Passes every arc to `visit`, as tail, head and weight, in node order within each thread's range.
+    fn for_each_arc(&self, threads: usize, visit: impl Fn(u32, u32, u32) + Sync) {
+        for_ranges(self.offsets.len() - 1, threads, |start, end| {
+            for node in start..end {
+                let (first, arcs) = self.arcs_of(node as u32);
+                for (index, arc) in arcs.iter().enumerate() {
+                    let (neighbour, weight) = self.unpack(first + index, arc.load(Relaxed));
+                    visit(node as u32, neighbour, weight as u32);
+                }
+            }
+        });
     }
 }
 
@@ -290,11 +302,10 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     let nodes = next_number(graph_file, &mut pos) as usize;
     next_number(graph_file, &mut pos); // The edge count: the file's length says the same.
     let edge_lines = &graph_file[pos..];
-    let (records, in_counts) = (zeroed_u32s(nodes * RECORD), zeroed_u32s(nodes));
+    let records = zeroed_u32s(nodes * RECORD);
     for_each_batch(edge_lines, threads, |batch| {
-        for &(tail, head, _) in batch {
+        for &(tail, _, _) in batch {
             prefetch(&records[tail as usize * RECORD]);
-            prefetch(&in_counts[head as usize]);
         }
         for &(tail, head, _) in batch {
             let record = &records[tail as usize * RECORD..][..RECORD];
@@ -302,49 +313,53 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
             if seen < RECORD - 1 {
                 record[seen + 1].store(head + 1, Relaxed);
             }
-            in_counts[head as usize].fetch_add(1, Relaxed);
         }
     });
     let (numbers, entries) = local_numbering(&records, nodes, threads);
 
-    let (out_new, in_new) = (zeroed_u32s(entries), zeroed_u32s(entries));
+    let out_counts = zeroed_u32s(entries);
     for_ranges(nodes, threads, |start, end| {
         for node in start..end {
             let new = numbers[node].load(Relaxed) as usize;
-            out_new[new].store(records[node * RECORD].load(Relaxed), Relaxed);
-            in_new[new].store(in_counts[node].load(Relaxed), Relaxed);
+            out_counts[new].store(records[node * RECORD].load(Relaxed), Relaxed);
         }
     });
-    drop((records, in_counts));
-    let mut forward = Graph::from_counts(out_new);
-    let mut backward = Graph::from_counts(in_new);
+    drop(records);
+    let mut forward = Graph::from_counts(out_counts);
 
     for_each_batch(edge_lines, threads, |batch| {
         let number = |node: u32| numbers[node as usize].load(Relaxed);
         let mut renumbered = [(0, 0, 0); BATCH];
-        let mut slots = [(0, 0); BATCH];
+        let mut slots = [0; BATCH];
         for &(tail, head, _) in batch {
             prefetch(&numbers[tail as usize]);
             prefetch(&numbers[head as usize]);
         }
         for (new, &(tail, head, weight)) in renumbered.iter_mut().zip(batch) {
-            let (tail, head) = (number(tail), number(head));
-            *new = (tail, head, weight);
-            prefetch(&forward.offsets[tail as usize]);
-            prefetch(&backward.offsets[head as usize]);
+            *new = (number(tail), number(head), weight);
+            prefetch(&forward.offsets[new.0 as usize]);
         }
         // Atomic updates wait for earlier stores, so reserve every slot first, and store afterwards.
-        for (slot, &(tail, head, _)) in slots.iter_mut().zip(&renumbered[..batch.len()]) {
-            *slot = (forward.reserve(tail), backward.reserve(head));
-            prefetch(&forward.arcs[slot.0]);
-            prefetch(&backward.arcs[slot.1]);
+        for (slot, &(tail, _, _)) in slots.iter_mut().zip(&renumbered[..batch.len()]) {
+            *slot = forward.reserve(tail);
+            prefetch(&forward.arcs[*slot]);
         }
-        for (slot, &(tail, head, weight)) in slots.iter().zip(&renumbered[..batch.len()]) {
-            forward.store(slot.0, head, weight);
-            backward.store(slot.1, tail, weight);
+        for (&slot, &(_, head, weight)) in slots.iter().zip(&renumbered[..batch.len()]) {
+            forward.store(slot, head, weight);
         }
     });
     forward.seal();
+
+    // The reverse graph comes from the forward one, with no parsing and no number lookups. Neighbours
+    // have nearby numbers by now, so these sweeps stay in memory that's nearly in cache.
+    let in_counts = zeroed_u32s(entries);
+    forward.for_each_arc(threads, |_, head, _| {
+        in_counts[head as usize].fetch_add(1, Relaxed);
+    });
+    let mut backward = Graph::from_counts(in_counts);
+    forward.for_each_arc(threads, |tail, head, weight| {
+        backward.store(backward.reserve(head), tail, weight);
+    });
     backward.seal();
     ([forward, backward], numbers)
 }

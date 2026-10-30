@@ -420,6 +420,6 @@ fn main() -> io::Result<()> {
     let size = (log.len() / (threads * 8)).max(1);
     on_threads(threads, || parse(log, &table, &hours, &cursor, size));
     let (keys, ranks) = rank_ids(&table, log);
-    write_summary(file, &keys, &ranks, hours, threads);
+    write_summary(file, &keys, &ranks, hours, threads.min(10));
     Ok(())
 }

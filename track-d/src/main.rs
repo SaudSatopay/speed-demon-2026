@@ -24,6 +24,7 @@ const INF: u64 = 1 << 62;
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn mallopt(option: i32, value: i32) -> i32;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -39,14 +40,8 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(
-            std::ptr::null_mut(),
-            len + PADDING,
-            read,
-            private | anonymous,
-            -1,
-            0,
-        );
+        let null = std::ptr::null_mut();
+        let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -381,8 +376,9 @@ impl Distance for u64 {
     const UNREACHED: u64 = INF;
 }
 
-/// Nodes per page of the label store.
+/// Nodes per page of the label store, and the entries a side's lists keep between queries.
 const PAGE: usize = 64;
+const KEPT_ENTRIES: usize = 1 << 15;
 
 /// One side of a search: its tentative distances and its queue. Distances live in pages of `PAGE`
 /// nodes, found through a directory indexed by node, which persists across queries and is reset through
@@ -418,8 +414,14 @@ impl<D: Distance> Side<D> {
         for entry in self.used.drain(..) {
             self.directory[entry as usize] = 0;
         }
+        // A rare huge search shouldn't leave every thread holding its memory for good.
         self.pages.truncate(PAGE);
-        self.buckets.iter_mut().for_each(Vec::clear);
+        self.pages.shrink_to(KEPT_ENTRIES);
+        self.used.shrink_to(KEPT_ENTRIES);
+        for bucket in &mut self.buckets {
+            bucket.clear();
+            bucket.shrink_to(KEPT_ENTRIES);
+        }
         self.last = zero;
     }
 
@@ -517,6 +519,9 @@ impl<D: Distance> Side<D> {
 }
 
 fn main() -> io::Result<()> {
+    // SAFETY: M_MMAP_THRESHOLD only sets an option of our own process's allocator. It stops glibc
+    // from keeping freed blocks of any size it has seen freed.
+    unsafe { mallopt(-3, 1 << 17) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());

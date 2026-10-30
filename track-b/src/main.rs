@@ -54,14 +54,8 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(
-            std::ptr::null_mut(),
-            len + PADDING,
-            read,
-            private | anonymous,
-            -1,
-            0,
-        );
+        let null = std::ptr::null_mut();
+        let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))

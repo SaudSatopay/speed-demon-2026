@@ -62,14 +62,8 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
     // dataset while we run.
     unsafe {
-        let base = mmap(
-            std::ptr::null_mut(),
-            len + PADDING,
-            read,
-            private | anonymous,
-            -1,
-            0,
-        );
+        let null = std::ptr::null_mut();
+        let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
@@ -97,11 +91,11 @@ fn load_block(log: &[u8], pos: usize) -> [__m256i; 2] {
 /// One bit per byte of two blocks, set where they're equal.
 fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
     // SAFETY: the build targets x86-64-v3, which has AVX2.
-    let (low, high) = unsafe {
-        let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[0], b[0]));
-        (low, _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[1], b[1])))
-    };
-    u64::from(low as u32) | u64::from(high as u32) << 32
+    unsafe {
+        let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[0], b[0])) as u32;
+        let high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[1], b[1])) as u32;
+        u64::from(low) | u64::from(high) << 32
+    }
 }
 
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
@@ -137,13 +131,11 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
 }
 
 /// Mixes an endpoint's length with its first and last 8 bytes, which tell nearly all templated paths
-/// apart. A test build swaps it for a constant, so that every key collides and any logic that trusts
-/// a hash without comparing the key shows up as a wrong answer.
-fn hash(words: [u64; 2], len: usize) -> u64 {
-    let hash = words.iter().fold(len as u64, |hash, &word| {
-        let mixed = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        mixed ^ (mixed >> 29)
-    });
+/// apart, with one multiply, whose high bits depend on every input bit. A test build swaps it for a
+/// constant, so that every key collides and any logic that trusts a hash without comparing the key
+/// shows up as a wrong answer.
+fn hash(first: u64, last: u64, len: usize) -> u64 {
+    let hash = (first ^ last.rotate_left(29) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     if cfg!(sd_const_hash) { 0 } else { hash }
 }
 
@@ -154,16 +146,12 @@ fn hash(words: [u64; 2], len: usize) -> u64 {
 fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
-    let hash = hash(
-        [
-            load_u64(log, start) << outside,
-            load_u64(log, end - 8) >> outside,
-        ],
-        len,
-    );
-    let entry = hash & !0 << 48 | (len as u64) << START_BITS | start as u64;
+    let first = load_u64(log, start) << outside;
+    let last = load_u64(log, end - 8) >> outside;
+    let hash = hash(first, last, len);
+    let entry = (hash << 12) & (!0 << 48) | (len as u64) << START_BITS | start as u64;
     let block = load_block(log, start);
-    let mut index = hash as usize;
+    let mut index = (hash >> 52) as usize;
     loop {
         index = (index & (SLOTS - 1)).max(1);
         let slot = &table[index];
@@ -408,12 +396,9 @@ fn main() -> io::Result<()> {
     let log = map_file(&Path::new(&data_dir).join("requests.log"))?;
     let file = File::create(Path::new(&out_dir).join("summary.txt"))?;
     // Room for every line, the shortest being 40 bytes, plus each thread's unfinished block.
-    let hour_len = log.len() / 40 + BLOCK_RECORDS * (threads + 1);
+    let len = log.len() / 40 + BLOCK_RECORDS * (threads + 1);
     let new_hour = |_| {
-        let slots = vec![0u32; hour_len]
-            .into_iter()
-            .map(AtomicU32::new)
-            .collect();
+        let slots = vec![0u32; len].into_iter().map(AtomicU32::new).collect();
         (slots, AtomicUsize::new(0), Mutex::default())
     };
     let hours: Vec<Hour> = (0..HOURS).map(new_hour).collect();

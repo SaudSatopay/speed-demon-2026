@@ -13,12 +13,12 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Limits
 
-- Each arc takes 8 bytes in each direction, so the graph is 94 MB, and M is about 164 MB locally.
+- M is about 128 MB locally, of which the labels take about 37 MB, with 24 bytes per label.
 - Node ids are random, so nearly every hop is a cache miss.
 
 ## Approach
 
-The mapped graph file is parsed twice by 12 threads, in batches of 32 edges with prefetching. The first pass counts each node's edges and keeps up to 3 neighbours. Threads then walk those neighbours depth first, claiming nodes as they go, and that order gives every node a new number, so neighbours sit close in memory. The second pass places each edge into forward and reverse compressed adjacency arrays, in new numbers. So no temporary edge list is ever held. Threads then claim queries from an atomic counter. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Each thread keeps its labels in a list, found through a small hash table that starts at 1,024 slots for each query and grows with the search. Each answer goes into its own slot, so the output order doesn't depend on scheduling.
+The mapped graph file is parsed twice by 12 threads, in batches of 32 edges with prefetching. The first pass counts each node's edges and keeps up to 3 neighbours. Threads then walk those neighbours depth first, claiming nodes as they go, and that order gives every node a new number, so neighbours sit close in memory. The second pass places each edge into forward and reverse compressed adjacency arrays, in new numbers. Each arc packs its neighbour and weight into 32 bits, with a small side table for the rare heavy weight. So no temporary edge list is ever held. Threads then claim queries from an atomic counter. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Each thread keeps its labels in a list, found through a small hash table that starts at 1,024 slots for each query and grows with the search. Each answer goes into its own slot, so the output order doesn't depend on scheduling.
 
 ## Why it's fast
 

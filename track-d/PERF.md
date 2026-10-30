@@ -6,9 +6,8 @@
 
 ## Where it loses
 
-- M is about 164 MB locally, of which 94 MB is the graph.
-- S is 427 code lines against the reference's 43, which costs about 7.5 speed points.
-- Each arc takes 8 bytes in each direction, and most weights would fit in far fewer bits.
+- M is about 128 MB locally, of which 54 MB is the graph and about 37 MB the labels.
+- S is 465 code lines against the reference's 43, which costs about 7.8 speed points.
 
 ## Where the reference spends its time
 
@@ -22,9 +21,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 |---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | — | — | 72.69 | 893 | 0 |
 | 1 | v1: two-pass parse into two compressed arrays, two-ended Dijkstra, one thread | Scans far fewer nodes per query, and no Python objects | run-… | 1.886 *local* | 105.4 *local* | 40.8 *local* |
-| 2 | 12 threads: parallel parsing with atomic counters, and a query pool with search state per thread | Queries are independent, and parsing can be cut at line boundaries | run-… | 0.342 *local* | 201.8 *local* | 55.8 *local* |
-| 3 | Per-query hash table for labels, and pruned pushes | The largest search labels 78,554 of 1.74M nodes, and the median 196 | run-… | 0.299 *local* | 130.7 *local* | 58.7 *local* |
+| 2 | 12 threads: parallel parsing with atomic counters, and a query pool with search state per thread | Queries are independent, and parsing can be cut at line boundaries | run-0e6c1ebf489a | 0.454 | 201.5 | 55.8 |
+| 3 | Per-query hash table for labels, and pruned pushes | The largest search labels 78,554 of 1.74M nodes, and the median 196 | run-9000879b77a6 | 0.380 | 130 | 59.1 |
 | 4 | Nodes renumbered by depth-first walks, SWAR parsing, and a batched, prefetched build | Random ids make every hop a cache miss, and the build was mostly cache misses on shared counters | run-… | 0.199 *local* | 164.4 *local* | 60.9 *local* |
+| 5 | Arcs packed into 4 bytes, with a side table for heavy weights | 8 bytes per arc cost 80 MB, and fewer arcs fit in a cache line | run-… | 0.190 *local* | 128.0 *local* | 62.2 *local* |
 
 ## Decision log
 
@@ -40,9 +40,13 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D6. Renumber nodes, and batch the build.** Context: we tried renumbering alone first, and it nearly halved query time (190 to 105 ms), but the extra build time kept the total at 265 ms against 299 ms. We compared BFS, DFS and BFS limited to cells of 64 to 16,384 nodes, and DFS was best, by a small margin. A profile showed the build was mostly cache misses on shared counters and arcs. So: parse 32 edges at a time, prefetch all their cache lines, then touch them, reserving arc slots before storing, because an atomic update waits for earlier stores. Numbers parse from one 8-byte load. Cost: S 288 -> 427, and M 130.7 -> 164.4 MB, for the numbering's arrays and because threads now find more cache lines worth touching. Evidence: T 0.299 -> 0.199 s, K 14.95 -> 16.50 (local). Outcome: kept.
 
+**D7. Pack arcs into 4 bytes.** Context: arcs took 80 MB. A node id needs 21 bits at this size, which leaves 11 bits for a weight, and most weights fit. Chose: the bit split follows the node count, the highest weight value means "look in the side table", and that table is sorted by arc number once the graph is built. Cost: S 427 -> 465. Evidence: M 164.4 -> 128.0 MB, T 0.199 -> 0.190 s, K 16.50 -> 17.50 (local). Outcome: kept.
+
 ## What didn't work
 
-Nothing tried yet.
+| Experiment | What we expected | What we measured | Where | Kept? |
+|---|---|---|---|---|
+| Node id as its own label-table hash, since renumbered neighbours are close | Fewer cache misses in the label table | About 5x slower, because linear probing clusters on consecutive ids: T 0.21 -> 1.03 s by `ab.sh` | local | reverted |
 
 ## The final design
 

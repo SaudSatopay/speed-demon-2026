@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
@@ -235,16 +236,21 @@ fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> Vec<Ato
 }
 
 /// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
-/// Each arc packs (neighbour << 32 | weight). Atomics let threads fill it without locks or `unsafe`;
-/// relaxed atomic loads and stores compile to plain moves on x86.
+/// An arc packs its neighbour and its weight into 32 bits, with as many weight bits as the node count
+/// leaves. The highest value means the weight is in `heavy`, sorted by arc number once the graph is
+/// built. Atomics let threads fill it without locks or `unsafe`; relaxed atomic loads and stores
+/// compile to plain moves on x86.
 struct Graph {
     offsets: Vec<AtomicU32>,
-    arcs: Vec<AtomicU64>,
+    arcs: Vec<AtomicU32>,
+    weight_bits: u32,
+    heavy: Mutex<Vec<(u32, u32)>>,
+    heavy_sorted: Vec<(u32, u32)>,
 }
 
 impl Graph {
-    /// Turns per-node counts into a graph, ready to `place` every arc. Each offset starts at the
-    /// end of its node's range and moves down as arcs are placed, so it finishes at the start of
+    /// Turns per-node counts into a graph, ready to `reserve` every arc. Each offset starts at the
+    /// end of its node's range and moves down as arcs are reserved, so it finishes at the start of
     /// the range, with no second array.
     fn from_counts(mut offsets: Vec<AtomicU32>) -> Graph {
         let mut total = 0;
@@ -252,11 +258,14 @@ impl Graph {
             total += *offset.get_mut();
             *offset.get_mut() = total;
         }
-        let arcs = vec![0u64; total as usize]
-            .into_iter()
-            .map(AtomicU64::new)
-            .collect();
-        Graph { offsets, arcs }
+        let nodes = offsets.len() as u32;
+        Graph {
+            offsets,
+            arcs: zeroed_u32s(total as usize),
+            weight_bits: nodes.leading_zeros(),
+            heavy: Mutex::new(Vec::new()),
+            heavy_sorted: Vec::new(),
+        }
     }
 
     /// Reserves a slot for one more arc of `node`.
@@ -265,10 +274,47 @@ impl Graph {
         self.offsets[node as usize].fetch_sub(1, Relaxed) as usize - 1
     }
 
-    fn arcs_of(&self, node: u32) -> &[AtomicU64] {
+    #[inline]
+    fn store(&self, slot: usize, neighbour: u32, weight: u32) {
+        let heavy = (1 << self.weight_bits) - 1;
+        if weight >= heavy {
+            let list = self.heavy.lock();
+            list.expect("panic = \"abort\" means a lock can't be poisoned")
+                .push((slot as u32, weight));
+        }
+        self.arcs[slot].store(neighbour << self.weight_bits | weight.min(heavy), Relaxed);
+    }
+
+    /// Sorts the heavy weights, once every thread has finished.
+    fn seal(&mut self) {
+        let list = self
+            .heavy
+            .get_mut()
+            .expect("panic = \"abort\" means a lock can't be poisoned");
+        self.heavy_sorted = std::mem::take(list);
+        self.heavy_sorted.sort_unstable();
+    }
+
+    /// The first arc number of `node`, and its arcs.
+    #[inline]
+    fn arcs_of(&self, node: u32) -> (usize, &[AtomicU32]) {
         let start = self.offsets[node as usize].load(Relaxed) as usize;
         let end = self.offsets[node as usize + 1].load(Relaxed) as usize;
-        &self.arcs[start..end]
+        (start, &self.arcs[start..end])
+    }
+
+    /// A packed arc's neighbour and weight, given its arc number.
+    #[inline]
+    fn unpack(&self, slot: usize, arc: u32) -> (u32, u64) {
+        let heavy = (1 << self.weight_bits) - 1;
+        let weight = arc & heavy;
+        if weight != heavy {
+            return (arc >> self.weight_bits, u64::from(weight));
+        }
+        let at = self
+            .heavy_sorted
+            .partition_point(|entry| (entry.0 as usize) < slot);
+        (arc >> self.weight_bits, u64::from(self.heavy_sorted[at].1))
     }
 }
 
@@ -308,8 +354,8 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
         }
     });
     drop((out_counts, in_counts));
-    let forward = Graph::from_counts(out_new);
-    let backward = Graph::from_counts(in_new);
+    let mut forward = Graph::from_counts(out_new);
+    let mut backward = Graph::from_counts(in_new);
 
     for_each_batch(edge_lines, threads, |batch| {
         let mut renumbered = [(0, 0, 0); BATCH];
@@ -334,11 +380,12 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
             prefetch(&backward.arcs[slot.1]);
         }
         for (slot, &(tail, head, weight)) in slots.iter().zip(&renumbered[..batch.len()]) {
-            let arc_of = |neighbour: u32| u64::from(neighbour) << 32 | u64::from(weight);
-            forward.arcs[slot.0].store(arc_of(head), Relaxed);
-            backward.arcs[slot.1].store(arc_of(tail), Relaxed);
+            forward.store(slot.0, head, weight);
+            backward.store(slot.1, tail, weight);
         }
     });
+    forward.seal();
+    backward.seal();
     ([forward, backward], numbers)
 }
 
@@ -454,11 +501,10 @@ impl Search {
             if dist > self.labels[label].dist[side] {
                 continue; // Stale: this node was queued again at a smaller distance.
             }
-            let arcs = graphs[side].arcs_of(node);
+            let (first, arcs) = graphs[side].arcs_of(node);
             work[side] += 1 + arcs.len() as u64;
-            for arc in arcs {
-                let arc = arc.load(Relaxed);
-                let (neighbour, weight) = ((arc >> 32) as u32, arc & 0xFFFF_FFFF);
+            for (index, arc) in arcs.iter().enumerate() {
+                let (neighbour, weight) = graphs[side].unpack(first + index, arc.load(Relaxed));
                 let candidate = dist + weight;
                 let label = self.label_index(neighbour);
                 if candidate < self.labels[label].dist[side] {

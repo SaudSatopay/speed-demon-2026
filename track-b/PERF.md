@@ -39,6 +39,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 | Experiment | What we expected | What we measured | Where | Kept? |
 |---|---|---|---|---|
+| Tokens in batches of 48, with prefetching of table slots, list states and bitmaps | Up to 30% off the scan, which the profile showed was mostly cache misses | T 0.175 -> 0.169 s, S 832 -> 878, K +0.7%. Not worth the code | local | reverted |
 | Disabling transparent huge pages, to stop per-thread arenas rounding up to 2 MB | M down by about 39 MB, the part we couldn't account for | M 105.8 -> 97.2 MB, T 0.224 -> 0.190 s on B, but A flat and C and D about 15% slower | local | not kept |
 
 ## The final design

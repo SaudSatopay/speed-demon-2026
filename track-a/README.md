@@ -16,7 +16,7 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 - It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
 - Latencies of 2^19 or more take a slower path through a side list, about 3% of requests.
 - It relies on the spec's promise of 1,842 endpoints per seed. Past 3,584 it aborts rather than risk a wrong answer.
-- S is far above the reference's 56 code lines, because each of these gains needed code.
+- S is 284 code lines after the current line-cut change, against the reference's 56.
 
 ## Approach
 
@@ -42,7 +42,7 @@ See [PERF.md](PERF.md) for run IDs.
 
 ## Correctness
 
-The spec's edge cases need no special code: duplicate lines count twice, a 499 isn't an error because only a first byte of `5` counts, the hour comes from the timestamp rather than the file's order, and an empty log gives an empty file. Every build is checked by SHA-256 against the naive reference on 15 generator seeds, 8 answer-preserving rewrites and 5 limit cases. A constant-hash test build, where every key collides and the table starts with 16 slots to force its restart path, must give the same answers. Anyone can reproduce this with one command: `python3 tools/verify.py` (see [tools/README.md](../tools/README.md)).
+The spec's edge cases need no special code: duplicate lines count twice, a 499 isn't an error because only a first byte of `5` counts, the hour comes from the timestamp rather than the file's order, and an empty log gives an empty file. Every build is checked by SHA-256 against the naive reference on 15 generator seeds, 8 answer-preserving rewrites and 5 limit cases. A constant-hash test build, where every key collides in the 4,096-slot table, must give the same answers. Anyone can reproduce this with one command: `python3 tools/verify.py` (see [tools/README.md](../tools/README.md)).
 
 ## Dependencies
 

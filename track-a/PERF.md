@@ -1,6 +1,6 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board, and ours takes **0.030 s / 20.2 MB** (run `run-0cde8ba06e51`). That's K = **40.90** and **80.6** speed points.
+**Result:** the reference takes **32.05 s / 228 MB** on the board, and our best run takes **0.030 s / 20.8 MB** (`run-49a3c72ea111`). That's K = **41.24** and **80.8** speed points.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
@@ -33,9 +33,14 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 11 | Shorter slicing and prefix sums, and hours grouped in their own arrays with no copy | Nothing here runs per record, and 5 lines are worth 0.1 points | run-… | 0.036 *local* | 26.9 *local* | 70.9 *local* |
 | 12 | One bounds check per line for the fixed-distance loads, not one per load | The load asserts cost 16 instructions per record, and the padding already covers these loads | run-… | 0.041 *local* | 27.0 *local* | 69.4 *local* |
 | 13 | Percentiles selected upward, p50 then p95 then p99 | After p50 splits a large group, the later selections only search its top half | run-… | 0.037 *local* | 26.5 *local* | 70.7 *local* |
+| 14 | Table slots store a u32 position and compare through the closing space | Halves the table; the full-key comparison still handles collisions | run-5c3a4b720daa / run-80bd6120701c / run-2f9fbbf914cf | 0.030 / 0.030 / 0.031 | 20.6 / 21.2 / 20.4 | 80.7 / 80.7 / 80.4 |
+| 15 | Generic unaligned load and shorter rank assignment | Eight fewer lines; no measurable hot-path change | pending board trial | local A/B: no difference | 26.8 *local* | pending |
 
 ## Decision log
 
+**D13. Keep only a 32-bit first position in each endpoint slot.** Context: the prior slot packed a hash fragment, length and log position into 64 bits. Chose: a u32 position, with zero still meaning empty, and compare through the endpoint's closing space so keys with shared prefixes remain distinct. The spec's 3.1M-line log is below the added 2^32 byte bound. Evidence (`counts.sh`, seed 1 full): 288.6 -> 277.0 instructions per request, 32-bit slots; mispredicts 1.27 -> 1.26. S 295 -> 292. Constant-hash passed 39/39, and the current tree's quick grid and thread sweep passed 44/44 and 234/234. Board runs `run-5c3a4b720daa` and `run-80bd6120701c` gave K 41.06 and 41.17 at T 0.030 s; `run-2f9fbbf914cf` gave K 40.51 at T 0.031 s. The earlier best remains K 41.24. Outcome: keep; the three board times are within run noise, while the smaller slot and lower instruction count are repeatable.
+
+**D14. Replace two load helpers with one generic unaligned load, and shorten rank assignment.** Context: `load_u64` and `load_block` both do checked-at-call-site unaligned reads from the padded mapping. Chose: one monomorphized helper for both shapes, and a `zip`/`for_each` rank pass. Cost: the method-length expression is written without redundant parentheses to keep the formatted line short. Evidence: S 292 -> 284; counts stay at 277.0 instructions and 1.26 simulated mispredicts per request. `ab.sh` (31 pairs) was +0.4% with 105.6% spread, which separates neither build. Quick 44/44, thread sweep 234/234, constant-hash tiny 20/20, and pre-push 44/44 pass. Board result is pending. Outcome: board test pending; the expected gain is code size, about +0.4% K.
 **D1. Start with one thread.** Context: a correct v1 is worth more than half the reachable points, and a wrong answer scores zero. Options: start threaded, or start simple. Chose: one thread, so the first run proves the parsing and the output format alone. Cost: an idle box, for one push. Evidence: 44/44 on the local grid. Outcome: kept as step 1.
 
 **D2. Records per hour instead of a list per group.** Context: with 12 threads, a list header per (thread, endpoint, hour) would cost about 50 MB before storing anything. Options: a shared table with locks, per-thread group tables, or per-thread lists per hour. Chose: per-thread lists per hour, holding one integer per request, because the sort that percentiles need then also does the grouping. Cost: M rose from 36 to 55 MB (local), since records are 8 bytes and sorting copies them. Evidence: T 0.230 -> 0.037 s, K 10.27 -> 22.65 (local), and the thread sweep passes at 1, 2, 3, 7, 12 and 64 threads. Outcome: kept.

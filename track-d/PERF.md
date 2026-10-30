@@ -1,13 +1,13 @@
 # Track D: performance log
 
-**Result:** the reference takes **72.69 s / 893 MB** on the board. Ours is in the last row of [the journey](#the-journey).
+**Result:** the reference takes **72.69 s / 893 MB** on the board. Our best run is `run-a94ddb39f2f8`: **0.166 s / 70.7 MB**, K **24.64** and **69.6** speed points.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks d`. Output SHA-256 on seed 1: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
 ## Where it loses
 
-- M is about 93 MB locally, of which 54 MB is the graph.
-- S is 508 code lines against the reference's 43, which costs about 8 speed points.
+- M is 69.8 MB in the latest local score and 70.7 MB on the latest board run; the two graphs account for about 54 MB.
+- S is 424 code lines against the reference's 43, which costs about 7.8 speed points.
 
 ## Where the reference spends its time
 
@@ -35,9 +35,11 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 13 | Queries parsed and `numbers` dropped before the reverse graph is built | The 7 MB of old-to-new numbers were still live at the memory peak, and nothing in the reverse build reads them | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 | 14 | `INF` as `u64::MAX`, so an answer prints as a plain cast | The cast already gives -1 for "no path", which removes the output loop's branch and 5 lines | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 | 15 | Prefetching a node's offsets when it's pushed | Its arcs are read from those offsets soon after, on a dependent miss | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
+| 16 | Coarse radix queue, k=7 | Skip sorting keys within a block; occasionally re-expand improved labels | run-a94ddb39f2f8 | 0.166 | 70.7 | 69.6 |
 
 ## Decision log
 
+**D17. Coarsen the radix queue into 128-distance blocks.** Context: sorting keys inside a small distance range costs more than occasional re-expansion. Chose: `COARSE_BITS = 7`; bucket 0 is LIFO inside the block, while `top()` remains a conservative lower bound for termination and pruning. The stale-label check skips an older, longer path. Evidence (`counts.sh`, seed 1 full): instructions 1,202.4 -> 1,154.0 per edge, branches 156.8 -> 142.6, mispredicts 7.32 -> 5.88. Quick 45/45 and thread sweep 240/240 pass. Local `ab.sh` over 31 pairs leaned -4.5% with 18.3% spread; query-phase measurements in the scan were 13–17% faster. The one-run local `score.sh` was T 0.1328 s, M 69.8 MB, S 424, K 23.98; its comparison was unpaired and does not resolve the A/B. Board run `run-a94ddb39f2f8` scored K 24.64 at T 0.166 s, M 70.7 MB, S 424, versus the prior latest K 23.78 at T 0.181 s. Outcome: keep for a second board run; the first board result is a material gain, but one noisy run is not enough to settle T.
 **D1. Alternate the two sides by work.** Context: the spec's island queries start on 14 nodes that can't reach the main body. Options: expand the side with the smaller top, or the side with less work. Chose: less work, because with the smaller top the backward side keeps winning and settles about 1.74M nodes per island query before the forward side runs out. Cost: none. Evidence: both rules are exact, and the full-scale grid passes. Outcome: kept.
 
 **D2. Parse the file twice instead of holding an edge list.** Context: a list of 5M edges costs 60 MB at the peak. Chose: a counting pass and a placing pass over the mapped file. Cost: parsing runs twice. Outcome: kept.

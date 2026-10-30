@@ -13,7 +13,7 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Limits
 
-- M is about 93 MB locally. The graph takes 54 MB of that.
+- M was 70.7 MB on the latest board run; the graph takes about 54 MB.
 - A query whose distances pass 2^32 runs twice, first in 32 bits and then in 64. There are only a few of these.
 - Node ids are random, so nearly every hop is a cache miss.
 

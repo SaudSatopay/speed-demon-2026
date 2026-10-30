@@ -6,8 +6,8 @@
 
 ## Where it loses
 
-- M is 13 MB on the board, against the 7.3 MB where more savings stop counting. The name table takes 8.4 MB of that.
-- S is 339 code lines against the reference's 108, which costs about 3.7 speed points.
+- M ranged from 12.9 to 13.6 MB over the latest two runs, against the 7.3 MB where more savings stop counting. The name table takes about 8.4 MB of that.
+- S is 315 code lines against the reference's 108, which costs about 3.4 speed points.
 
 ## Where the reference spends its time
 
@@ -27,9 +27,11 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 5 | Same design in 369 lines: one exit from the table's loop, a row that is an array, and regions parsed once | Two passes over `regions.csv` were serial time, and rivals have half our lines | run-126b276f6fae | 0.061 | 12.8 | 69.9 |
 | 6 | Regions parsed in one pass, and the output sorted once, when it's written | The temporary list, the `seen` table and the output loop's destructuring were all lines with no job at run time | run-… | 0.0304 *local* | 23.5 *local* | 68.8 *local* |
 | 7 | BZHI masks the key words, in place of a `u128` shift | Three 128-bit shifts per record were about 5% of all instructions, and the box is limited by its clock | run-… | 0.0314 *local* | 21.1 *local* | 69.0 *local* |
+| 8 | Parser and thread-helper line cuts | Twenty-four fewer counted lines; parser semantics rely only on spec 2.2 guarantees | run-30c0ac031f43 / run-424808ccefdc | 0.050 / 0.051 | 12.9 / 13.6 | 72.5 / 72.1 |
 
 ## Decision log
 
+**D9. Cut parser and helper lines that the spec no longer needs.** Context: several serial helpers and temporary region structures existed only for broader input forms. Chose: inline the single-use thread helper, treat unquoted text fields as empty per spec 2.2, derive header/record starts from the fixed header and CRLF rules, return the two needed region arrays directly, and shorten the hash fold. Evidence: S 339 -> 315. Full-scale counts: 393.1 -> 393.2 instructions per record (+130,724 total), branches 43.8 -> 43.9, simulated mispredicts 1.70 -> 1.53 (6,333,623 -> 5,712,201). Quick 59/59, thread sweep 324/324, constant-hash tiny 29/29 and pre-push 59/59 pass. Local `ab.sh` gave -3.9% with 89% spread, inconclusive. Board runs `run-30c0ac031f43` and `run-424808ccefdc` gave K 28.22 (T 0.050 s, M 12.9 MB) and K 27.67 (T 0.051 s, M 13.6 MB); the earlier best remains K 28.28. Outcome: keep for the 24-line reduction; the two board results are within the track's measured timing and memory spread, with another run pending.
 **D1. Never unescape.** Context: `names_distinct` compares unescaped values, and `name_bytes` counts them. Options: unescape into a buffer, or work from the raw bytes. Chose: raw bytes. Inside a quoted field, every `"` belongs to a `""` pair, so the raw bytes encode the value one to one, and the value's length is the raw length minus the number of pairs. Cost: none. Evidence: the grid's rewrites and limit cases. Outcome: kept.
 
 **D2. Cut segments at CRLF, not by counting quotes.** Context: a thread must start on a record boundary, and quoted notes contain LFs. Options: count quotes in a first pass to find the parity at each cut, or use section 2.2's promise that a CR is only ever the start of a CRLF. Chose: the CRLF, which needs no extra pass, since about half the records end in one. Cost: a file with no CRLF isn't split, though it's still right. The `lf-except-last` variant in our bank tests exactly that. Outcome: kept.

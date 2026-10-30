@@ -131,17 +131,18 @@ fn token_key(file: &[u8], start: usize, len: usize) -> u128 {
     (bytes | 0x2020_2020_2020_2020_2020_2020_2020_2020) & (u128::MAX >> (128 - 8 * len.min(16)))
 }
 
-/// Mixes a key and its length. A test build swaps it for a constant, so that every key collides and
-/// any logic that trusts a hash without comparing the key shows up as a wrong answer.
-#[inline]
-fn hash(key: u128, len: usize) -> usize {
-    let first = (key as u64 ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let second = ((first ^ (first >> 29)) ^ (key >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    if cfg!(sd_const_hash) {
-        0
-    } else {
-        (second ^ (second >> 32)) as usize
-    }
+/// Mixes a key and its length with one multiply, whose high bits depend on every input bit. A test
+/// build swaps it for a constant, so that every key collides and any logic that trusts a hash without
+/// comparing the key shows up as a wrong answer.
+fn hash(key: u128, len: usize) -> u64 {
+    let (low, high) = (key as u64, (key >> 64) as u64);
+    let hash = (low ^ high.rotate_left(29) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if cfg!(sd_const_hash) { 0 } else { hash }
+}
+
+/// The slot a key's probe starts at, in a table of `slots` slots, a power of two: the hash's top bits.
+fn home(slots: usize, key: u128, len: usize) -> usize {
+    (hash(key, len) >> (64 - slots.trailing_zeros())) as usize
 }
 
 /// A slot of the term table: half a cache line holding all that a token's lookup needs, so one memory
@@ -172,29 +173,38 @@ impl<'a> TermTable<'a> {
         }
     }
 
-    /// Finds the term for the token at `start..end` of `file`, in any letter case.
-    #[inline]
-    fn find(&self, file: &[u8], start: usize, end: usize) -> Option<&TermSlot> {
+    /// The slot of the term for the token at `start..end` of `file`, in any letter case, or else the
+    /// empty slot that ends its probe, whose term is the one no query uses. The compares are joined
+    /// without short-circuits, so a probe has one branch, the exit, which is nearly always taken.
+    #[inline(always)]
+    fn find(&self, file: &[u8], start: usize, end: usize) -> &TermSlot {
         let len = end - start;
         let key = token_key(file, start, len);
         let mask = self.slots.len() - 1;
-        let mut index = hash(key, len) & mask;
-        let long_match = |term| file[start..end].eq_ignore_ascii_case(self.keys[term as usize]);
+        let mut index = home(self.slots.len(), key, len);
         loop {
             let slot = &self.slots[index];
-            if slot.len == 0 {
-                return None;
-            }
-            if slot.key == key && slot.len as usize == len && (len <= 16 || long_match(slot.term)) {
-                return Some(slot);
+            let differs = (slot.key ^ key) | u128::from(slot.len ^ len as u32);
+            // The term, or the empty slot, unless a term longer than the key disagrees past it.
+            if differs.min(u128::from(slot.len)) == 0
+                && (len <= 16 || slot.len == 0 || self.long_term_is(slot, &file[start..end]))
+            {
+                return slot;
             }
             index = (index + 1) & mask;
         }
     }
 
+    /// Whether a term longer than the key's 16 bytes, whose key and length match, is this token.
+    #[cold]
+    fn long_term_is(&self, slot: &TermSlot, token: &[u8]) -> bool {
+        token.eq_ignore_ascii_case(self.keys[slot.term as usize])
+    }
+
     /// Adds the query term at `start..end` of `file`, if it's new, and returns its id.
     fn intern(&mut self, file: &'a [u8], start: usize, end: usize) -> u32 {
-        if let Some(slot) = self.find(file, start, end) {
+        let slot = self.find(file, start, end);
+        if slot.len != 0 {
             return slot.term;
         }
         let len = end - start;
@@ -221,7 +231,7 @@ impl<'a> TermTable<'a> {
 
 fn place_slot(slots: &mut [TermSlot], slot: TermSlot) {
     let mask = slots.len() - 1;
-    let mut index = hash(slot.key, slot.len as usize) & mask;
+    let mut index = home(slots.len(), slot.key, slot.len as usize);
     while slots[index].len != 0 {
         index = (index + 1) & mask;
     }
@@ -299,15 +309,26 @@ fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32
     while line > 0 && docs[line - 1] != b'\n' {
         line += 1;
     }
-    while line < end {
+    // The range is rounded to whole words of 64 documents: it starts at its first document whose id
+    // is a multiple of 64 and runs to the next range's, so threads never share a bitmap word.
+    let mut aligned = false;
+    while line < docs.len() {
         let mut pos = line;
         let mut id = 0;
         while docs[pos] != b'\t' {
             id = id * 10 + u32::from(docs[pos] - b'0');
             pos += 1;
         }
+        if id % 64 == 0 {
+            if line >= end {
+                return;
+            }
+            aligned = true;
+        }
         let lf = pos + 1 + offset_of_line_feed(docs, pos + 1);
-        visit(id, pos + 1, lf);
+        if aligned {
+            visit(id, pos + 1, lf);
+        }
         line = lf + 1;
     }
 }
@@ -404,18 +425,21 @@ struct Plan {
 }
 
 fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
+    // Two terms follow the query terms: the one every other token maps to, and one no token maps to.
     let term_count = queries.terms.keys.len();
-    let (mut last_doc, mut sample_df) = (vec![NONE; term_count], vec![0u32; term_count]);
+    for slot in queries.terms.slots.iter_mut().filter(|slot| slot.len == 0) {
+        slot.term = term_count as u32;
+        slot.store = STAMP_ONLY;
+    }
+    let (mut last_doc, mut sample_df) = (vec![NONE; term_count + 2], vec![0u32; term_count + 2]);
     let mut sampled_docs = 0;
     for_each_doc(docs, 0, docs.len().min(SAMPLE_BYTES), |doc, text, lf| {
         sampled_docs += 1;
         for_each_token(docs, text, lf, |start, end| {
-            if let Some(slot) = queries.terms.find(docs, start, end) {
-                let term = slot.term as usize;
-                if last_doc[term] != doc {
-                    last_doc[term] = doc;
-                    sample_df[term] += 1;
-                }
+            let term = queries.terms.find(docs, start, end).term as usize;
+            if last_doc[term] != doc {
+                last_doc[term] = doc;
+                sample_df[term] += 1;
             }
         });
     });
@@ -459,7 +483,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
             scan_count += 1;
             let mut packed = Packed {
                 query: query.slot,
-                terms: [term_count as u32; 6], // The term after the last is the one no document has.
+                terms: [term_count as u32 + 1; 6], // The term no token maps to, in unused slots.
             };
             for (slot, step) in packed.terms.iter_mut().zip(steps) {
                 *slot = step.term | op_code(step.op) << 30;
@@ -556,6 +580,7 @@ fn scan_range(
     plan: &Plan,
     bitmaps: &[AtomicU64],
     words: usize,
+    spare: usize, // This thread's own word after the bitmaps, where stamp-only terms set bits.
     smallest: &[Mutex<[u32; SMALLEST]>],
 ) -> ScanResult {
     let term_count = queries.terms.keys.len();
@@ -570,8 +595,8 @@ fn scan_range(
         hits: vec![NO_HITS; plan.scan_count],
     };
     let mut part = new_part(NONE);
-    // The offset of the last document of the part holding each term, plus one no document has.
-    let mut stamps = vec![u16::MAX; term_count + 1];
+    // The offset of the last document of the part holding each term, and the two terms after them.
+    let mut stamps = vec![u16::MAX; term_count + 2];
     let (mut tokens, mut phrase_anchors, mut bool_anchors) = (Vec::new(), Vec::new(), Vec::new());
     for_each_doc(docs, range.0, range.1, |doc, text, lf| {
         if part.first_doc == NONE {
@@ -582,33 +607,35 @@ fn scan_range(
             stamps.fill(u16::MAX);
         }
         let offset = (doc - part.first_doc) as u16;
+        let (doc_word, doc_bit) = (doc as usize / 64, 1u64 << (doc % 64));
         tokens.clear();
         phrase_anchors.clear();
         bool_anchors.clear();
         for_each_token(docs, text, lf, |start, end| {
-            let Some(slot) = queries.terms.find(docs, start, end) else {
-                tokens.push(NONE);
-                return;
-            };
+            let slot = queries.terms.find(docs, start, end);
             let term = slot.term as usize;
             tokens.push(slot.term);
             if slot.flags & PHRASE_ANCHOR != 0 {
                 phrase_anchors.push((tokens.len() - 1, term));
             }
-            if stamps[term] == offset {
-                return; // Only a term's first occurrence in a document counts.
-            }
+            // Only a term's first occurrence in a document counts.
+            let first = stamps[term] != offset;
             stamps[term] = offset;
-            if slot.flags & BOOL_ANCHOR != 0 {
+            if first & (slot.flags & BOOL_ANCHOR != 0) {
                 bool_anchors.push(term);
             }
             if slot.store & BITMAP != 0 {
-                if slot.store != STAMP_ONLY {
-                    let bitmap = (slot.store & !BITMAP) as usize;
-                    let word = &bitmaps[bitmap * words + doc as usize / 64];
-                    word.fetch_or(1 << (doc % 64), Relaxed);
-                }
-            } else {
+                // Setting a bit again is harmless, and a stamp-only term's bit lands in the spare
+                // word, so this takes no branch. And no other thread writes this document's words,
+                // so it takes no atomic either.
+                let bitmap = (slot.store & !BITMAP) as usize;
+                let at = if slot.store == STAMP_ONLY {
+                    spare
+                } else {
+                    bitmap * words + doc_word
+                };
+                bitmaps[at].store(bitmaps[at].load(Relaxed) | doc_bit, Relaxed);
+            } else if first {
                 let list = &mut part.lists[slot.store as usize];
                 if list.tail == 0 || list.fill as usize == BLOCK_POSTINGS {
                     result.blocks.push(Block {
@@ -905,8 +932,11 @@ fn main() -> io::Result<()> {
     let plan = make_plan(docs, &mut queries);
 
     let words = document_count(docs).div_ceil(64);
+    // After the bitmaps, a spare word on its own cache line for each thread.
     let bitmap_words = plan.bitmap_count * words;
-    let bitmaps: Vec<AtomicU64> = (0..bitmap_words).map(|_| AtomicU64::new(0)).collect();
+    let bitmaps: Vec<AtomicU64> = (0..bitmap_words + threads * 8)
+        .map(|_| AtomicU64::new(0))
+        .collect();
     let smallest: Vec<_> = (0..plan.scan_count)
         .map(|_| Mutex::new([NONE; SMALLEST]))
         .collect();
@@ -915,7 +945,10 @@ fn main() -> io::Result<()> {
         let scan = |i: usize| {
             let range = (i * docs.len() / threads, (i + 1) * docs.len() / threads);
             let (queries, plan, bitmaps, smallest) = (&queries, &plan, &bitmaps, &smallest);
-            scope.spawn(move || scan_range(docs, range, queries, plan, bitmaps, words, smallest))
+            let spare = bitmap_words + i * 8;
+            scope.spawn(move || {
+                scan_range(docs, range, queries, plan, bitmaps, words, spare, smallest)
+            })
         };
         let handles: Vec<_> = (0..threads).map(scan).collect();
         handles

@@ -1,6 +1,6 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board. Ours is in the last row of [the journey](#the-journey).
+**Result:** the reference takes **32.05 s / 228 MB** on the board, and ours takes **0.033 s / 20.0 MB** (run `run-5289b7130599`). That's K = **37.15** and **78.5** speed points.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
@@ -27,7 +27,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 5 | Output through a shared mapping, numbers printed by arithmetic, and no restart paths | Serial `write`s to tmpfs queue on the file's lock, and formatting cost 220 ns a line | run-caafa693c324 | 0.036 | 20.8 | 76.9 |
 | 6 | A smaller endpoint table, comparing keys against the log | Inline keys cost 262 KB of table and 20 lines, for just 1,842 endpoints | run-e1d40bd48c9a | 0.034 | 19.9 | 77.8 |
 | 7 | Group each hour by counting, in place, and select percentiles | A full sort was about half the output stage, for three order statistics per group | run-c17dc23201a0 | 0.033 | 20.3 | 77.9 |
-| 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-… | | | |
+| 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-5289b7130599 | 0.033 | 20.0 | 78.5 |
 
 ## Decision log
 
@@ -41,7 +41,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D5. One shared array per hour.** Context: M was 54 MB: 8-byte records with doubling slack, a copy to sort each hour, and the 10 MB output on top. Options: per-thread lists of 32-bit records freed hour by hour, or one array per hour that threads reserve blocks of. We tried the first and measured it (see below): M 31 MB but T 33 ms, because 864 small mappings cost about 13 ms. Chose: the second, with 72 mappings, no merge and an in-place sort. Latencies that don't fit in a record go to a side list. Cost: S 394 -> 514, and one `unsafe` cast from atomics to integers once threads have joined. Evidence: T 0.025 -> 0.022 s, M 54.4 -> 26.8 MB, K 26.17 -> 30.48 (local). Outcome: kept.
 
-**D6. Write the output through a shared mapping.** Context: SpeedDEMONS passed us on the board with T 0.032 s. A profile showed the output stage at about half of T, with `write` calls serial, because tmpfs takes the file's lock for each. Chose: stretch the file to an upper bound, map it, let each thread claim its stretch in hour order, copy without waiting, and cut the file to length at the end. Numbers now print with no digit loop. We also dropped both restart paths, which cost lines for inputs the spec rules out: each hour's array now has room for every line, in pages that stay untouched, and more than 3,584 endpoints aborts. Cost: one `unsafe impl Sync`. Evidence: T 0.022 -> 0.021 s, K 30.48 -> 31.44 (local), but the board stayed at T 0.036 s, so `write` wasn't the bottleneck there. Kept for now. Outcome: removed again in step 8, once S mattered more.
+**D6. Write the output through a shared mapping.** Context: SpeedDEMONS passed us on the board with T 0.032 s. A profile showed the output stage at about half of T, with `write` calls serial, because tmpfs takes the file's lock for each. Chose: stretch the file to an upper bound, map it, let each thread claim its stretch in hour order, copy without waiting, and cut the file to length at the end. Numbers now print with no digit loop. We also dropped both restart paths, which cost lines for inputs the spec rules out: each hour's array now has room for every line, in pages that stay untouched, and more than 3,584 endpoints aborts. Cost: one `unsafe impl Sync`. Evidence: T 0.022 -> 0.021 s, K 30.48 -> 31.44 (local), but the board stayed at T 0.036 s, so `write` wasn't the bottleneck there. Kept for now. Outcome: removed again in step 8, when it cost lines and still hadn't gained time on the board. T held at 0.033 s and K rose from 36.19 to 37.15.
 
 **D7. Remove the inline keys.** Context: with only 1,842 endpoints, the key texts in the log fit in the caches anyway, so a 64-byte slot per endpoint might not earn its 20 lines. Chose: a 16-byte slot, and a compare against the key's first occurrence in the log. It came out both simpler and faster, because the table now fits the L1 cache. Evidence: T 0.021 -> 0.018 s, S 519 -> 492, K 31.44 -> 34.06 (local). Outcome: kept.
 

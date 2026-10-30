@@ -13,7 +13,7 @@ Boolean and phrase queries over a 254 MB corpus. Rust, standard library only.
 
 ## Limits
 
-- M is about 71 MB locally, above the 44 MB where more savings stop counting. Chain blocks take 40 MB of that.
+- M is about 73 MB on the board, above the 44 MB where more savings stop counting. Chain blocks take most of that.
 - Threads get equal byte ranges rather than claiming work, so one slow thread slows the whole scan.
 - A wrong guess from the 1% sample can cost memory or extra phrase checks, never a wrong answer.
 

@@ -501,6 +501,8 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
                     if candidate + other_top < best {
                         sides[side].set_label(neighbour, narrow);
                         sides[side].push(narrow, neighbour);
+                        // Its arcs come next from this node's offsets, which can load meanwhile.
+                        prefetch(&graphs[side].offsets[neighbour as usize]);
                     }
                 }
             }

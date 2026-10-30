@@ -34,6 +34,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 12 | Nodes numbered in clusters the size of a label page, breadth first inside each | Two links per node instead of three cost 20%, so the numbering's quality matters far more than we'd assumed | run-03f74b0ab497 | 0.180 | 78.2 | 68.2 |
 | 13 | Queries parsed and `numbers` dropped before the reverse graph is built | The 7 MB of old-to-new numbers were still live at the memory peak, and nothing in the reverse build reads them | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 | 14 | `INF` as `u64::MAX`, so an answer prints as a plain cast | The cast already gives -1 for "no path", which removes the output loop's branch and 5 lines | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
+| 15 | Prefetching a node's offsets when it's pushed | Its arcs are read from those offsets soon after, on a dependent miss | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 
 ## Decision log
 
@@ -67,12 +68,17 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D15. A larger `INF`.** Context: the output loop only tested for `INF` to print -1, and `u64::MAX as i64` is -1. Nothing adds to `INF`, and the spec puts every real distance below 2^63, so two of them add without wrapping. Cost: S -5. Evidence: `counts.sh` instructions 1,186.4 -> 1,186.3 per record, mispredicts 7.26 -> 7.27, so this is a line saving only.
 
+**D16. Prefetch offsets at push.** Context: a pop's first read is the node's offsets, a dependent miss. Chose: one prefetch at push, kept because it costs one line, though it's unproven: `ab.sh` over 31 runs gave -2.9% at 20.6% noise, the review's own run -3.5% at 20%, and query-phase medians over two rounds of 15 were 67.8 and 68.9 ms without it, 68.3 and 68.1 ms with it. `counts.sh`: instructions 1,186.4 -> 1,202.4 per record, mispredicts 7.27 -> 7.32. What would change our minds: a lower K on the board, or a need for this one line.
+
 ## What didn't work
 
 | Experiment | What we expected | What we measured | Where | Kept? |
 |---|---|---|---|---|
 | PREFETCHW instead of a read prefetch for counters, offsets and arcs, to avoid stalling on another core's copy | Faster build on the box, whose cross-core traffic is slow | T 0.272 -> 0.276 s, K 17.80 -> 17.60: no gain. Its time now tracks plain clock speed | run-98438f4073de | reverted |
 | Node id as its own label-table hash, since renumbered neighbours are close | Fewer cache misses in the label table | About 5x slower, because linear probing clusters on consecutive ids: T 0.21 -> 1.03 s by `ab.sh` | local | reverted |
+| Also prefetching arcs during bucket redistribution (from a review) | A further gain on top of the offsets prefetch | No further gain | local | not applied |
+| A radix queue as an array of buckets with an occupancy mask (from a review) | A cheaper scan for the next bucket | Wrong answers, as the bit for keys equal to `last` must stay clear, and the scan isn't hot anyway | local | not applied |
+| A thread pool in place of 7 x 12 spawns (from a review) | Cheaper starts | Spawns cost 2.6 ms in all, a `Barrier` pool 2.9 ms | local | not applied |
 
 ## The final design
 

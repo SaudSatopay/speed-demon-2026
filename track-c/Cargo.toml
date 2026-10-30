@@ -1,0 +1,18 @@
+[package]
+name = "join"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies: each one multiplies K by 0.9.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# `--cfg sd_const_hash` builds a test binary whose key hash is constant, so every key collides and the
+# answers must still be right (see the kickoff runbook, T+0).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sd_const_hash)"] }

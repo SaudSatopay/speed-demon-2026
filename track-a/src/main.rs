@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::thread;
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
@@ -42,10 +42,6 @@ const METHOD_LENS: u64 = 0x70_0064_5003;
 
 /// Room for the spec's exactly 1,842 endpoints, at a low load.
 const SLOTS: usize = 1 << 12;
-
-/// A table slot holds, from the top: 16 bits of hash, the key's length (at most 125 by the spec), and
-/// where the key first occurred in the log, which is never 0, so 0 means empty.
-const START_BITS: u32 = 40;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -152,38 +148,37 @@ fn hash(first: u64, last: u64, len: usize) -> u64 {
 }
 
 /// The id of the endpoint at `start..end`, adding it if it's new. An id is a slot number in a table
-/// that all threads share with no locks: one compare-and-swap publishes a whole slot, and a published
-/// slot never changes. A key is always compared in full, against its first occurrence in the log,
-/// because templated paths share prefixes, suffixes and lengths. Slot 0 stays free: see `Hour`.
+/// that all threads share with no locks: a slot holds where the key first occurred in the log, which
+/// is never 0, so 0 means empty, and a published slot never changes. A key is always compared in full,
+/// through its closing space, because templated paths share prefixes, suffixes and lengths, and that
+/// space is why a slot needs no length. Slot 0 stays free: see `Hour`.
 ///
 /// # Safety
 /// `log` must come from `map_file`, `start` must be at least 8, `start <= end`, `end` must be inside
-/// the log, and `table` must have been filled only by this function, with this log.
-unsafe fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
+/// the log and hold a space, and `table` must have been filled only by this function, with this log.
+unsafe fn id_of(table: &[AtomicU32], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
     // SAFETY, for this load and the next two: all three start inside the log.
     let first = unsafe { load_u64(log, start) } << outside;
     let last = unsafe { load_u64(log, end - 8) } >> outside;
-    let hash = hash(first, last, len);
-    let entry = (hash << 12) & (!0 << 48) | (len as u64) << START_BITS | start as u64;
     let block = unsafe { load_block(log, start) };
-    let mut index = (hash >> 52) as usize;
+    let position = start as u32;
+    let mut index = (hash(first, last, len) >> 52) as usize;
     loop {
         index = (index & (SLOTS - 1)).max(1);
         let slot = &table[index];
-        if slot.load(Relaxed) == 0 && slot.compare_exchange(0, entry, Relaxed, Relaxed).is_ok() {
+        if slot.load(Relaxed) == 0 && slot.compare_exchange(0, position, Relaxed, Relaxed).is_ok() {
             return index as u32;
         }
-        let found = slot.load(Relaxed);
-        let first = found as usize & ((1 << START_BITS) - 1);
+        let first = slot.load(Relaxed) as usize;
         // One compare of a whole block covers nearly all keys, whatever their length, and a call to
-        // memcmp would branch on the length.
-        // SAFETY: `first` is at most the `start` of an earlier call, which was inside the log.
-        if (found ^ entry) >> START_BITS == 0
-            && (!equal_bytes(unsafe { load_block(log, first) }, block)).trailing_zeros() as usize
-                >= len.min(64)
-            && (len <= 64 || log[first + 64..first + len] == log[start + 64..end])
+        // memcmp would branch on the length. The rest of a long key may be longer than what's left of
+        // the log after `first`, if that key is shorter and on the last line, hence the `get`.
+        // SAFETY: `first` is the `start` of an earlier call, which was inside the log.
+        if (!equal_bytes(unsafe { load_block(log, first) }, block)).trailing_zeros() as usize
+            > len.min(63)
+            && (len < 64 || log.get(first + 64..=first + len) == Some(&log[start + 64..=end]))
         {
             return index as u32;
         }
@@ -193,10 +188,11 @@ unsafe fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u3
 
 /// Each id's endpoint, and each id's place in byte order (`[u8]` compares as unsigned bytes, with a
 /// proper prefix first). Unused ids have an empty key, which sorts before every real one.
-fn rank_ids<'a>(table: &[AtomicU64], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<u32>) {
-    let key_of = |slot: &AtomicU64| {
-        let entry = slot.load(Relaxed) as usize;
-        &log[entry & ((1 << START_BITS) - 1)..][..entry >> START_BITS & 255]
+fn rank_ids<'a>(table: &[AtomicU32], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<u32>) {
+    let key_of = |slot: &AtomicU32| match slot.load(Relaxed) as usize {
+        0 => &log[..0],
+        // SAFETY: a slot holds the `start` of a call to `id_of`, which was inside the log.
+        first => &log[first..][..unsafe { offset_of_space(log, first) }],
     };
     let keys: Vec<&[u8]> = table.iter().map(key_of).collect();
     let mut ids: Vec<usize> = (0..SLOTS).collect();
@@ -253,7 +249,7 @@ unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
 /// the timestamp is always 27 bytes. A thread keeps its own unfilled block of each hour, as a slice,
 /// and its own big latencies, so the hot path reads and writes no line that other threads write.
 /// `log` is the mapping from `map_file`, whose padding the unchecked loads here rely on.
-fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, size: usize) {
+fn parse(log: &[u8], table: &[AtomicU32], hours: &[Hour], cursor: &AtomicUsize, size: usize) {
     let mut blocks: [&[AtomicU32]; HOURS] = [&[]; HOURS];
     let mut bigs = [const { Vec::new() }; HOURS];
     let claim = || Some(cursor.fetch_add(size, Relaxed)).filter(|&start| start < log.len());
@@ -277,8 +273,8 @@ fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, 
             // This index is the one check the unchecked loads below rely on: it panics unless the space
             // is inside the log. Statuses are 100 to 599.
             let is_error = u32::from(log[key_end + 1] == b'5');
-            // SAFETY: `key_end` is inside the log, `key_start` is at least 29 and not after it, and
-            // only this call fills `table`.
+            // SAFETY: `key_end` is inside the log and holds a space, `key_start` is at least 29 and
+            // not after it, and only this call fills `table`.
             let id = unsafe { id_of(table, log, key_start, key_end) };
             // Three status digits sit between two spaces, so the latency starts 5 bytes on.
             // SAFETY: the load ends 13 bytes after `key_end`, inside the padding at the latest.
@@ -428,6 +424,7 @@ fn main() -> io::Result<()> {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let threads = thread_count();
     let log = map_file(&Path::new(&data_dir).join("requests.log"))?;
+    assert!(log.len() < 1 << 32, "table slots hold 32-bit positions");
     let file = File::create(Path::new(&out_dir).join("summary.txt"))?;
     // Room for every line, the shortest being 40 bytes, plus each thread's unfinished block.
     let len = log.len() / 40 + BLOCK_RECORDS * (threads + 1);
@@ -436,7 +433,7 @@ fn main() -> io::Result<()> {
         (slots, AtomicUsize::new(0), Mutex::default())
     };
     let hours: Vec<Hour> = (0..HOURS).map(new_hour).collect();
-    let table: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
+    let table: Vec<AtomicU32> = (0..SLOTS).map(|_| AtomicU32::new(0)).collect();
     let cursor = AtomicUsize::new(0);
     // Eight segments per thread balances the load. Tying the size to the thread count also makes
     // the SD_THREADS test sweep move every cut, down to cuts smaller than a line on tiny inputs.

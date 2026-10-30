@@ -173,6 +173,8 @@ fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
     vec![0u32; len].into_iter().map(AtomicU32::new).collect()
 }
 
+/// Seeds a thread takes at a time when numbering.
+const SEED_BLOCK: usize = 1 << 12;
 /// Out-neighbours kept per node for numbering. Nodes average 2.9, so this sees most edges.
 const LINKS: usize = 3;
 
@@ -187,18 +189,28 @@ fn local_numbering(links: &[AtomicU32], nodes: usize, threads: usize) -> Vec<Ato
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
-                    let claim = |node: usize| !claimed[node].swap(true, Relaxed);
+                    // Most claims fail, and a plain read of a flag costs far less than a locked swap.
+                    let claim = |node: usize| {
+                        !claimed[node].load(Relaxed) && !claimed[node].swap(true, Relaxed)
+                    };
                     let (mut list, mut stack) = (Vec::new(), Vec::new());
+                    let (mut seed, mut seeds_end) = (0, 0);
                     loop {
                         let node = match stack.pop() {
                             Some(node) => node,
                             None => loop {
-                                let seed = next_seed.fetch_add(1, Relaxed);
-                                if seed >= nodes {
-                                    return list;
+                                // Seeds come in blocks, because near the end nearly all are taken,
+                                // and one shared counter hit per node would make the threads queue.
+                                if seed == seeds_end {
+                                    seed = next_seed.fetch_add(SEED_BLOCK, Relaxed);
+                                    seeds_end = (seed + SEED_BLOCK).min(nodes);
+                                    if seed >= nodes {
+                                        return list;
+                                    }
                                 }
-                                if claim(seed) {
-                                    break seed as u32;
+                                seed += 1;
+                                if claim(seed - 1) {
+                                    break seed as u32 - 1;
                                 }
                             },
                         };

@@ -164,12 +164,16 @@ const BUSY: u64 = 1;
 /// that has seen this name. So a lookup costs one cache miss, with no second memory access to compare
 /// the key. Names are compared in full, and never unescaped: the raw bytes encode the value one to
 /// one. The slots are insert-only, so a published slot never changes its key.
+/// Give the shared insertion counter its own cache line, away from the table fields read by every worker.
+#[repr(align(64))]
+struct AlignedUsed(AtomicUsize);
+
 struct NameTable<'a> {
     file: &'a [u8],
     words: Vec<AtomicU64>,
     first: usize, // The word where the first slot starts, on a cache line boundary.
     mask: usize,
-    used: AtomicUsize,
+    used: AlignedUsed,
 }
 
 impl<'a> NameTable<'a> {
@@ -182,12 +186,12 @@ impl<'a> NameTable<'a> {
             first: words.as_ptr().align_offset(64),
             words,
             mask: slots - 1,
-            used: AtomicUsize::new(0),
+            used: AlignedUsed(AtomicUsize::new(0)),
         }
     }
 
     fn is_full(&self) -> bool {
-        self.used.load(Relaxed) * 8 >= (self.mask + 1) * 7
+        self.used.0.load(Relaxed) * 8 >= (self.mask + 1) * 7
     }
 
     /// Marks this name as seen in `country`, and returns whether that's new for the country. When the
@@ -207,7 +211,7 @@ impl<'a> NameTable<'a> {
                     .compare_exchange(EMPTY, BUSY, Acquire, Acquire)
                     .is_ok()
                 {
-                    self.used.fetch_add(1, Relaxed);
+                    self.used.0.fetch_add(1, Relaxed);
                     if key.len() <= INLINE_BYTES {
                         (0..3).for_each(|i| stored[i].store(key_words[i], Relaxed));
                     } else {

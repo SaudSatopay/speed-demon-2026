@@ -86,6 +86,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | A thread pool in place of 7 x 12 spawns (from a review) | Cheaper starts | Spawns cost 2.6 ms in all, a `Barrier` pool 2.9 ms | local | not applied |
 | Two-tier exact Dial queue (4,096 near-distance ring buckets plus a binary-heap overflow) | Cheaper queue operations and fewer dependent heap steps | Correct: quick 45/45, threads 240/240. `counts.sh` vs guarded u16 radix k=7 was flat: 1,153.5 -> 1,153.6 instructions/edge, branches 142.2/142.2, mispredicts 5.88/5.88. Across 31 alternating full-scale pairs, query median 41.484 -> 41.588 ms (+0.25% paired median; mean +0.17 ms, 95% CI includes zero); whole-process median 102.174 -> 102.691 ms (+0.32% paired median); RSS 151.191 -> 151.121 MB. No material timing or memory benefit. | local scratch | rejected |
 
+| Compress graph offsets with a u32 base per 64 nodes and u16 local entries, plus a sparse u32 overflow path | Halve offset storage to save roughly 5.5 MB across both graphs | Quick 45/45, thread sweep 240/240 and synthetic overflow-boundary test pass. Full counts 1,153.7 -> 1,211.5 instructions/edge and 142.3 -> 155.9 branches, misses 5.88 -> 5.85. 41-pair A/B +4.6% (10.4% spread); prefetch variants +3.8% and +4.8%. Two five-run scorer pairs: S 428 -> 506, M 69.6 -> 62.4 with K 28.54 -> 27.83, then M 74.6 -> 62.7 with K 29.39 -> 29.25 | local scratch | rejected |
+
 ## The final design
 
 Not final yet: see [README](README.md#approach) for the current one.

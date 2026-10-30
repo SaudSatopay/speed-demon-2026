@@ -6,8 +6,8 @@
 
 ## Where it loses
 
-- M is about 128 MB locally, of which 54 MB is the graph and about 37 MB the labels.
-- S is 465 code lines against the reference's 43, which costs about 7.8 speed points.
+- M is about 93 MB locally, of which 54 MB is the graph.
+- S is 500 code lines against the reference's 43, which costs about 8 speed points.
 
 ## Where the reference spends its time
 
@@ -25,6 +25,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 3 | Per-query hash table for labels, and pruned pushes | The largest search labels 78,554 of 1.74M nodes, and the median 196 | run-9000879b77a6 | 0.380 | 130 | 59.1 |
 | 4 | Nodes renumbered by depth-first walks, SWAR parsing, and a batched, prefetched build | Random ids make every hop a cache miss, and the build was mostly cache misses on shared counters | run-… | 0.199 *local* | 164.4 *local* | 60.9 *local* |
 | 5 | Arcs packed into 4 bytes, with a side table for heavy weights | 8 bytes per arc cost 80 MB, and fewer arcs fit in a cache line | run-… | 0.190 *local* | 128.0 *local* | 62.2 *local* |
+| 6 | A 32-bit search with a 64-bit fallback | Nearly every distance fits in 32 bits, which halves labels and queue entries | run-… | 0.180 *local* | 93.2 *local* | 63.9 *local* |
 
 ## Decision log
 
@@ -41,6 +42,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D6. Renumber nodes, and batch the build.** Context: we tried renumbering alone first, and it nearly halved query time (190 to 105 ms), but the extra build time kept the total at 265 ms against 299 ms. We compared BFS, DFS and BFS limited to cells of 64 to 16,384 nodes, and DFS was best, by a small margin. A profile showed the build was mostly cache misses on shared counters and arcs. So: parse 32 edges at a time, prefetch all their cache lines, then touch them, reserving arc slots before storing, because an atomic update waits for earlier stores. Numbers parse from one 8-byte load. Cost: S 288 -> 427, and M 130.7 -> 164.4 MB, for the numbering's arrays and because threads now find more cache lines worth touching. Evidence: T 0.299 -> 0.199 s, K 14.95 -> 16.50 (local). Outcome: kept.
 
 **D7. Pack arcs into 4 bytes.** Context: arcs took 80 MB. A node id needs 21 bits at this size, which leaves 11 bits for a weight, and most weights fit. Chose: the bit split follows the node count, the highest weight value means "look in the side table", and that table is sorted by arc number once the graph is built. Cost: S 427 -> 465. Evidence: M 164.4 -> 128.0 MB, T 0.199 -> 0.190 s, K 16.50 -> 17.50 (local). Outcome: kept.
+
+**D8. Search in 32 bits first.** Context: labels took 24 bytes and queue entries 16, yet only the spec's huge-weight queries pass 2^32. Options: a narrower type with escapes, or generic code run twice. Chose: the same search, generic over the distance type. The 32-bit run gives up as soon as a distance doesn't fit, and that query runs again in 64 bits. Cost: S 465 -> 500. The first attempt compared before checking the fit, so a too-large candidate was silently dropped, and the bank caught it at once. Evidence: M 128.0 -> 93.2 MB, T 0.190 -> 0.180 s, K 17.50 -> 18.99 (local). Outcome: kept.
 
 ## What didn't work
 

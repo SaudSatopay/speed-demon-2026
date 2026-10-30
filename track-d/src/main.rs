@@ -389,11 +389,46 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     ([forward, backward], numbers)
 }
 
+/// A distance type for the search. Nearly every distance fits in 32 bits, which halves the labels and
+/// the queues. The few that don't make the 32-bit search give up, and that query runs again in 64 bits.
+trait Distance: Copy + Ord {
+    const UNREACHED: Self;
+    /// Converts a real distance, or returns None if it doesn't fit.
+    fn narrow(wide: u64) -> Option<Self>;
+    fn widen(self) -> u64;
+}
+
+impl Distance for u32 {
+    const UNREACHED: u32 = u32::MAX;
+    #[inline]
+    fn narrow(wide: u64) -> Option<u32> {
+        u32::try_from(wide)
+            .ok()
+            .filter(|&narrow| narrow != u32::MAX)
+    }
+    #[inline]
+    fn widen(self) -> u64 {
+        u64::from(self)
+    }
+}
+
+impl Distance for u64 {
+    const UNREACHED: u64 = INF;
+    #[inline]
+    fn narrow(wide: u64) -> Option<u64> {
+        Some(wide)
+    }
+    #[inline]
+    fn widen(self) -> u64 {
+        self
+    }
+}
+
 /// One node's tentative distances, from the source and to the target.
 #[derive(Clone, Copy)]
-struct Label {
+struct Label<D> {
     node: u32,
-    dist: [u64; 2],
+    dist: [D; 2],
 }
 
 /// Node ids to table slots. A test build swaps this for a constant, so that every node collides and
@@ -415,14 +450,14 @@ const SMALL_TABLE: usize = 1 << 10;
 /// finds a node's label. A query's table starts small and grows with its search, so a small search
 /// stays in the fastest caches, and the largest on seed 1 needs about 1 MB per thread, where a
 /// node-sized array would cost 7 MB per thread.
-struct Search {
+struct Search<D> {
     table: Vec<u32>, // Label number + 1, or 0 when free. The length is a power of two.
-    labels: Vec<Label>,
-    queues: [BinaryHeap<Reverse<(u64, u32)>>; 2],
+    labels: Vec<Label<D>>,
+    queues: [BinaryHeap<Reverse<(D, u32)>>; 2],
 }
 
-impl Search {
-    fn new() -> Search {
+impl<D: Distance> Search<D> {
+    fn new() -> Search<D> {
         Search {
             table: Vec::new(),
             labels: Vec::new(),
@@ -442,7 +477,7 @@ impl Search {
         }
         self.labels.push(Label {
             node,
-            dist: [INF, INF],
+            dist: [D::UNREACHED; 2],
         });
         self.table[slot] = self.labels.len() as u32;
         if self.labels.len() * 2 > self.table.len() {
@@ -464,16 +499,16 @@ impl Search {
         }
     }
 
-    /// Two-ended Dijkstra, returning INF if there is no path. `best` holds the shortest path seen
-    /// so far, and the search stops when the two queue tops add up to at least `best`, which is
-    /// exact for any non-negative weights, including 0. When a queue empties, that side has settled
-    /// all it can reach, so `best` is exact too.
+    /// Two-ended Dijkstra, returning INF if there is no path, or None if a distance doesn't fit in D.
+    /// `best` holds the shortest path seen so far, and the search stops when the two queue tops add
+    /// up to at least `best`, which is exact for any non-negative weights, including 0. When a queue
+    /// empties, that side has settled all it can reach, so `best` is exact too.
     ///
     /// The side with less work so far goes next. Choosing the smaller top instead would let the
     /// backward side settle the whole main body on queries from a small island.
-    fn distance(&mut self, graphs: &[Graph; 2], source: u32, target: u32) -> u64 {
+    fn distance(&mut self, graphs: &[Graph; 2], source: u32, target: u32) -> Option<u64> {
         if source == target {
-            return 0;
+            return Some(0);
         }
         self.table.clear();
         self.table.resize(SMALL_TABLE, 0);
@@ -482,13 +517,13 @@ impl Search {
         self.queues[1].clear();
         for (side, node) in [source, target].into_iter().enumerate() {
             let label = self.label_index(node);
-            self.labels[label].dist[side] = 0;
-            self.queues[side].push(Reverse((0, node)));
+            self.labels[label].dist[side] = D::narrow(0)?;
+            self.queues[side].push(Reverse((D::narrow(0)?, node)));
         }
         let mut best = INF;
         let mut work = [0u64; 2];
         while let (Some(top_f), Some(top_b)) = (self.queues[0].peek(), self.queues[1].peek()) {
-            let tops = [top_f.0.0, top_b.0.0];
+            let tops = [top_f.0.0.widen(), top_b.0.0.widen()];
             if tops[0] + tops[1] >= best {
                 break;
             }
@@ -505,21 +540,25 @@ impl Search {
             work[side] += 1 + arcs.len() as u64;
             for (index, arc) in arcs.iter().enumerate() {
                 let (neighbour, weight) = graphs[side].unpack(first + index, arc.load(Relaxed));
-                let candidate = dist + weight;
+                let candidate = dist.widen() + weight;
+                let narrow = D::narrow(candidate)?;
                 let label = self.label_index(neighbour);
-                if candidate < self.labels[label].dist[side] {
-                    self.labels[label].dist[side] = candidate;
-                    best = best.min(candidate + self.labels[label].dist[1 - side]);
+                if narrow < self.labels[label].dist[side] {
+                    self.labels[label].dist[side] = narrow;
+                    let other = self.labels[label].dist[1 - side];
+                    if other != D::UNREACHED {
+                        best = best.min(candidate + other.widen());
+                    }
                     // If the other side has settled this node, `best` just counted the path through
                     // it. If not, the rest of the way costs at least the other queue's top. So a
                     // node at or past `best` by that bound needn't be expanded.
                     if candidate + other_top < best {
-                        self.queues[side].push(Reverse((candidate, neighbour)));
+                        self.queues[side].push(Reverse((narrow, neighbour)));
                     }
                 }
             }
         }
-        best
+        Some(best)
     }
 }
 
@@ -540,19 +579,22 @@ fn main() -> io::Result<()> {
         queries.push((numbers[source].load(Relaxed), numbers[target].load(Relaxed)));
     }
 
+    drop(numbers);
+
     let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let next_query = AtomicUsize::new(0);
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut search = Search::new();
+                let (mut narrow, mut wide) = (Search::<u32>::new(), Search::<u64>::new());
                 loop {
                     let index = next_query.fetch_add(1, Relaxed);
                     let Some(&(source, target)) = queries.get(index) else {
                         return;
                     };
-                    let answer = search.distance(&graphs, source, target);
-                    answers[index].store(answer, Relaxed);
+                    let answer = narrow.distance(&graphs, source, target);
+                    let answer = answer.or_else(|| wide.distance(&graphs, source, target));
+                    answers[index].store(answer.unwrap_or(INF), Relaxed);
                 }
             });
         }

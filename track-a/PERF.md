@@ -30,6 +30,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-5289b7130599 | 0.033 | 20.0 | 78.5 |
 | 9 | Same design in 307 lines: one word per table slot, published by one compare-and-swap, and no separate rank pass | Rivals were at our T with 210 lines, and 2x S is worth 2.26 points. Cutting needed no speed | run-43987ef4ad03 | 0.032 | 20.9 | 79.7 |
 | 10 | Keys compared by one block compare, not memcmp | A call to memcmp branches on the length, which varies from line to line | run-aaaf2f99c450 | 0.031 | 20.7 | 80.2 |
+| 11 | Shorter slicing and prefix sums, and hours grouped in their own arrays with no copy | Nothing here runs per record, and 5 lines are worth 0.1 points | run-… | 0.036 *local* | 26.9 *local* | 70.9 *local* |
 
 ## Decision log
 
@@ -50,6 +51,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D8. Cut the code, not the design.** Context: ttimesai took first place with our T and 210 lines to our 468, so code size was what cost us. Options: drop the fast paths, or find what the fast paths don't need. Chose: the second. A table slot became one word (16 bits of hash, the length, the key's first position), so one compare-and-swap publishes it, with no busy state to spin on, and the table halved to 32 KB. Grouping looks up each record's rank itself, so the rank pass went. The method table became a 40-bit constant. Safe code replaced the cast from atomics, and arrays of counts moved onto the stack. Evidence: S 468 -> 307, with local T unchanged at 19.2 ms, and all checks passing. The first version moved big latencies into a list per hour behind a lock, next to the block counter and the array pointer that every record read. Locally it looked free, and on the board T rose from 0.033 to 0.037 s (run-d7cbabc9f01a). So each thread now keeps its own big latencies, and its unfilled blocks as slices, and the hot path reads no line another thread writes.
 
 **D9. Compare keys without memcmp.** Context: on Track D, cutting mispredicts paid more than the instruction count suggested. Every line here compares its endpoint against the endpoint's first occurrence. Chose: load 64 bytes from both, and check the run of equal bytes covers the key, which has no branch on the length for the 94% of keys that fit. Evidence: at sample scale, instructions 492.7 -> 460.4 per record and mispredicts 3.26 -> 2.63 per record, on `counts.sh`. Sorting each group instead of selecting three percentiles was 4 lines shorter, but cost +5.2% instructions and +9% mispredicts at full scale, so we kept selecting.
+
+**D10. Cut five lines nobody runs per record.** Context: a review found slicing, prefix sums and a collect that could be shorter. `AtomicU32::get_mut_slice` also removes the copy from atomics to integers. Evidence: S 301 -> 296, with instructions 319.2 -> 319.3 per record and mispredicts 1.19 -> 1.19 per record at full scale, on `counts.sh`.
 
 ## What didn't work
 

@@ -178,8 +178,7 @@ fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
 fn rank_ids<'a>(table: &[AtomicU64], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<u32>) {
     let key_of = |slot: &AtomicU64| {
         let entry = slot.load(Relaxed) as usize;
-        let start = entry & ((1 << START_BITS) - 1);
-        &log[start..start + (entry >> START_BITS & 255)]
+        &log[entry & ((1 << START_BITS) - 1)..][..entry >> START_BITS & 255]
     };
     let keys: Vec<&[u8]> = table.iter().map(key_of).collect();
     let mut ids: Vec<usize> = (0..SLOTS).collect();
@@ -255,8 +254,7 @@ fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, 
             let block = &mut blocks[index];
             if block.is_empty() {
                 let (slots, next, _) = &hours[index];
-                let first = next.fetch_add(BLOCK_RECORDS, Relaxed);
-                *block = &slots[first..first + BLOCK_RECORDS];
+                *block = &slots[next.fetch_add(BLOCK_RECORDS, Relaxed)..][..BLOCK_RECORDS];
             }
             block[0].store(id << ID_SHIFT | stored << 1 | is_error, Relaxed);
             *block = &block[1..];
@@ -301,12 +299,10 @@ fn group_by_rank(records: &mut [u32], ranks: &[u32]) {
     for &record in records.iter() {
         ends[rank_of(record)] += 1;
     }
-    let mut total = 0;
-    for (start, end) in next.iter_mut().zip(ends.iter_mut()) {
-        *start = total;
-        total += *end;
-        *end = total;
+    for rank in 1..SLOTS {
+        ends[rank] += ends[rank - 1];
     }
+    next[1..].copy_from_slice(&ends[..SLOTS - 1]);
     for rank in 0..SLOTS {
         while next[rank] < ends[rank] {
             let here = next[rank] as usize;
@@ -364,15 +360,14 @@ fn write_summary(file: File, keys: &[&[u8]], ranks: &[u32], hours: Vec<Hour>, th
     on_threads(threads, || {
         let mut text = Vec::new();
         for (hour, (mut slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
-            slots.truncate(next.into_inner());
-            let mut records: Vec<u32> = slots.into_iter().map(AtomicU32::into_inner).collect();
-            group_by_rank(&mut records, ranks);
+            let records = AtomicU32::get_mut_slice(&mut slots[..next.into_inner()]);
+            group_by_rank(records, ranks);
             let zeros = records.partition_point(|&record| record == 0);
             let mut big = big.into_inner().unwrap();
             big.sort_unstable_by_key(|entry| (ranks[(entry >> 32) as usize], *entry));
             text.clear();
             format_hour(hour, &mut records[zeros..], &big, keys, &mut text);
-            drop(records);
+            drop(slots);
             while written.load(Acquire) != hour {
                 thread::yield_now();
             }

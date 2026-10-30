@@ -31,7 +31,8 @@ const BIG_LATENCY: u32 = (1 << 19) - 1;
 /// Records a thread reserves at a time from an hour's array, and writes without contention.
 const BLOCK_RECORDS: usize = 256;
 
-/// Readable zero bytes after the log, so that block loads can run past its last line.
+/// Readable zero bytes after the log, so that block loads can run past its last line. So a load that
+/// starts inside the log, or a short fixed distance after it, needs no check of its own.
 const PADDING: usize = 4096;
 
 /// A method's length, as the nibble selected by the low nibble of its 4th byte, which tells the seven
@@ -71,16 +72,20 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
-fn load_u64(log: &[u8], pos: usize) -> u64 {
-    assert!(pos + 8 <= log.len() + PADDING);
-    // SAFETY: the assert keeps the load inside the mapping, and the load needs no alignment.
+///
+/// # Safety
+/// `log` must come from `map_file`, and `pos + 8` must be at most `log.len() + PADDING`.
+unsafe fn load_u64(log: &[u8], pos: usize) -> u64 {
+    // SAFETY: the caller keeps the load inside the mapping, and the load needs no alignment.
     unsafe { log.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
 /// The 64 bytes at `pos`, which may run into the padding.
-fn load_block(log: &[u8], pos: usize) -> [__m256i; 2] {
-    assert!(pos + 64 <= log.len() + PADDING);
-    // SAFETY: the assert keeps both loads inside the mapping, they need no alignment, and the build
+///
+/// # Safety
+/// `log` must come from `map_file`, and `pos + 64` must be at most `log.len() + PADDING`.
+unsafe fn load_block(log: &[u8], pos: usize) -> [__m256i; 2] {
+    // SAFETY: the caller keeps both loads inside the mapping, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
         let at = log.as_ptr().add(pos).cast::<__m256i>();
@@ -99,17 +104,24 @@ fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
 }
 
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
-/// within 64, so two 32-byte loads almost always settle it, with no byte loop to mispredict.
-fn offset_of_space(log: &[u8], pos: usize) -> usize {
+/// within 64, so two 32-byte loads almost always settle it, with no byte loop to mispredict. Panics
+/// if the log has no more spaces. The result may not be inside the log, so the caller checks it.
+///
+/// # Safety
+/// `log` must come from `map_file`, and `pos + 64` must be at most `log.len() + PADDING`.
+unsafe fn offset_of_space(log: &[u8], pos: usize) -> usize {
     // SAFETY: the build targets x86-64-v3, which has AVX2.
     let spaces = unsafe { _mm256_set1_epi8(b' ' as i8) };
     let mut offset = 0;
     loop {
-        let mask = equal_bytes(load_block(log, pos + offset), [spaces; 2]);
+        // SAFETY: the caller vouches for the first block, and the assert below for the later ones,
+        // since `PADDING` is more than a block.
+        let mask = equal_bytes(unsafe { load_block(log, pos + offset) }, [spaces; 2]);
         if mask != 0 {
             return offset + mask.trailing_zeros() as usize;
         }
         offset += 64;
+        assert!(pos + offset < log.len());
     }
 }
 
@@ -143,14 +155,19 @@ fn hash(first: u64, last: u64, len: usize) -> u64 {
 /// that all threads share with no locks: one compare-and-swap publishes a whole slot, and a published
 /// slot never changes. A key is always compared in full, against its first occurrence in the log,
 /// because templated paths share prefixes, suffixes and lengths. Slot 0 stays free: see `Hour`.
-fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
+///
+/// # Safety
+/// `log` must come from `map_file`, `start` must be at least 8, `start <= end`, `end` must be inside
+/// the log, and `table` must have been filled only by this function, with this log.
+unsafe fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
-    let first = load_u64(log, start) << outside;
-    let last = load_u64(log, end - 8) >> outside;
+    // SAFETY, for this load and the next two: all three start inside the log.
+    let first = unsafe { load_u64(log, start) } << outside;
+    let last = unsafe { load_u64(log, end - 8) } >> outside;
     let hash = hash(first, last, len);
     let entry = (hash << 12) & (!0 << 48) | (len as u64) << START_BITS | start as u64;
-    let block = load_block(log, start);
+    let block = unsafe { load_block(log, start) };
     let mut index = (hash >> 52) as usize;
     loop {
         index = (index & (SLOTS - 1)).max(1);
@@ -162,8 +179,9 @@ fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
         let first = found as usize & ((1 << START_BITS) - 1);
         // One compare of a whole block covers nearly all keys, whatever their length, and a call to
         // memcmp would branch on the length.
+        // SAFETY: `first` is at most the `start` of an earlier call, which was inside the log.
         if (found ^ entry) >> START_BITS == 0
-            && (!equal_bytes(load_block(log, first), block)).trailing_zeros() as usize
+            && (!equal_bytes(unsafe { load_block(log, first) }, block)).trailing_zeros() as usize
                 >= len.min(64)
             && (len <= 64 || log[first + 64..first + len] == log[start + 64..end])
         {
@@ -199,8 +217,12 @@ type Hour = (Vec<AtomicU32>, AtomicUsize, Mutex<Vec<u64>>);
 /// Hours since the start of the span, read from four timestamp bytes without parsing a date.
 /// Oct 30, Oct 31, Nov 1 and Nov 2 differ in the last digit of the month and of the day:
 /// (month & 1) + (day & 3) gives 0, 1, 2 and 3.
-fn hour_index(log: &[u8], line: usize) -> usize {
-    let bytes = load_u64(log, line + 6).to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
+///
+/// # Safety
+/// `log` must come from `map_file`, and `line` must be inside the log.
+unsafe fn hour_index(log: &[u8], line: usize) -> usize {
+    // SAFETY: the load ends within 14 bytes of `line`, so inside the padding at the latest.
+    let bytes = unsafe { load_u64(log, line + 6) }.to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
     let day = (bytes[0] & 1) + (bytes[3] & 3);
     let hour = 10 * (bytes[5] & 15) + (bytes[6] & 15);
     24 * usize::from(day) + usize::from(hour) - 18
@@ -209,8 +231,12 @@ fn hour_index(log: &[u8], line: usize) -> usize {
 /// Reads the latency at `pos`, and returns it with the number of digits. Digits have bit 4 set and an
 /// LF doesn't, so one load finds the end of up to 8 digits, and three multiplications parse them,
 /// which leaves only the rarest latencies to the loop.
-fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
-    let word = load_u64(log, pos);
+///
+/// # Safety
+/// `log` must come from `map_file`, and `pos + 8` must be at most `log.len() + PADDING`.
+unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
+    // SAFETY: the caller vouches for this load, and the loop below uses checked indexing.
+    let word = unsafe { load_u64(log, pos) };
     let mut digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
     let aligned = (word << (64 - 8 * digits)) & 0x0F0F_0F0F_0F0F_0F0F;
     let pairs = aligned.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
@@ -226,6 +252,7 @@ fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
 /// Claims segments until the log runs out. Each line is `ts method endpoint status latency`, where
 /// the timestamp is always 27 bytes. A thread keeps its own unfilled block of each hour, as a slice,
 /// and its own big latencies, so the hot path reads and writes no line that other threads write.
+/// `log` is the mapping from `map_file`, whose padding the unchecked loads here rely on.
 fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, size: usize) {
     let mut blocks: [&[AtomicU32]; HOURS] = [&[]; HOURS];
     let mut bigs = [const { Vec::new() }; HOURS];
@@ -239,14 +266,25 @@ fn parse(log: &[u8], table: &[AtomicU64], hours: &[Hour], cursor: &AtomicUsize, 
             line += 1;
         }
         while line < end {
-            let method_len = METHOD_LENS >> (4 * (log[line + 31] & 15)) & 15;
+            // Reads at a fixed distance from `line` need no check, since `line` is inside the log and
+            // the padding is longer than any such distance. A truncated line just reads zeros.
+            // SAFETY: the load ends 39 bytes after `line`, so inside the padding at the latest.
+            let method_len = METHOD_LENS >> (4 * (unsafe { load_u64(log, line + 31) } & 15)) & 15;
             let key_start = line + 29 + method_len as usize;
-            let key_end = key_start + offset_of_space(log, key_start);
-            let id = id_of(table, log, key_start, key_end);
-            let is_error = u32::from(log[key_end + 1] == b'5'); // Statuses are 100 to 599.
+            // SAFETY: the method's length is at most 15, so the first block ends within 108 bytes of
+            // `line`, inside the padding at the latest.
+            let key_end = key_start + unsafe { offset_of_space(log, key_start) };
+            // This index is the one check the unchecked loads below rely on: it panics unless the space
+            // is inside the log. Statuses are 100 to 599.
+            let is_error = u32::from(log[key_end + 1] == b'5');
+            // SAFETY: `key_end` is inside the log, `key_start` is at least 29 and not after it, and
+            // only this call fills `table`.
+            let id = unsafe { id_of(table, log, key_start, key_end) };
             // Three status digits sit between two spaces, so the latency starts 5 bytes on.
-            let (latency, digits) = parse_latency(log, key_end + 5);
-            let index = hour_index(log, line);
+            // SAFETY: the load ends 13 bytes after `key_end`, inside the padding at the latest.
+            let (latency, digits) = unsafe { parse_latency(log, key_end + 5) };
+            // SAFETY: `line` is inside the log.
+            let index = unsafe { hour_index(log, line) };
             if latency >= BIG_LATENCY {
                 bigs[index].push(u64::from(id) << 32 | u64::from(latency));
             }

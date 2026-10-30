@@ -31,7 +31,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 9 | A node's out-count and links on one cache line, and prefetching into L2 | Each edge of the count pass touched three lines, and on a shared core the L1 prefetch queue is small | run-6c4a3ec99255 | 0.230 | 80.4 | 65.7 |
 | 10 | The reverse graph derived from the forward one, by sweeping it | After renumbering, neighbours are close, so a sweep has few misses, where the file's order made every edge a random touch of six lines | run-3cffbc842db0 | 0.208 | 79.4 | 66.7 |
 | 11 | A radix queue instead of binary heaps | Keys never go below the last one popped, so a key moves a few times in all, with no comparisons against other keys | run-20366d30099c | 0.184 | 82.1 | 67.8 |
-| 12 | Nodes numbered in clusters the size of a label page, breadth first inside each | Two links per node instead of three cost 20%, so the numbering's quality matters far more than we'd assumed | RUN12 | T12 | M12 | P12 |
+| 12 | Nodes numbered in clusters the size of a label page, breadth first inside each | Two links per node instead of three cost 20%, so the numbering's quality matters far more than we'd assumed | run-03f74b0ab497 | 0.180 | 78.2 | 68.2 |
 
 ## Decision log
 

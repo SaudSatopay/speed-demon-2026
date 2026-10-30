@@ -1,6 +1,6 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board, and ours takes **0.032 s / 20.9 MB** (run `run-43987ef4ad03`). That's K = **39.30** and **79.7** speed points.
+**Result:** the reference takes **32.05 s / 228 MB** on the board, and ours takes **0.030 s / 20.2 MB** (run `run-0cde8ba06e51`). That's K = **40.90** and **80.6** speed points.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
@@ -29,7 +29,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 7 | Group each hour by counting, in place, and select percentiles | A full sort was about half the output stage, for three order statistics per group | run-c17dc23201a0 | 0.033 | 20.3 | 77.9 |
 | 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-5289b7130599 | 0.033 | 20.0 | 78.5 |
 | 9 | Same design in 307 lines: one word per table slot, published by one compare-and-swap, and no separate rank pass | Rivals were at our T with 210 lines, and 2x S is worth 2.26 points. Cutting needed no speed | run-43987ef4ad03 | 0.032 | 20.9 | 79.7 |
-| 10 | Keys compared by one block compare, not memcmp | A call to memcmp branches on the length, which varies from line to line | RUN10 | T10 | M10 | P10 |
+| 10 | Keys compared by one block compare, not memcmp | A call to memcmp branches on the length, which varies from line to line | run-aaaf2f99c450 | 0.031 | 20.7 | 80.2 |
 
 ## Decision log
 

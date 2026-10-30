@@ -242,6 +242,7 @@ impl Graph {
     fn reserve(&self, node: u32) -> usize {
         self.offsets[node as usize].fetch_sub(1, Relaxed) as usize - 1
     }
+
     fn store(&self, slot: usize, neighbour: u32, weight: u32) {
         let heavy = (1 << self.weight_bits) - 1;
         if weight >= heavy {
@@ -433,10 +434,12 @@ impl<D: Distance> Side<D> {
         }
         Some(self.last)
     }
+
     fn label(&self, node: u32) -> D {
         let page = self.directory[node as usize / PAGE] as usize;
         self.pages[page * PAGE + node as usize % PAGE]
     }
+
     fn set_label(&mut self, node: u32, dist: D) {
         let entry = node as usize / PAGE;
         if self.directory[entry] == 0 {
@@ -486,15 +489,16 @@ impl<D: Distance> Side<D> {
                 let candidate = dist + weight;
                 let narrow = fit(candidate)?;
                 if narrow < sides[side].label(neighbour) {
-                    sides[side].set_label(neighbour, narrow);
                     let other: u64 = sides[1 - side].label(neighbour).into();
                     if other != unreached {
                         best = best.min(candidate + other);
                     }
-                    // If the other side has settled this node, `best` just counted the path through
-                    // it. If not, the rest of the way costs at least the other queue's top. So a
-                    // node at or past `best` by that bound needn't be expanded.
+                    // If the other side has labelled this node, `best` just counted the path through
+                    // it. If not, the rest of the way costs at least the other queue's top. So a node
+                    // at or past `best` by that bound needs no expanding, and no label either, since
+                    // no path the other side finds through it later could beat `best`.
                     if candidate + other_top < best {
+                        sides[side].set_label(neighbour, narrow);
                         sides[side].push(narrow, neighbour);
                     }
                 }

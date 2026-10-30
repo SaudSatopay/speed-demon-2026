@@ -387,6 +387,7 @@ fn parse_records(
     }
     add_records(&batch[..count], regions, names, rows);
 }
+
 fn add_records(batch: &[Pending], regions: &Regions, names: &NameTable, rows: &mut [Row]) {
     for &(id, cents, region, name, note_bytes, key_words, hash) in batch {
         let country = usize::from(regions.country_of[region]);

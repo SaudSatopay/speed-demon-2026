@@ -111,8 +111,9 @@ fn next_number(text: &[u8], pos: &mut usize) -> u64 {
 
 /// The position just past the first LF, where the first data line starts.
 fn after_header(text: &[u8]) -> usize {
-    let lf = text.iter().position(|&byte| byte == b'\n');
-    lf.map_or(text.len(), |lf| lf + 1)
+    text.iter()
+        .position(|&c| c == b'\n')
+        .map_or(text.len(), |lf| lf + 1)
 }
 
 /// The first record boundary at or after `pos`: just past the next CRLF, or the end of the file.
@@ -120,8 +121,10 @@ fn after_header(text: &[u8]) -> usize {
 /// quotes. About half the records end in CRLF, so it's never far. A file without one simply doesn't
 /// get split.
 fn next_boundary(file: &[u8], pos: usize) -> usize {
-    let cr = file[pos..].iter().position(|&byte| byte == b'\r');
-    cr.map_or(file.len(), |cr| pos + cr + 2)
+    file[pos..]
+        .iter()
+        .position(|&c| c == b'\r')
+        .map_or(file.len(), |cr| pos + cr + 2)
 }
 
 /// The join table: country indices by region id, and the codes in byte order. Indices follow that
@@ -351,9 +354,7 @@ fn parse_records(
     let mut count = 0;
     while pos < end {
         // A byte order mark can only start a record here, and no record otherwise starts with it.
-        if file[pos] == 0xEF {
-            pos += 3;
-        }
+        pos += 3 * usize::from(file[pos] == 0xEF);
         let id = next_number(file, &mut pos) as i64;
         let name = text_field(file, &mut pos);
         let note = text_field(file, &mut pos);

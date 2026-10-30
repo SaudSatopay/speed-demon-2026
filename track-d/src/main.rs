@@ -11,6 +11,7 @@
 use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::ops::Not;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
@@ -167,11 +168,9 @@ fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<
                 number = next_number.fetch_add(NUMBER_BLOCK, Relaxed);
                 numbers_end = number + NUMBER_BLOCK;
             }
-            let free = numbers[node].load(Relaxed) == 0;
-            let won = free
-                && numbers[node]
-                    .compare_exchange(0, number, Relaxed, Relaxed)
-                    .is_ok();
+            let slot = &numbers[node];
+            let won = slot.load(Relaxed) == 0
+                && slot.compare_exchange(0, number, Relaxed, Relaxed).is_ok();
             number += u32::from(won);
             won
         };
@@ -204,8 +203,7 @@ fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<
             }
         }
     });
-    let entries = next_number.into_inner() as usize + 1;
-    (numbers, entries)
+    (numbers, next_number.into_inner() as usize + 1)
 }
 
 /// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
@@ -362,20 +360,6 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
     ([forward, backward], numbers)
 }
 
-/// A distance type for the search. Nearly every distance fits in 32 bits, which halves the labels and
-/// the queues. The few that don't make the 32-bit search give up, and that query runs again in 64 bits.
-trait Distance: Copy + Ord + TryFrom<u64> + Into<u64> {
-    const UNREACHED: Self;
-}
-
-impl Distance for u32 {
-    const UNREACHED: u32 = u32::MAX;
-}
-
-impl Distance for u64 {
-    const UNREACHED: u64 = INF;
-}
-
 /// Nodes per page of the label store, and the entries a side's lists keep between queries.
 const PAGE: usize = 64;
 const KEPT_ENTRIES: usize = 1 << 15;
@@ -384,7 +368,7 @@ const KEPT_ENTRIES: usize = 1 << 15;
 /// nodes, found through a directory indexed by node, which persists across queries and is reset through
 /// the list of entries a query used. Neighbours have nearby numbers, so a search fills few pages, and
 /// finding a label costs one directory read and one page read, with no key to compare. Page 0 is all
-/// `UNREACHED`, and every empty directory entry points at it, so reading a label needs no branch. A
+/// unreached, and every empty directory entry points at it, so reading a label needs no branch. A
 /// zeroed directory stays untouched until it's used, which the 64-bit search rarely is.
 ///
 /// The queue relies on keys never going below the last one popped, as in Dijkstra. Bucket `i` holds the
@@ -399,14 +383,17 @@ struct Side<D> {
     last: D,
 }
 
-impl<D: Distance> Side<D> {
+/// A side works in 32 bits or 64. Nearly every distance fits in 32 bits, which halves the labels and the
+/// queues. The few that don't make the 32-bit search give up, and that query runs again in 64 bits.
+/// In either, the highest value means a node isn't reached yet, and `!D::default()` gives it.
+impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<D> {
     fn new(entries: usize) -> Side<D> {
         Side {
             directory: vec![0; entries / PAGE + 1],
-            pages: vec![D::UNREACHED; PAGE],
+            pages: vec![!D::default(); PAGE],
             used: Vec::new(),
             buckets: vec![Vec::new(); 65],
-            last: D::UNREACHED,
+            last: !D::default(),
         }
     }
 
@@ -454,7 +441,7 @@ impl<D: Distance> Side<D> {
         let entry = node as usize / PAGE;
         if self.directory[entry] == 0 {
             self.directory[entry] = (self.pages.len() / PAGE) as u32;
-            self.pages.resize(self.pages.len() + PAGE, D::UNREACHED);
+            self.pages.resize(self.pages.len() + PAGE, !D::default());
             self.used.push(entry as u32);
         }
         self.pages[self.directory[entry] as usize * PAGE + node as usize % PAGE] = dist;
@@ -471,8 +458,8 @@ impl<D: Distance> Side<D> {
         if from == to {
             return Some(0);
         }
-        let fit = |wide: u64| D::try_from(wide).ok().filter(|&dist| dist != D::UNREACHED);
-        let unreached: u64 = D::UNREACHED.into();
+        let fit = |wide: u64| D::try_from(wide).ok().filter(|&dist| dist != !D::default());
+        let unreached: u64 = (!D::default()).into();
         for (side, node) in sides.iter_mut().zip([from, to]) {
             side.clear(fit(0)?);
             side.set_label(node, fit(0)?);

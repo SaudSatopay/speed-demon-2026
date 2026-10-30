@@ -290,10 +290,10 @@ impl Graph {
     }
 }
 
-/// Builds the forward graph and its reverse from the graph file, in new node numbers, and returns
-/// those numbers too. `offsets` has a final entry that counts no node, so it ends up as the arc
-/// total, which no `reserve` moves.
-fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32>) {
+/// Builds the forward graph from the graph file, in new node numbers, and returns those numbers too.
+/// `offsets` has a final entry that counts no node, so it ends up as the arc total, which no `reserve`
+/// moves.
+fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Vec<AtomicU32>) {
     let mut pos = 0;
     let nodes = next_number(graph_file, &mut pos) as usize;
     next_number(graph_file, &mut pos); // The edge count: the file's length says the same.
@@ -345,10 +345,13 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
         }
     });
     forward.seal();
+    (forward, numbers)
+}
 
-    // The reverse graph comes from the forward one, with no parsing and no number lookups. Neighbours
-    // have nearby numbers by now, so these sweeps stay in memory that's nearly in cache.
-    let in_counts = zeroed_u32s(entries);
+/// The reverse graph comes from the forward one, with no parsing and no number lookups. Neighbours
+/// have nearby numbers by now, so these sweeps stay in memory that's nearly in cache.
+fn reverse(forward: &Graph, threads: usize) -> Graph {
+    let in_counts = zeroed_u32s(forward.offsets.len());
     forward.for_each_arc(threads, |_, head, _| {
         in_counts[head as usize].fetch_add(1, Relaxed);
     });
@@ -357,7 +360,7 @@ fn build_graphs(graph_file: &[u8], threads: usize) -> ([Graph; 2], Vec<AtomicU32
         backward.store(backward.reserve(head), tail, weight);
     });
     backward.seal();
-    ([forward, backward], numbers)
+    backward
 }
 
 /// Nodes per page of the label store, and the entries a side's lists keep between queries.
@@ -514,8 +517,8 @@ fn main() -> io::Result<()> {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let data_dir = Path::new(&data_dir);
     let threads = thread_count();
-    let (graphs, numbers) = build_graphs(map_file(&data_dir.join("graph.txt"))?, threads);
-    let entries = graphs[0].offsets.len();
+    let (forward, numbers) = build_graph(map_file(&data_dir.join("graph.txt"))?, threads);
+    let entries = forward.offsets.len();
 
     let query_lines = map_file(&data_dir.join("queries.txt"))?;
     let number = |id: u64| numbers[id as usize].load(Relaxed);
@@ -527,6 +530,8 @@ fn main() -> io::Result<()> {
         queries.push((source, target, AtomicU64::new(0)));
     }
     drop(numbers);
+    let backward = reverse(&forward, threads);
+    let graphs = [forward, backward];
 
     let next_query = AtomicUsize::new(0);
     on_threads(threads, || {

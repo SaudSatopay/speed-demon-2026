@@ -13,13 +13,13 @@ Boolean and phrase queries over a 254 MB corpus. Rust, standard library only.
 
 ## Limits
 
-- M is about 100 MB locally, more than twice the 44 MB where more savings stop counting. Chain blocks take 40 MB of that.
+- M is about 71 MB locally, above the 44 MB where more savings stop counting. Chain blocks take 40 MB of that.
 - Threads get equal byte ranges rather than claiming work, so one slow thread slows the whole scan.
 - A wrong guess from the 1% sample can cost memory or extra phrase checks, never a wrong answer.
 
 ## Approach
 
-The queries are read first, so only their 75,000 or so terms are indexed. A sample of about 1% of the corpus decides which terms are common enough for a bitmap, and which term of each phrase is rarest. Threads then scan the corpus once, each over its own contiguous range, in 32-byte blocks. Every token is looked up in one cache access and buffered for its document. Common terms set bits directly, and other terms append 2-byte offsets to a chain of small blocks, with no second copy and no merge, because each thread's range follows document order. When a document ends, each occurrence of a phrase's rarest term checks the phrase around it. BOOL queries run strictly left to right, on a sorted list that becomes a bitmap only when a union with a bitmap makes it large.
+The queries are read first, so only their 75,000 or so terms are indexed. A sample of about 1% of the corpus decides which terms are common enough for a bitmap, and which term of each phrase is rarest. Threads then scan the corpus once, each over its own contiguous range, in 32-byte blocks. Every token is looked up in one cache access and buffered for its document. Common terms set bits directly, and other terms append 2-byte offsets to a chain of small blocks, with no second copy and no merge, because each thread's range follows document order. When a document ends, each occurrence of a phrase's rarest term checks the phrase around it. BOOL queries keep the spec's left-to-right meaning, but reorder each run of ANDs and NOTs, rarest first, which is safe because they all intersect. The result is a sorted list, which becomes a bitmap only when a union with a bitmap makes it large.
 
 ## Why it's fast
 

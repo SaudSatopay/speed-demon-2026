@@ -211,9 +211,10 @@ struct TermTable<'a> {
 }
 
 impl<'a> TermTable<'a> {
-    fn new() -> Self {
+    /// Sized for `query_bytes` of query text, where 16 bytes hold about one distinct term.
+    fn new(query_bytes: usize) -> Self {
         TermTable {
-            slots: vec![TermSlot::default(); 1 << 12],
+            slots: vec![TermSlot::default(); (query_bytes / 16).next_power_of_two().max(1 << 12)],
             keys: Vec::new(),
         }
     }
@@ -306,7 +307,7 @@ impl Queries<'_> {
 }
 
 fn parse_queries(text: &[u8]) -> Queries<'_> {
-    let mut terms = TermTable::new();
+    let mut terms = TermTable::new(text.len());
     let (mut list, mut steps) = (Vec::new(), Vec::new());
     let mut pos = 0;
     while pos < text.len() {
@@ -396,6 +397,7 @@ fn for_each_token(docs: &[u8], start: usize, lf: usize, mut visit: impl FnMut(us
 /// What the sample decided: how each term is stored, and which phrases to check at each term.
 struct Plan {
     store_of: Vec<u32>,
+    sample_df: Vec<u32>,
     bitmap_count: usize,
     list_count: usize,
     anchor_start: Vec<u32>, // A term's phrases are `anchored[anchor_start[t]..anchor_start[t + 1]]`.
@@ -467,6 +469,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
     }
     Plan {
         store_of,
+        sample_df,
         bitmap_count: bitmap_count as usize,
         list_count: list_count as usize,
         anchor_start,
@@ -611,6 +614,7 @@ fn scan_range(
 /// Everything the queries read.
 struct Index<'a> {
     store_of: &'a [u32],
+    sample_df: &'a [u32],
     bitmaps: Vec<u64>,
     words: usize,
     scans: &'a [ScanResult],
@@ -666,6 +670,7 @@ fn has_bit(bits: &[u64], doc: u32) -> bool {
 /// One thread's running result R for a BOOL query, as a sorted list while it's small and a bitmap
 /// once a union with a bitmap makes it large.
 struct Evaluator {
+    order: Vec<Step>,
     list: Vec<u32>,
     term_list: Vec<u32>,
     merged: Vec<u32>,
@@ -740,11 +745,35 @@ impl Evaluator {
         }
     }
 
-    /// Applies a BOOL query's steps strictly left to right, from the empty set.
+    /// Applies a BOOL query's steps in order, from the empty set. Strictly left to right is the
+    /// spec's rule, but AND and NOT both intersect, so a run of them between two ORs can go in any
+    /// order. The rarest ANDs go first, to shrink the result early, and the first term counts as an
+    /// AND too. That usually keeps R a short list and avoids copying a bitmap.
     fn run(&mut self, steps: &[Step], index: &Index) {
+        self.order.clear();
+        self.order.extend_from_slice(steps);
+        let df = |step: &Step| index.sample_df[step.term as usize];
+        let mut first_run = true;
+        for run in self.order.chunk_by_mut(|_, next| next.op != b'O') {
+            let (head, rest) = run.split_at_mut(1);
+            rest.sort_unstable_by_key(|step| (step.op == b'N', df(step)));
+            // Only the query's first OR starts from the empty set, so only it can trade places.
+            if first_run
+                && rest
+                    .first()
+                    .is_some_and(|s| s.op == b'A' && df(s) < df(&head[0]))
+            {
+                std::mem::swap(&mut head[0].term, &mut rest[0].term);
+            }
+            first_run = false;
+        }
         self.list.clear();
         self.is_bits = false;
-        for step in steps {
+        for i in 0..self.order.len() {
+            let step = self.order[i];
+            if step.op != b'O' && !self.is_bits && self.list.is_empty() {
+                continue; // An empty R stays empty until the next OR.
+            }
             let store = index.store_of[step.term as usize];
             if store & BITMAP != 0 {
                 let from = (store & !BITMAP) as usize * index.words;
@@ -831,6 +860,7 @@ fn answer_queries(path: &Path, queries: &Queries, index: &Index, threads: usize)
         for _ in 0..threads {
             scope.spawn(|| {
                 let mut evaluator = Evaluator {
+                    order: Vec::new(),
                     list: Vec::new(),
                     term_list: Vec::new(),
                     merged: Vec::new(),
@@ -914,6 +944,7 @@ fn main() -> io::Result<()> {
     let (hit_start, hits) = collect_hits(&results, queries.list.len());
     let index = Index {
         store_of: &plan.store_of,
+        sample_df: &plan.sample_df,
         bitmaps: bitmaps.into_iter().map(AtomicU64::into_inner).collect(),
         words,
         scans: &results,

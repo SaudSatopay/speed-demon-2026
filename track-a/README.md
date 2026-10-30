@@ -16,11 +16,11 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 - It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
 - Latencies of 2^19 or more take a slower path through a side list, about 3% of requests.
 - It relies on the spec's promise of 1,842 endpoints per seed. Past 3,584 it aborts rather than risk a wrong answer.
-- S is 492 code lines, far above the reference's 56, because each of these gains needed code.
+- S is far above the reference's 56 code lines, because each of these gains needed code.
 
 ## Approach
 
-The log is memory-mapped, followed by readable padding so that block loads can run past its end, and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Two 32-byte loads find the end of the endpoint, and one 8-byte load usually parses the latency. One lock-free table, shared by all threads, turns endpoints into ids, always comparing the full key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves blocks of 256. When the log is done, threads claim hours. Each one rewrites an hour's endpoint ids to byte-order ranks, sorts the array in place as plain integers, formats it, frees it, takes the next stretch of the output file in hour order, and copies the text there through a shared mapping.
+The log is memory-mapped, followed by readable padding so that block loads can run past its end, and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Two 32-byte loads find the end of the endpoint, and one 8-byte load usually parses the latency. One lock-free table, shared by all threads, turns endpoints into ids, always comparing the full key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves blocks of 256. When the log is done, threads claim hours. Each one rewrites an hour's endpoint ids to byte-order ranks, groups the array by endpoint in place, selects each group's percentiles, formats it, frees it, and appends the text to the file in turn.
 
 ## Why it's fast
 
@@ -31,7 +31,7 @@ See [PERF.md](PERF.md) for run IDs.
 3. **The log isn't read into memory.** Mapped dataset pages don't count toward the memory peak.
 4. **No byte loops on the hot path.** Finding the endpoint's end, hashing it and parsing the latency are all block operations, so a line costs few branch mispredictions.
 5. **One sortable 32-bit integer per request.** With the endpoint's byte-order rank in the top bits and the latency below it, sorting an hour's records as integers gives every group and every percentile at once.
-6. **Threads write the output at the same time.** A `write` to the file would queue them on its lock, so they copy into a shared mapping instead, each into its own stretch.
+6. **Selection instead of sorting.** Only three order statistics per group are needed, so a counting pass groups each hour in place, and `select_nth_unstable` does the rest.
 7. **Output and records don't add up.** The output on tmpfs counts toward memory, so each hour's records are freed as its text is written.
 
 ## Ideas and where they came from

@@ -5,9 +5,9 @@
 //! allows it, and with block loads where it doesn't. One lock-free table, shared by all threads,
 //! turns endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
 //! where each thread reserves small blocks. When the log is done, threads claim hours: each groups one
-//! hour's array in place, selects its percentiles, formats it, frees it, takes the next stretch of the output file in hour
-//! order, and copies its text there. So the output is in a fixed order whatever the scheduling, never
-//! sits in memory whole, and is written by all threads at once.
+//! hour's array in place, selects its percentiles, formats it, frees it, and waits for its turn to
+//! append to the file. So the output is in a fixed order whatever the scheduling, and never sits in
+//! memory whole.
 
 use std::arch::x86_64::{
     __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
@@ -15,7 +15,7 @@ use std::arch::x86_64::{
 use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::hint;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
@@ -467,73 +467,9 @@ fn format_hour(
     }
 }
 
-/// The output file, mapped so that threads can copy their text into it at the same time. Writing
-/// with `write` would queue them on the file's lock. It starts long enough for any output, which
-/// costs nothing until written, and is cut to its true length at the end.
-struct OutputFile {
-    file: File,
-    base: *mut u8,
-    /// `(hours done << 40) | bytes so far`, so a thread claims its stretch of the file in hour order.
-    progress: AtomicU64,
-}
-
-// SAFETY: threads write through `base` only into stretches that `claim` hands out, which never overlap.
-unsafe impl Sync for OutputFile {}
-
-impl OutputFile {
-    fn create(path: &Path, longest: usize) -> io::Result<Self> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        let (read_write, shared) = (3, 1);
-        file.set_len(longest as u64)?;
-        // An empty log gets an empty file, and mmap rejects an empty range.
-        let base = if longest == 0 {
-            null_mut()
-        } else {
-            map(null_mut(), longest, read_write, shared, file.as_raw_fd())?
-        };
-        let progress = AtomicU64::new(0);
-        Ok(OutputFile {
-            file,
-            base,
-            progress,
-        })
-    }
-
-    /// Waits for the hours before this one to take their stretches, which is short because each only
-    /// has to add a length, then copies this hour's text to its own stretch.
-    fn write_hour(&self, hour: usize, text: &[u8]) {
-        let bytes_so_far = loop {
-            let progress = self.progress.load(Acquire);
-            if (progress >> 40) as usize == hour {
-                break progress & ((1 << 40) - 1);
-            }
-            thread::yield_now();
-        };
-        let next = ((hour as u64 + 1) << 40) | (bytes_so_far + text.len() as u64);
-        self.progress.store(next, Release);
-        if !text.is_empty() {
-            // SAFETY: this stretch is this thread's alone, and `create` made the mapping long enough
-            // for any output.
-            unsafe {
-                let to = self.base.add(bytes_so_far as usize);
-                std::ptr::copy_nonoverlapping(text.as_ptr(), to, text.len());
-            }
-        }
-    }
-
-    fn finish(self) -> io::Result<()> {
-        self.file
-            .set_len(self.progress.load(Acquire) & ((1 << 40) - 1))
-    }
-}
-
-/// Threads claim hours in order. Each hour's array is freed once formatted, so the output on tmpfs
-/// grows as the records shrink, and the two don't add up in the memory peak.
+/// Threads claim hours in order, and each waits for the hour before it to reach the file. The wait
+/// is short, because hours cost about the same. Each hour's array is freed once formatted, so the
+/// output on tmpfs grows as the records shrink, and the two don't add up in the memory peak.
 fn write_summary(
     path: &Path,
     table: &EndpointTable,
@@ -542,18 +478,12 @@ fn write_summary(
     threads: usize,
 ) -> io::Result<()> {
     let (endpoints, rank) = table.sorted_keys();
-    let longest_key = endpoints.iter().map(|key| key.len()).max().unwrap_or(0);
-    let lines: usize = hours
-        .iter()
-        .map(|hour| hour.next.load(Relaxed).min(endpoints.len()))
-        .sum();
-    // The stamp, the key, and six numbers of at most 10 digits, each with its space.
-    let output = OutputFile::create(path, lines * (21 + longest_key + 6 * 11 + 1))?;
     let hours: Vec<Mutex<Option<HourRecords>>> = hours
         .into_iter()
         .map(|hour| Mutex::new(Some(hour)))
         .collect();
-    let next_hour = AtomicUsize::new(0);
+    let file = File::create(path)?;
+    let (next_hour, written) = (AtomicUsize::new(0), AtomicUsize::new(0));
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
@@ -599,12 +529,18 @@ fn write_summary(
                         &mut text,
                     );
                     drop(records);
-                    output.write_hour(hour, &text);
+                    while written.load(Acquire) != hour {
+                        thread::yield_now();
+                    }
+                    // `panic = "abort"`: a failed write ends the process rather than leaving the
+                    // other threads waiting for their turn.
+                    (&file).write_all(&text).expect("writing the summary");
+                    written.store(hour + 1, Release);
                 }
             });
         }
     });
-    output.finish()
+    Ok(())
 }
 
 fn main() -> io::Result<()> {

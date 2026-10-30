@@ -29,6 +29,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 7 | Group each hour by counting, in place, and select percentiles | A full sort was about half the output stage, for three order statistics per group | run-c17dc23201a0 | 0.033 | 20.3 | 77.9 |
 | 8 | Back to ordered appends for the output | The mapped output never gained anything on the board, and cost about 35 lines | run-5289b7130599 | 0.033 | 20.0 | 78.5 |
 | 9 | Same design in 307 lines: one word per table slot, published by one compare-and-swap, and no separate rank pass | Rivals were at our T with 210 lines, and 2x S is worth 2.26 points. Cutting needed no speed | run-43987ef4ad03 | 0.032 | 20.9 | 79.7 |
+| 10 | Keys compared by one block compare, not memcmp | A call to memcmp branches on the length, which varies from line to line | RUN10 | T10 | M10 | P10 |
 
 ## Decision log
 
@@ -47,6 +48,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D7. Remove the inline keys.** Context: with only 1,842 endpoints, the key texts in the log fit in the caches anyway, so a 64-byte slot per endpoint might not earn its 20 lines. Chose: a 16-byte slot, and a compare against the key's first occurrence in the log. It came out both simpler and faster, because the table now fits the L1 cache. Evidence: T 0.021 -> 0.018 s, S 519 -> 492, K 31.44 -> 34.06 (local). Outcome: kept.
 
 **D8. Cut the code, not the design.** Context: ttimesai took first place with our T and 210 lines to our 468, so code size was what cost us. Options: drop the fast paths, or find what the fast paths don't need. Chose: the second. A table slot became one word (16 bits of hash, the length, the key's first position), so one compare-and-swap publishes it, with no busy state to spin on, and the table halved to 32 KB. Grouping looks up each record's rank itself, so the rank pass went. The method table became a 40-bit constant. Safe code replaced the cast from atomics, and arrays of counts moved onto the stack. Evidence: S 468 -> 307, with local T unchanged at 19.2 ms, and all checks passing. The first version moved big latencies into a list per hour behind a lock, next to the block counter and the array pointer that every record read. Locally it looked free, and on the board T rose from 0.033 to 0.037 s (run-d7cbabc9f01a). So each thread now keeps its own big latencies, and its unfilled blocks as slices, and the hot path reads no line another thread writes.
+
+**D9. Compare keys without memcmp.** Context: on Track D, cutting mispredicts paid more than the instruction count suggested. Every line here compares its endpoint against the endpoint's first occurrence. Chose: load 64 bytes from both, and check the run of equal bytes covers the key, which has no branch on the length for the 94% of keys that fit. Evidence: at sample scale, instructions 492.7 -> 460.4 per record and mispredicts 3.26 -> 2.63 per record, on `counts.sh`. Sorting each group instead of selecting three percentiles was 4 lines shorter, but cost +5.2% instructions and +9% mispredicts at full scale, so we kept selecting.
 
 ## What didn't work
 

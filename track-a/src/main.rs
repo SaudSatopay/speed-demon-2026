@@ -83,22 +83,35 @@ fn load_u64(log: &[u8], pos: usize) -> u64 {
     unsafe { log.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
+/// The 64 bytes at `pos`, which may run into the padding.
+fn load_block(log: &[u8], pos: usize) -> [__m256i; 2] {
+    assert!(pos + 64 <= log.len() + PADDING);
+    // SAFETY: the assert keeps both loads inside the mapping, they need no alignment, and the build
+    // targets x86-64-v3, which has AVX2.
+    unsafe {
+        let at = log.as_ptr().add(pos).cast::<__m256i>();
+        [_mm256_loadu_si256(at), _mm256_loadu_si256(at.add(1))]
+    }
+}
+
+/// One bit per byte of two blocks, set where they're equal.
+fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
+    // SAFETY: the build targets x86-64-v3, which has AVX2.
+    let (low, high) = unsafe {
+        let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[0], b[0]));
+        (low, _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[1], b[1])))
+    };
+    u64::from(low as u32) | u64::from(high as u32) << 32
+}
+
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
 /// within 64, so two 32-byte loads almost always settle it, with no byte loop to mispredict.
 fn offset_of_space(log: &[u8], pos: usize) -> usize {
+    // SAFETY: the build targets x86-64-v3, which has AVX2.
+    let spaces = unsafe { _mm256_set1_epi8(b' ' as i8) };
     let mut offset = 0;
     loop {
-        assert!(pos + offset + 64 <= log.len() + PADDING);
-        // SAFETY: the assert keeps both loads inside the mapping, they need no alignment, and the
-        // build targets x86-64-v3, which has AVX2.
-        let mask = unsafe {
-            let spaces = _mm256_set1_epi8(b' ' as i8);
-            let at = log.as_ptr().add(pos + offset).cast::<__m256i>();
-            let low = _mm256_cmpeq_epi8(_mm256_loadu_si256(at), spaces);
-            let high = _mm256_cmpeq_epi8(_mm256_loadu_si256(at.add(1)), spaces);
-            let (low, high) = (_mm256_movemask_epi8(low), _mm256_movemask_epi8(high));
-            u64::from(low as u32) | u64::from(high as u32) << 32
-        };
+        let mask = equal_bytes(load_block(log, pos + offset), [spaces; 2]);
         if mask != 0 {
             return offset + mask.trailing_zeros() as usize;
         }
@@ -149,6 +162,7 @@ fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
         len,
     );
     let entry = hash & !0 << 48 | (len as u64) << START_BITS | start as u64;
+    let block = load_block(log, start);
     let mut index = hash as usize;
     loop {
         index = (index & (SLOTS - 1)).max(1);
@@ -158,7 +172,13 @@ fn id_of(table: &[AtomicU64], log: &[u8], start: usize, end: usize) -> u32 {
         }
         let found = slot.load(Relaxed);
         let first = found as usize & ((1 << START_BITS) - 1);
-        if (found ^ entry) >> START_BITS == 0 && log[first..first + len] == log[start..end] {
+        // One compare of a whole block covers nearly all keys, whatever their length, and a call to
+        // memcmp would branch on the length.
+        if (found ^ entry) >> START_BITS == 0
+            && (!equal_bytes(load_block(log, first), block)).trailing_zeros() as usize
+                >= len.min(64)
+            && (len <= 64 || log[first + 64..first + len] == log[start + 64..end])
+        {
             return index as u32;
         }
         index += 1;

@@ -13,12 +13,13 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 
 ## Limits
 
-- It's single-threaded for now, and the parser reads one byte at a time.
-- It relies on the spec's guarantee that a mid-file BOM only ever starts a record.
+- The parser reads one byte at a time.
+- It relies on two spec guarantees: a mid-file BOM only ever starts a record, and a CR only ever starts a CRLF. A file with no CRLF would still be right, but wouldn't get split across threads.
+- The name table is 8.4 MB, which keeps M above the 7.3 MB where more savings stop counting.
 
 ## Approach
 
-The region table becomes an array from region id to country index, with indices in byte order, so printing by index sorts the output. The mapped CSV is walked once by a scalar parser written straight from section 2.1 of the spec. It never unescapes anything: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length is the raw length minus the number of pairs. Names are interned into dense ids, always comparing the full key, and each country keeps a bitset of the ids it has seen.
+The region table becomes an array from region id to country index, with indices in byte order, so printing by index sorts the output. Threads claim segments of the mapped CSV from an atomic cursor, and cut them just after a CRLF, which is always a record boundary because the spec promises a CR appears nowhere else. A scalar parser written straight from section 2.1 of the spec walks each segment. It never unescapes anything: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length is the raw length minus the number of pairs. Each thread sums into its own rows. One lock-free table, shared by all threads, counts distinct names: each slot is one cache line, holding the name's first 24 bytes and one bit per country.
 
 ## Why it's fast
 
@@ -27,10 +28,12 @@ See [PERF.md](PERF.md) for run IDs.
 1. **No strings.** A field is a slice of the mapping, and nothing is decoded or copied.
 2. **Exact cents from the digits alone.** The fraction is always two digits, so an amount is read as one integer, ignoring the point.
 3. **The file isn't read into memory.** Mapped dataset pages don't count toward the memory peak.
+4. **One cache line per name lookup.** On seed 1, 99.99% of names fit inline in the table, so comparing the key needs no second memory access, and the country bits are in the same line.
 
 ## Ideas and where they came from
 
 - Comparing raw bytes instead of unescaping: our own reading of section 2.1.
+- Cutting on CRLF instead of counting quotes: our own reading of section 2.2. Ge et al. (SIGMOD 2019) describe the two-pass quote-counting method it replaces.
 - A full-key compare on every hash hit: the 1BRC contest rejected entries that trusted hashes (Morling, 2024).
 
 ## Correctness

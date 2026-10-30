@@ -1,14 +1,24 @@
 //! Track C (Join): aggregates per country, from a hostile CSV joined against a region table.
 //!
-//! A scalar parser, written straight from section 2.1 of the spec, walks the mapped file once. It
-//! never unescapes anything: a quoted field's raw bytes, with its `""` pairs intact, encode its
-//! value one to one, and the value's length is the raw length minus the number of pairs.
+//! Threads claim segments of the mapped file from an atomic cursor. Segments are cut just after a
+//! CRLF, because the spec promises that a CR appears nowhere else, so that is always a record
+//! boundary, and no quote counting is needed. A scalar parser, written straight from section 2.1 of
+//! the spec, walks each segment. It never unescapes anything: a quoted field's raw bytes, with its
+//! `""` pairs intact, encode its value one to one, and the value's length is the raw length minus
+//! the number of pairs. Each thread sums into its own rows, and one shared table counts the
+//! distinct names per country.
 
 use std::ffi::{c_int, c_void};
 use std::fs::File;
+use std::hint;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
+use std::thread;
 
 /// Number of possible country codes, `[A-Z]{3}` (spec section 2.3).
 const CODES: usize = 26 * 26 * 26;
@@ -53,6 +63,18 @@ fn map_file(path: &Path) -> io::Result<&'static [u8]> {
     }
 }
 
+/// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
+/// box's 12 threads.
+fn thread_count() -> usize {
+    match std::env::var("SD_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        Some(threads) if threads > 0 => threads,
+        _ => thread::available_parallelism().map_or(1, |n| n.get().min(12)),
+    }
+}
+
 /// Reads the digits at `pos` and steps past the separator after them. Commas and line ends both
 /// sort below the digits, so one comparison ends the number.
 fn next_number(text: &[u8], pos: &mut usize) -> u64 {
@@ -67,9 +89,17 @@ fn next_number(text: &[u8], pos: &mut usize) -> u64 {
 
 /// The position just past the first LF, where the first data line starts.
 fn after_header(text: &[u8]) -> usize {
-    text.iter()
-        .position(|&byte| byte == b'\n')
-        .map_or(text.len(), |lf| lf + 1)
+    let lf = text.iter().position(|&byte| byte == b'\n');
+    lf.map_or(text.len(), |lf| lf + 1)
+}
+
+/// The first record boundary at or after `pos`: just past the next CRLF, or the end of the file.
+/// A CR can only be the first byte of a CRLF terminator (spec section 2.2), so this is never inside
+/// quotes. About half the records end in CRLF, so it's never far. A file without one simply doesn't
+/// get split.
+fn next_boundary(file: &[u8], pos: usize) -> usize {
+    let cr = file[pos..].iter().position(|&byte| byte == b'\r');
+    cr.map_or(file.len(), |cr| pos + cr + 2)
 }
 
 /// The join table: country indices by region id, and the codes in byte order. Indices follow that
@@ -119,65 +149,133 @@ fn parse_regions(file: &[u8]) -> Regions {
     Regions { country_of, keys }
 }
 
-/// FNV-1a. A test build swaps it for a constant, so that every key collides and any logic that
-/// trusts a hash without comparing the key shows up as a wrong answer.
+/// Mixes a name's first 24 bytes and its length. A test build swaps it for a constant, so that every
+/// key collides and any logic that trusts a hash without comparing the key shows up as a wrong
+/// answer.
 #[cfg(not(sd_const_hash))]
-fn hash(key: &[u8]) -> usize {
-    let h = key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &byte| {
-        (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-    });
-    (h ^ (h >> 32)) as usize
+fn hash(key_words: &[u64; 3], len: usize) -> u64 {
+    key_words.iter().fold(len as u64, |hash, &word| {
+        let mixed = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mixed ^ (mixed >> 29)
+    })
 }
 
 #[cfg(sd_const_hash)]
-fn hash(_key: &[u8]) -> usize {
+fn hash(_key_words: &[u64; 3], _len: usize) -> u64 {
     0
 }
 
-/// Raw names to dense ids, by open addressing with linear probing. A hit always compares the full
-/// key, because about 5% of the names differ from another only by trailing spaces.
-struct Interner<'a> {
-    slots: Vec<u32>, // id + 1, or 0 when free. The length is a power of two.
-    keys: Vec<&'a [u8]>,
+/// Slots to start with: 2^17 for the generator's pool of 100,000 names. A test build starts tiny, to
+/// exercise the restart that a larger pool would need.
+const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 4 } else { 1 << 17 };
+/// Most names fit in the slot itself: on seed 1, 99.99% of them.
+const INLINE_BYTES: usize = 24;
+const EMPTY: u64 = 0;
+const BUSY: u64 = 1;
+
+/// Distinct names per country, in one table shared by all threads, with no locks. Each slot is one
+/// cache line: a header, the name's first 24 bytes (or its file offset if it's longer), and one bit
+/// per country that has seen this name. So a lookup costs one cache miss, with no second memory
+/// access to compare the key. Names are compared in full, and never unescaped: the raw bytes encode
+/// the value one to one. The slots are insert-only, so a published slot never changes its key.
+struct NameTable<'a> {
+    file: &'a [u8],
+    words: Vec<AtomicU64>,
+    first: usize,  // The word where the first slot starts, on a cache line boundary.
+    stride: usize, // Words per slot.
+    mask: usize,
+    used: AtomicUsize,
+    overflowed: AtomicU64,
 }
 
-impl<'a> Interner<'a> {
-    fn new() -> Self {
-        Interner {
-            slots: vec![0; 1 << 12],
-            keys: Vec::new(),
+impl<'a> NameTable<'a> {
+    fn new(file: &'a [u8], slots: usize, countries: usize) -> Self {
+        let stride = (4 + countries.div_ceil(64)).next_multiple_of(8);
+        // An untouched allocation stays out of the memory peak until a thread writes to it.
+        let zeroed = vec![0u64; slots * stride + 8];
+        let words: Vec<AtomicU64> = zeroed.into_iter().map(AtomicU64::new).collect();
+        NameTable {
+            file,
+            first: words.as_ptr().align_offset(64),
+            words,
+            stride,
+            mask: slots - 1,
+            used: AtomicUsize::new(0),
+            overflowed: AtomicU64::new(0),
         }
     }
 
-    fn intern(&mut self, key: &'a [u8]) -> usize {
-        let mask = self.slots.len() - 1;
-        let mut slot = hash(key) & mask;
-        while self.slots[slot] != 0 {
-            let id = self.slots[slot] as usize - 1;
-            if self.keys[id] == key {
-                return id;
+    /// Marks this name as seen in `country`, and returns whether that's new for the country.
+    fn mark(&self, key: &[u8], country: usize) -> bool {
+        let mut key_words = [0u64; 3];
+        let inline = &key[..key.len().min(INLINE_BYTES)];
+        for (word, chunk) in key_words.iter_mut().zip(inline.chunks(8)) {
+            let mut bytes = [0; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_le_bytes(bytes);
+        }
+        let hash = hash(&key_words, key.len());
+        // The top half of the hash and the length, plus 2 to stay clear of EMPTY and BUSY.
+        let published = (hash & 0xFFFF_FFFF_0000_0000) | (key.len() as u64 + 2);
+        let mut slot = hash as usize & self.mask;
+        loop {
+            let base = self.first + slot * self.stride;
+            let mut header = self.words[base].load(Acquire);
+            if header == EMPTY {
+                if self.used.load(Relaxed) * 8 >= (self.mask + 1) * 7 {
+                    self.overflowed.store(1, Relaxed);
+                    return false; // This whole pass will be thrown away.
+                }
+                let claim = self.words[base].compare_exchange(EMPTY, BUSY, Acquire, Acquire);
+                match claim {
+                    Ok(_) => {
+                        self.fill_slot(base, key, &key_words);
+                        self.words[base].store(published, Release);
+                        return self.mark_country(base, country);
+                    }
+                    Err(current) => header = current,
+                }
             }
-            slot = (slot + 1) & mask;
+            while header == BUSY {
+                hint::spin_loop();
+                header = self.words[base].load(Acquire);
+            }
+            if header == published && self.key_matches(base, key, &key_words) {
+                return self.mark_country(base, country);
+            }
+            slot = (slot + 1) & self.mask;
         }
-        self.keys.push(key);
-        self.slots[slot] = self.keys.len() as u32;
-        if self.keys.len() * 2 > self.slots.len() {
-            self.grow();
-        }
-        self.keys.len() - 1
     }
 
-    fn grow(&mut self) {
-        let mut slots = vec![0; self.slots.len() * 2];
-        let mask = slots.len() - 1;
-        for (id, key) in self.keys.iter().enumerate() {
-            let mut slot = hash(key) & mask;
-            while slots[slot] != 0 {
-                slot = (slot + 1) & mask;
+    fn fill_slot(&self, base: usize, key: &[u8], key_words: &[u64; 3]) {
+        self.used.fetch_add(1, Relaxed);
+        if key.len() <= INLINE_BYTES {
+            for (i, &word) in key_words.iter().enumerate() {
+                self.words[base + 1 + i].store(word, Relaxed);
             }
-            slots[slot] = id as u32 + 1;
+        } else {
+            let offset = key.as_ptr() as usize - self.file.as_ptr() as usize;
+            self.words[base + 1].store(offset as u64, Relaxed);
         }
-        self.slots = slots;
+    }
+
+    fn key_matches(&self, base: usize, key: &[u8], key_words: &[u64; 3]) -> bool {
+        if key.len() <= INLINE_BYTES {
+            let stored = |i: usize| self.words[base + 1 + i].load(Relaxed);
+            key_words
+                .iter()
+                .enumerate()
+                .all(|(i, &word)| stored(i) == word)
+        } else {
+            let offset = self.words[base + 1].load(Relaxed) as usize;
+            &self.file[offset..offset + key.len()] == key
+        }
+    }
+
+    fn mark_country(&self, base: usize, country: usize) -> bool {
+        let word = &self.words[base + 4 + country / 64];
+        let bit = 1u64 << (country % 64);
+        word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0
     }
 }
 
@@ -225,8 +323,8 @@ fn amount_cents(file: &[u8], pos: &mut usize) -> i64 {
     if negative { -cents } else { cents }
 }
 
-#[derive(Clone)]
-struct Aggregate {
+#[derive(Clone, Copy)]
+struct Row {
     count: u64,
     id_sum: u64,
     amount_sum: i64,
@@ -235,12 +333,10 @@ struct Aggregate {
     names_distinct: u64,
     name_bytes: u64,
     note_bytes: u64,
-    names_seen: Vec<u64>, // A bitset over name ids.
 }
 
-/// Parses every record and adds it to its country's aggregate.
-fn aggregate(file: &[u8], regions: &Regions) -> Vec<Aggregate> {
-    let empty = Aggregate {
+impl Row {
+    const EMPTY: Row = Row {
         count: 0,
         id_sum: 0,
         amount_sum: 0,
@@ -249,13 +345,31 @@ fn aggregate(file: &[u8], regions: &Regions) -> Vec<Aggregate> {
         names_distinct: 0,
         name_bytes: 0,
         note_bytes: 0,
-        names_seen: Vec::new(),
     };
-    let mut aggregates = vec![empty; regions.keys.len()];
+
+    fn merge(&mut self, other: &Row) {
+        self.count += other.count;
+        self.id_sum += other.id_sum;
+        self.amount_sum += other.amount_sum;
+        self.amount_min = self.amount_min.min(other.amount_min);
+        self.amount_max = self.amount_max.max(other.amount_max);
+        self.names_distinct += other.names_distinct;
+        self.name_bytes += other.name_bytes;
+        self.note_bytes += other.note_bytes;
+    }
+}
+
+/// Parses the records in `pos..end`, adding each to its country's row.
+fn parse_records(
+    file: &[u8],
+    mut pos: usize,
+    end: usize,
+    regions: &Regions,
+    names: &NameTable,
+    rows: &mut [Row],
+) {
     let unmatched = regions.keys.len() - 1;
-    let mut names = Interner::new();
-    let mut pos = after_header(file);
-    while pos < file.len() {
+    while pos < end {
         // A byte order mark can only start a record here, and no record otherwise starts with it.
         if file[pos] == 0xEF {
             pos += 3;
@@ -269,11 +383,11 @@ fn aggregate(file: &[u8], regions: &Regions) -> Vec<Aggregate> {
         pos += usize::from(pos < file.len() && file[pos] == b'\r');
         pos += 1;
 
-        let country = regions
-            .country_of
+        let country_of = &regions.country_of;
+        let country = country_of
             .get(region)
             .map_or(unmatched, |&c| usize::from(c));
-        let row = &mut aggregates[country];
+        let row = &mut rows[country];
         row.count += 1;
         row.id_sum += id;
         row.amount_sum += cents;
@@ -281,15 +395,57 @@ fn aggregate(file: &[u8], regions: &Regions) -> Vec<Aggregate> {
         row.amount_max = row.amount_max.max(cents);
         row.name_bytes += name_bytes as u64;
         row.note_bytes += note_bytes as u64;
-        let name_id = names.intern(name);
-        let word = name_id / 64;
-        if word >= row.names_seen.len() {
-            row.names_seen.resize(word + 1, 0);
-        }
-        row.names_distinct += u64::from(row.names_seen[word] >> (name_id % 64) & 1 == 0);
-        row.names_seen[word] |= 1 << (name_id % 64);
+        row.names_distinct += u64::from(names.mark(name, country));
     }
-    aggregates
+}
+
+/// Parses the whole file on `threads` threads and merges their rows. Eight segments per thread
+/// balances the load. Tying the size to the thread count also makes the SD_THREADS test sweep move
+/// every cut. Returns None if the name table filled up.
+fn aggregate(file: &[u8], regions: &Regions, threads: usize, slots: usize) -> Option<Vec<Row>> {
+    let names = NameTable::new(file, slots, regions.keys.len());
+    let segment = (file.len() / (threads * 8)).max(1);
+    let cursor = AtomicUsize::new(0);
+    let worker_rows: Vec<Vec<Row>> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut rows = vec![Row::EMPTY; regions.keys.len()];
+                    loop {
+                        let start = cursor.fetch_add(segment, Relaxed);
+                        if start >= file.len() {
+                            return rows;
+                        }
+                        let first = match start {
+                            0 => after_header(file),
+                            _ => next_boundary(file, start),
+                        };
+                        let cut = start + segment;
+                        let last = if cut >= file.len() {
+                            file.len()
+                        } else {
+                            next_boundary(file, cut)
+                        };
+                        parse_records(file, first, last, regions, &names, &mut rows);
+                    }
+                })
+            })
+            .collect();
+        let joined = handles.into_iter().map(|handle| handle.join());
+        joined
+            .map(|rows| rows.expect("panic = \"abort\" means a join can't fail"))
+            .collect()
+    });
+    if names.overflowed.load(Relaxed) != 0 {
+        return None;
+    }
+    let mut totals = vec![Row::EMPTY; regions.keys.len()];
+    for rows in &worker_rows {
+        for (total, row) in totals.iter_mut().zip(rows) {
+            total.merge(row);
+        }
+    }
+    Some(totals)
 }
 
 /// Prints cents as `W.CC`. The sign and the absolute value are separate because integer division
@@ -305,11 +461,22 @@ fn main() -> io::Result<()> {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let data_dir = Path::new(&data_dir);
+    let threads = thread_count();
     let regions = parse_regions(map_file(&data_dir.join("regions.csv"))?);
-    let aggregates = aggregate(map_file(&data_dir.join("records.csv"))?, &regions);
+    let file = map_file(&data_dir.join("records.csv"))?;
+
+    // The spec's pool of names is a distribution, not a promise. If a file holds more names than the
+    // table, the pass is thrown away and redone with a bigger table.
+    let mut slots = INITIAL_SLOTS;
+    let totals = loop {
+        if let Some(totals) = aggregate(file, &regions, threads, slots) {
+            break totals;
+        }
+        slots *= 4;
+    };
 
     let mut out = BufWriter::new(File::create(Path::new(&out_dir).join("aggregates.txt"))?);
-    for (key, row) in regions.keys.iter().zip(&aggregates) {
+    for (key, row) in regions.keys.iter().zip(&totals) {
         if row.count == 0 {
             continue; // A country with no records prints no line.
         }
@@ -317,9 +484,8 @@ fn main() -> io::Result<()> {
         write_money(&mut out, row.amount_sum)?;
         write_money(&mut out, row.amount_min)?;
         write_money(&mut out, row.amount_max)?;
-        let (distinct, name_bytes, note_bytes) =
-            (row.names_distinct, row.name_bytes, row.note_bytes);
-        writeln!(out, " {distinct} {name_bytes} {note_bytes}")?;
+        let (distinct, name_bytes) = (row.names_distinct, row.name_bytes);
+        writeln!(out, " {distinct} {name_bytes} {}", row.note_bytes)?;
     }
     out.flush()
 }

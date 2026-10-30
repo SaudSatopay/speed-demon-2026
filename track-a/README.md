@@ -14,11 +14,11 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 ## Limits
 
 - It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
-- It's single-threaded for now.
+- Each thread keeps its own endpoint table and record lists, so memory is about 55 MB locally, well above what the output needs.
 
 ## Approach
 
-The log is memory-mapped and walked once. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. An open-addressing table turns each endpoint into a dense id, always comparing the full key. Each (hour, endpoint) group keeps a growing list of latencies. At the end, the endpoints are sorted once as bytes, then each hour prints its groups in that order, sorting each group's list and reading the three percentiles from it. The output goes to the file in 64 KB pieces, so it never sits in memory as well.
+The log is memory-mapped and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Each thread has its own open-addressing endpoint table, always comparing the full key, and appends one 64-bit record per line to a list for that line's hour. When the log is done, the tables are merged and sorted by bytes, and threads claim hours. Each one merges an hour's records, rewrites their endpoint ids to byte-order ranks, sorts them as plain integers, formats them, and appends them to the file in turn.
 
 ## Why it's fast
 
@@ -27,6 +27,7 @@ See [PERF.md](PERF.md) for run IDs.
 1. **No date parsing.** The reference spends about 77% of its time in `strptime`. Here the hour is a few bit operations on four bytes.
 2. **No per-line objects.** A line costs no allocation, except when a latency list grows.
 3. **The log isn't read into memory.** Mapped dataset pages don't count toward the memory peak.
+4. **One sortable integer per request.** With the endpoint's byte-order rank in the top bits and the latency below it, sorting an hour's records as integers gives every group and every percentile at once.
 
 ## Ideas and where they came from
 

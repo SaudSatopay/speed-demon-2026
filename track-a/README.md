@@ -16,7 +16,7 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 - It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
 - Latencies of 2^19 or more take a slower path through a side list, about 3% of requests.
 - It relies on the spec's promise of 1,842 endpoints per seed. Past 3,584 it aborts rather than risk a wrong answer.
-- S is 514 code lines, far above the reference's 56, because each of these gains needed code.
+- S is 492 code lines, far above the reference's 56, because each of these gains needed code.
 
 ## Approach
 

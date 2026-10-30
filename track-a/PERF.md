@@ -7,7 +7,7 @@
 ## Where it loses
 
 - M is 55 MB locally, far above what the output needs (10 MB). Each thread keeps its own table and its own record lists, which grow by doubling, and sorting needs a second copy of each hour.
-- S is 519 code lines against the reference's 56, which costs about 7.2 speed points. The reference is short because Python does the work.
+- S is 492 code lines against the reference's 56, which costs about 7.1 speed points. The reference is short because Python does the work.
 
 ## Where the reference spends its time
 
@@ -24,7 +24,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 2 | 12 threads: segments from an atomic cursor, one sortable record per request, ordered appends | Parsing and sorting are independent per segment and per hour | run-4817f2d2cc47 | 0.062 | 48.3 | 69.4 |
 | 3 | Block loads on the hot path: AVX2 space search, word hashing, SWAR latency, one shared lock-free table | We measured about 350 cycles per line, and only 15% of the time in the kernel | run-d35f7df5c506 | 0.039 | 48.0 | 73.4 |
 | 4 | 32-bit records in one shared array per hour, sorted in place and freed as the text is written | The output counts toward M, and records were 8 bytes, with a copy to sort | run-f1c9f21494d2 | 0.036 | 20.3 | 77.1 |
-| 5 | Output through a shared mapping, numbers printed by arithmetic, and no restart paths | Serial `write`s to tmpfs queue on the file's lock, and formatting cost 220 ns a line | run-… | 0.021 *local* | 27.1 *local* | 74.9 *local* |
+| 5 | Output through a shared mapping, numbers printed by arithmetic, and no restart paths | Serial `write`s to tmpfs queue on the file's lock, and formatting cost 220 ns a line | run-caafa693c324 | 0.036 | 20.8 | 76.9 |
+| 6 | A smaller endpoint table, comparing keys against the log | Inline keys cost 262 KB of table and 20 lines, for just 1,842 endpoints | run-… | 0.018 *local* | 26.7 *local* | 76.6 *local* |
 
 ## Decision log
 
@@ -38,13 +39,16 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D5. One shared array per hour.** Context: M was 54 MB: 8-byte records with doubling slack, a copy to sort each hour, and the 10 MB output on top. Options: per-thread lists of 32-bit records freed hour by hour, or one array per hour that threads reserve blocks of. We tried the first and measured it (see below): M 31 MB but T 33 ms, because 864 small mappings cost about 13 ms. Chose: the second, with 72 mappings, no merge and an in-place sort. Latencies that don't fit in a record go to a side list. Cost: S 394 -> 514, and one `unsafe` cast from atomics to integers once threads have joined. Evidence: T 0.025 -> 0.022 s, M 54.4 -> 26.8 MB, K 26.17 -> 30.48 (local). Outcome: kept.
 
-**D6. Write the output through a shared mapping.** Context: SpeedDEMONS passed us on the board with T 0.032 s. A profile showed the output stage at about half of T, with `write` calls serial, because tmpfs takes the file's lock for each. Chose: stretch the file to an upper bound, map it, let each thread claim its stretch in hour order, copy without waiting, and cut the file to length at the end. Numbers now print with no digit loop. We also dropped both restart paths, which cost lines for inputs the spec rules out: each hour's array now has room for every line, in pages that stay untouched, and more than 3,584 endpoints aborts. Cost: one `unsafe impl Sync`. Evidence: T 0.022 -> 0.021 s, K 30.48 -> 31.44 (local). Outcome: see the journey table.
+**D6. Write the output through a shared mapping.** Context: SpeedDEMONS passed us on the board with T 0.032 s. A profile showed the output stage at about half of T, with `write` calls serial, because tmpfs takes the file's lock for each. Chose: stretch the file to an upper bound, map it, let each thread claim its stretch in hour order, copy without waiting, and cut the file to length at the end. Numbers now print with no digit loop. We also dropped both restart paths, which cost lines for inputs the spec rules out: each hour's array now has room for every line, in pages that stay untouched, and more than 3,584 endpoints aborts. Cost: one `unsafe impl Sync`. Evidence: T 0.022 -> 0.021 s, K 30.48 -> 31.44 (local), but the board stayed at T 0.036 s, so `write` wasn't the bottleneck there. Kept, because it's no longer in S's way. Outcome: kept.
+
+**D7. Remove the inline keys.** Context: with only 1,842 endpoints, the key texts in the log fit in the caches anyway, so a 64-byte slot per endpoint might not earn its 20 lines. Chose: a 16-byte slot, and a compare against the key's first occurrence in the log. It came out both simpler and faster, because the table now fits the L1 cache. Evidence: T 0.021 -> 0.018 s, S 519 -> 492, K 31.44 -> 34.06 (local). Outcome: see the journey table.
 
 ## What didn't work
 
 | Experiment | What we expected | What we measured | Where | Kept? |
 |---|---|---|---|---|
 | 32-bit records in 864 per-thread lists, freed hour by hour | M about 20 MB at the same T | M 31.4 MB, but T 25 -> 33 ms, K 26.17 -> 24.48. Each list being its own mapping cost about 13 ms | local | replaced by D5 |
+| A software prefetch of the log, 256 or 1,024 bytes ahead of the parse | Less stalling on the data | -3.8% and +0.1%, with noise of 17% and 19% | local | not kept |
 | The first SWAR digit parse, with its multipliers written the wrong way round | Faster latency parsing | Wrong answers on 43 of 44 grid cells, caught at once | local | fixed before any push |
 
 ## The final design

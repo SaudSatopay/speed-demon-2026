@@ -159,33 +159,30 @@ fn hash(_words: [u64; 3], _len: usize) -> u64 {
 
 /// Room for the spec's 1,842 endpoints per seed, at a low load.
 const SLOTS: usize = 1 << 12;
-const STRIDE: usize = 8; // Words per slot, which is one cache line.
-const INLINE_BYTES: usize = 56;
 const EMPTY: u64 = 0;
 const BUSY: u64 = 1;
 
-/// Endpoints to ids, shared by all threads with no locks. Each slot is a cache line: a header, then
-/// the first 56 bytes of the key, which is all of it for 94% of the endpoints, so a hit usually needs
-/// no access to the log. Keys are always compared in full, because templated paths share prefixes,
-/// suffixes and lengths. A slot's number is the endpoint's id, and a published slot never changes.
+/// A slot: a header holding part of the hash and the key's length, and where the key first occurred.
+#[derive(Default)]
+struct Slot {
+    header: AtomicU64,
+    start: AtomicU64,
+}
+
+/// Endpoints to ids, shared by all threads with no locks. A key is always compared in full, against
+/// its first occurrence in the log, because templated paths share prefixes, suffixes and lengths. A
+/// slot's number is the endpoint's id, and a published slot never changes.
 struct EndpointTable<'a> {
     log: &'a [u8],
-    words: Vec<AtomicU64>,
-    first: usize, // The word where the first slot starts, on a cache line boundary.
-    offsets: Vec<AtomicU64>, // Where each slot's key first occurred in the log.
+    slots: Vec<Slot>,
     used: AtomicUsize,
 }
 
 impl<'a> EndpointTable<'a> {
     fn new(log: &'a [u8]) -> Self {
-        let words: Vec<AtomicU64> = (0..=SLOTS * STRIDE + STRIDE)
-            .map(|_| AtomicU64::new(0))
-            .collect();
         EndpointTable {
             log,
-            first: words.as_ptr().align_offset(64),
-            words,
-            offsets: (0..SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..SLOTS).map(|_| Slot::default()).collect(),
             used: AtomicUsize::new(0),
         }
     }
@@ -207,76 +204,48 @@ impl<'a> EndpointTable<'a> {
         let hash = hash(words, len);
         // The top half of the hash and the length, plus 2 to stay clear of EMPTY and BUSY.
         let published = (hash & 0xFFFF_FFFF_0000_0000) | (len as u64 + 2);
-        let mut slot = (hash as usize & (SLOTS - 1)).max(1); // Slot 0 stays free: see `new_hours`.
+        let mut index = (hash as usize & (SLOTS - 1)).max(1); // Slot 0 stays free: see `new_hours`.
         loop {
-            let base = self.first + slot * STRIDE;
-            let mut header = self.words[base].load(Acquire);
+            let slot = &self.slots[index];
+            let mut header = slot.header.load(Acquire);
             if header == EMPTY
-                && self.words[base]
+                && slot
+                    .header
                     .compare_exchange(EMPTY, BUSY, Acquire, Acquire)
                     .is_ok()
             {
-                self.fill_slot(slot, base, start, len);
-                self.words[base].store(published, Release);
-                return slot;
+                assert!(
+                    self.used.fetch_add(1, Relaxed) < SLOTS / 8 * 7,
+                    "more endpoints than the spec's"
+                );
+                slot.start.store(start as u64, Relaxed);
+                slot.header.store(published, Release);
+                return index;
             }
             while header == EMPTY || header == BUSY {
                 hint::spin_loop();
-                header = self.words[base].load(Acquire);
+                header = slot.header.load(Acquire);
             }
-            if header == published && self.key_matches(slot, base, start, len) {
-                return slot;
+            if header == published {
+                let first = slot.start.load(Relaxed) as usize;
+                if self.log[first..first + len] == self.log[start..end] {
+                    return index;
+                }
             }
-            slot = ((slot + 1) & (SLOTS - 1)).max(1);
+            index = ((index + 1) & (SLOTS - 1)).max(1);
         }
-    }
-
-    /// One inline word of a key: the bytes past the key's end are masked off, so that a key's words
-    /// don't depend on what follows it in the log.
-    #[inline]
-    fn key_word(&self, start: usize, len: usize, word: usize) -> u64 {
-        let bytes = len - 8 * word;
-        let mask = if bytes >= 8 {
-            !0
-        } else {
-            (1 << (8 * bytes)) - 1
-        };
-        load_u64(self.log, start + 8 * word) & mask
-    }
-
-    fn fill_slot(&self, slot: usize, base: usize, start: usize, len: usize) {
-        assert!(
-            self.used.fetch_add(1, Relaxed) < SLOTS / 8 * 7,
-            "more endpoints than the spec's"
-        );
-        self.offsets[slot].store(start as u64, Relaxed);
-        for word in 0..len.min(INLINE_BYTES).div_ceil(8) {
-            self.words[base + 1 + word].store(self.key_word(start, len, word), Relaxed);
-        }
-    }
-
-    #[inline]
-    fn key_matches(&self, slot: usize, base: usize, start: usize, len: usize) -> bool {
-        if len > INLINE_BYTES {
-            let first = self.offsets[slot].load(Relaxed) as usize;
-            return self.log[first..first + len] == self.log[start..start + len];
-        }
-        let matches = |word: usize| {
-            self.words[base + 1 + word].load(Relaxed) == self.key_word(start, len, word)
-        };
-        (0..len.div_ceil(8)).all(matches)
     }
 
     /// Every endpoint in byte order (`[u8]` compares as unsigned bytes, with a proper prefix first),
     /// and each slot's position in that order, counting from 1.
     fn sorted_keys(&self) -> (Vec<&'a [u8]>, Vec<u32>) {
         let mut keys: Vec<(&[u8], usize)> = Vec::new();
-        for slot in 0..SLOTS {
-            let header = self.words[self.first + slot * STRIDE].load(Acquire);
+        for (index, slot) in self.slots.iter().enumerate() {
+            let header = slot.header.load(Acquire);
             if header != EMPTY {
                 let len = (header & 0xFFFF_FFFF) as usize - 2;
-                let start = self.offsets[slot].load(Relaxed) as usize;
-                keys.push((&self.log[start..start + len], slot));
+                let start = slot.start.load(Relaxed) as usize;
+                keys.push((&self.log[start..start + len], index));
             }
         }
         keys.sort_unstable();

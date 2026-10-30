@@ -7,7 +7,7 @@
 ## Where it loses
 
 - M is 55 MB locally, far above what the output needs (10 MB). Each thread keeps its own table and its own record lists, which grow by doubling, and sorting needs a second copy of each hour.
-- S is 275 code lines against the reference's 56, which costs about 5.2 speed points. The reference is short because Python does the work.
+- S is 394 code lines against the reference's 56, which costs about 6.4 speed points. The reference is short because Python does the work.
 
 ## Where the reference spends its time
 
@@ -20,8 +20,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Step | Change | Why we expected it to help | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|---|
 | 0 | The reference, unchanged | — | — | 32.05 | 228 | 0 |
-| 1 | v1: mmap, fixed-offset parsing, full-key table, one thread | Removes `strptime` and per-line objects | run-… | 0.230 *local* | 36.1 *local* | 50.6 *local* |
-| 2 | 12 threads: segments from an atomic cursor, one sortable record per request, ordered appends | Parsing and sorting are independent per segment and per hour | run-… | 0.037 *local* | 55.0 *local* | 67.8 *local* |
+| 1 | v1: mmap, fixed-offset parsing, full-key table, one thread | Removes `strptime` and per-line objects | run-45e4054a9bf6 | 0.443 | 35.3 | 50.3 |
+| 2 | 12 threads: segments from an atomic cursor, one sortable record per request, ordered appends | Parsing and sorting are independent per segment and per hour | run-4817f2d2cc47 | 0.062 | 48.3 | 69.4 |
+| 3 | Block loads on the hot path: AVX2 space search, word hashing, SWAR latency, one shared lock-free table | We measured about 350 cycles per line, and only 15% of the time in the kernel | run-… | 0.025 *local* | 54.4 *local* | 70.9 *local* |
 
 ## Decision log
 
@@ -31,9 +32,13 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D3. Tie the segment size to the thread count.** Context: fixed 2 MB segments would keep every cut in the same place, so a thread-count sweep would test nothing about chunk edges. Chose: log size / (threads x 8), so each thread count moves every cut, down to cuts shorter than a line on tiny inputs. Cost: none measurable. Outcome: kept.
 
+**D4. Block loads, and one shared table.** Context: on rung 2, `user` time was about 85% of the total, about 350 cycles per line, with a byte loop for the endpoint, a byte-at-a-time hash, and a byte loop for the latency. Options: keep the loops and tune, or load blocks. Chose: two 32-byte AVX2 loads to find the space, a hash of three words, a SWAR parse of up to 8 digits, and one lock-free table with keys inline in a cache line, which also removed the per-thread tables and their merge. The padded mapping means no tail code is needed for loads past the end of the file. Cost: S rose from 275 to 394 lines, and the program now uses `unsafe` for the loads, each behind a bounds assert. Evidence: T 0.037 -> 0.025 s, K 22.65 -> 26.17 (local). Outcome: kept.
+
 ## What didn't work
 
-Nothing tried yet.
+| Experiment | What we expected | What we measured | Where | Kept? |
+|---|---|---|---|---|
+| The first SWAR digit parse, with its multipliers written the wrong way round | Faster latency parsing | Wrong answers on 43 of 44 grid cells, caught at once | local | fixed before any push |
 
 ## The final design
 

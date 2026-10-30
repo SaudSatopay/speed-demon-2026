@@ -51,6 +51,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Experiment | What we expected | What we measured | Where | Kept? |
 |---|---|---|---|---|
 | Counting distinct names in a second phase, one partition per thread, with no shared writes per record | Nearly every record sets a new country bit in a shared cache line, and the box's cross-core traffic is slow, so T should fall a lot | T 0.055 -> 0.059 s, M 14.2 -> 37.4 MB, K 24.35 -> 19.08. Shared bits weren't the bottleneck | run-be17f3a6a2e0 | reverted |
+| PREFETCHW for the name table's slot line | Most records write a line another core owns | ab.sh -3.6%, inside 16% noise, for S +5; the same idea did nothing on Track D | local | not applied |
+| Parsing `regions.csv` on several threads, with atomic table entries, a lock for new codes, and the table sized from the last line | The serial parse is about 4% of the run, about +2% K for about 12 lines | Regions phase, 41 paired runs: 1,193 -> 949 us at 12 threads, 1,194 -> 609 us at 4, 1,215 -> 598 us at 6; thread spawns eat the rest. Whole run unchanged (31,770 -> 31,946 us at 4 threads, 32,298 -> 32,086 at 6). S 339 -> 356 costs 0.74% K, and the phase's best case gives back +0.9%. Scorer, 3 runs each, median K 24.02 -> 24.24, with a range of 3% per side | local | reverted |
 
 ## The final design
 

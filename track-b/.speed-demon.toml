@@ -1,5 +1,5 @@
 # Read by the board and the scoring harness.
 track = "b"
-team = "your team name"
+team = "ALL STAR"
 language = "Python"
 dependency_count = 0

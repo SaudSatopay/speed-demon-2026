@@ -51,4 +51,4 @@ None. `mmap` is declared directly against glibc, which `std` already links, and 
 
 ## AI use
 
-Written with AI assistance (Claude Code). Every decision and number in PERF.md was checked, and can be explained, by the author.
+Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). Every decision and number in PERF.md was checked, and can be explained, by the author.

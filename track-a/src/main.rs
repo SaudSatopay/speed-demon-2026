@@ -5,7 +5,7 @@
 //! allows it, and with block loads where it doesn't. One lock-free table, shared by all threads,
 //! turns endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
 //! where each thread reserves small blocks. When the log is done, threads claim hours: each groups one
-//! hour's array with four stable radix passes, formats it, frees it, and waits for its turn to append
+//! hour's array with three stable radix passes, formats it, frees it, and waits for its turn to append
 //! to the file. The output vector doubles as aligned radix scratch before it holds text, so output is
 //! in a fixed order whatever the scheduling and never sits in memory whole.
 
@@ -89,7 +89,7 @@ fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
 
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
 /// within 64, so two 32-byte loads almost always settle it, with no byte loop to mispredict. Panics
-/// if the log has no more spaces. The result may not be inside the log, so the caller checks it.
+/// if the log has no more spaces. The padding has none, so the result is inside the log.
 ///
 /// # Safety
 /// `log` must come from `map_file`, and `pos + 64` must be at most `log.len() + PADDING`.
@@ -144,7 +144,7 @@ fn hash(first: u64, last: u64, len: usize) -> u64 {
 /// # Safety
 /// `log` must come from `map_file`, `start` must be at least 8, `start <= end`, `end` must be inside
 /// the log and hold a space, and `table` must have been filled only by this function, with this log.
-unsafe fn id_of(table: &[AtomicU32], log: &[u8], start: usize, end: usize) -> u32 {
+unsafe fn id_of(table: &[AtomicU32; SLOTS], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
     // SAFETY, for this load and the next two: all three start inside the log.
@@ -174,20 +174,20 @@ unsafe fn id_of(table: &[AtomicU32], log: &[u8], start: usize, end: usize) -> u3
     }
 }
 
-/// Each id's endpoint, and each id's place in byte order (`[u8]` compares as unsigned bytes, with a
-/// proper prefix first). Unused ids have an empty key, which sorts before every real one.
-fn rank_ids<'a>(table: &[AtomicU32], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<u32>) {
+/// Each id's endpoint, with an empty key for unused ids, and the ids in use, in the byte order of
+/// their endpoints (`[u8]` compares as unsigned bytes, with a proper prefix first), after id 0,
+/// which no endpoint has: it's what the unused ends of blocks hold.
+fn order_ids<'a>(table: &[AtomicU32; SLOTS], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<usize>) {
     let key_of = |slot: &AtomicU32| match slot.load(Relaxed) as usize {
         0 => &log[..0],
         // SAFETY: a slot holds the `start` of a call to `id_of`, which was inside the log.
         first => &log[first..][..unsafe { offset_of_space(log, first) }],
     };
     let keys: Vec<&[u8]> = table.iter().map(key_of).collect();
-    let mut ids: Vec<usize> = (0..SLOTS).collect();
+    let mut ids: Vec<usize> = (1..SLOTS).filter(|&id| !keys[id].is_empty()).collect();
     ids.sort_unstable_by_key(|&id| keys[id]);
-    let mut ranks = vec![0; SLOTS];
-    ids.iter().zip(0..).for_each(|(&id, rank)| ranks[id] = rank);
-    (keys, ranks)
+    ids.insert(0, 0);
+    (keys, ids)
 }
 
 /// One hour's records: an array that threads reserve blocks of, where the next block starts, and the
@@ -198,21 +198,20 @@ type Hour = (Vec<AtomicU32>, AtomicUsize, Mutex<Vec<u64>>);
 
 /// Hours since the start of the span, read from four timestamp bytes without parsing a date.
 /// Oct 30, Oct 31, Nov 1 and Nov 2 differ in the last digit of the month and of the day:
-/// (month & 1) + (day & 3) gives 0, 1, 2 and 3.
+/// (month & 1) + (day & 3) gives 0, 1, 2 and 3. One multiply adds the four masked bytes into the top
+/// byte, weighted 24, 24, 10 and 1, and no partial product below that byte can carry into it.
 ///
 /// # Safety
 /// `log` must come from `map_file`, and `line` must be inside the log.
 unsafe fn hour_index(log: &[u8], line: usize) -> usize {
     // SAFETY: the load ends within 14 bytes of `line`, so inside the padding at the latest.
-    let bytes = unsafe { load::<u64>(log, line + 6) }.to_le_bytes(); // Bytes 6 to 13: M-DDTHH:
-    let day = (bytes[0] & 1) + (bytes[3] & 3);
-    let hour = 10 * (bytes[5] & 15) + (bytes[6] & 15);
-    24 * usize::from(day) + usize::from(hour) - 18
+    let bytes = unsafe { load::<u64>(log, line + 6) }; // Bytes 6 to 13: M-DDTHH:
+    ((bytes & 0x000F_0F00_0300_0001).wrapping_mul(0x1800_0018_000A_0100) >> 56) as usize - 18
 }
 
 /// Reads the latency at `pos`, and returns it with the number of digits. Digits have bit 4 set and an
 /// LF doesn't, so one load finds the end of up to 8 digits, and three multiplications parse them,
-/// which leaves only the rarest latencies to the loop.
+/// which leaves only the rarest latencies, those with more than 8 digits, to the loop.
 ///
 /// # Safety
 /// `log` must come from `map_file`, and `pos + 8` must be at most `log.len() + PADDING`.
@@ -224,7 +223,7 @@ unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
     let pairs = aligned.wrapping_mul((10 << 8) + 1) >> 8 & 0x00FF_00FF_00FF_00FF;
     let quads = pairs.wrapping_mul((100 << 16) + 1) >> 16 & 0x0000_FFFF_0000_FFFF;
     let mut value = quads.wrapping_mul((10000 << 32) + 1) >> 32;
-    while log[pos + digits] != b'\n' {
+    while digits >= 8 && log[pos + digits] != b'\n' {
         value = value * 10 + u64::from(log[pos + digits] - b'0');
         digits += 1;
     }
@@ -235,10 +234,10 @@ unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
 /// the timestamp is always 27 bytes. A thread keeps its own unfilled block of each hour, as a slice,
 /// and its own big latencies, so the hot path reads and writes no line that other threads write.
 /// `log` is the mapping from `map_file`, whose padding the unchecked loads here rely on.
-fn parse(log: &[u8], table: &[AtomicU32], hours: &[Hour], cursor: &AtomicUsize, size: usize) {
+fn parse(log: &[u8], table: &[AtomicU32; SLOTS], hours: &[Hour], head: &AtomicUsize, size: usize) {
     let mut blocks: [&[AtomicU32]; HOURS] = [&[]; HOURS];
     let mut bigs = [const { Vec::new() }; HOURS];
-    let claim = || Some(cursor.fetch_add(size, Relaxed)).filter(|&start| start < log.len());
+    let claim = || Some(head.fetch_add(size, Relaxed)).filter(|&start| start < log.len());
     while let Some(start) = claim() {
         let end = (start + size).min(log.len());
         // A line belongs to the segment holding its first byte, so skip the one already started.
@@ -256,9 +255,9 @@ fn parse(log: &[u8], table: &[AtomicU32], hours: &[Hour], cursor: &AtomicUsize, 
             // SAFETY: the method's length is at most 15, so the first block ends within 108 bytes of
             // `line`, inside the padding at the latest.
             let key_end = key_start + unsafe { offset_of_space(log, key_start) };
-            // This index is the one check the unchecked loads below rely on: it panics unless the space
-            // is inside the log. Statuses are 100 to 599.
-            let is_error = u32::from(log[key_end + 1] == b'5');
+            // Statuses are 100 to 599.
+            // SAFETY: the padding has no spaces, so `key_end` is inside the log.
+            let is_error = u32::from(unsafe { load::<u8>(log, key_end + 1) } == b'5');
             // SAFETY: `key_end` is inside the log and holds a space, `key_start` is at least 29 and
             // not after it, and only this call fills `table`.
             let id = unsafe { id_of(table, log, key_start, key_end) };
@@ -310,15 +309,16 @@ fn push_decimal(out: &mut Vec<u8>, value: u64) {
     out.truncate(end);
 }
 
-/// One stable pass of an LSD radix sort. The digit is always below `SLOTS`.
-fn radix_pass(from: &[u32], to: &mut [u32], digit: impl Fn(u32) -> usize) {
+/// One stable pass of an LSD radix sort. The digit is always below `SLOTS`, and `order` lists the
+/// digits that occur, in the order they should come out.
+fn radix_pass(from: &[u32], to: &mut [u32], digit: impl Fn(u32) -> usize, order: &[usize]) {
     let mut next = [0u32; SLOTS];
     for &record in from {
         next[digit(record)] += 1;
     }
     let mut total = 0;
-    for count in &mut next {
-        total += std::mem::replace(count, total);
+    for &bucket in order {
+        total += std::mem::replace(&mut next[bucket], total);
     }
     for &record in from {
         let position = &mut next[digit(record)];
@@ -327,9 +327,9 @@ fn radix_pass(from: &[u32], to: &mut [u32], digit: impl Fn(u32) -> usize) {
     }
 }
 
-/// Appends one hour's output lines, given its records sorted by endpoint rank and then latency, and
-/// its big latencies in the same order.
-fn format_hour(hour: usize, sorted: &[u32], mut big: &[u64], keys: &[&[u8]], out: &mut Vec<u8>) {
+/// Appends one hour's output lines, given its records sorted by endpoint and then latency, and its
+/// big latencies sorted by id and then latency.
+fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &mut Vec<u8>) {
     let clock = hour + 18;
     let stamp = format!("{}T{:02}:00:00Z ", DATES[clock / 24], clock % 24);
     for group in sorted.chunk_by(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
@@ -337,18 +337,17 @@ fn format_hour(hour: usize, sorted: &[u32], mut big: &[u64], keys: &[&[u8]], out
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
         let big_count = group.iter().filter(|&&r| latency(r) == BIG_LATENCY).count();
-        let (bigs, rest) = big.split_at(big_count);
-        big = rest;
+        let id = group[0] >> ID_SHIFT;
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
-            match bigs.get(index.wrapping_sub(n - big_count)) {
-                Some(&entry) => entry & 0xFFFF_FFFF,
+            match index.checked_sub(n - big_count) {
+                Some(i) => big[big.partition_point(|e| e >> 32 < id.into()) + i] & 0xFFFF_FFFF,
                 None => u64::from(latency(group[index])),
             }
         };
         let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         out.extend_from_slice(stamp.as_bytes());
-        out.extend_from_slice(keys[(group[0] >> ID_SHIFT) as usize]);
+        out.extend_from_slice(keys[id as usize]);
         let count = n as u64;
         for value in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
             out.push(b' ');
@@ -358,28 +357,27 @@ fn format_hour(hour: usize, sorted: &[u32], mut big: &[u64], keys: &[&[u8]], out
     }
 }
 
-fn write_summary(file: File, keys: &[&[u8]], ranks: &[u32], hours: Vec<Hour>, threads: usize) {
+fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, threads: usize) {
+    let all: Vec<usize> = (0..1024).collect();
     let queue = Mutex::new(hours.into_iter().enumerate());
     let written = AtomicUsize::new(0);
     on_threads(threads, || {
         let mut text = Vec::new();
         for (hour, (mut slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
             let records = AtomicU32::get_mut_slice(&mut slots[..next.into_inner()]);
-            // Four stable passes sort by latency first and rank last. The current text buffer is
-            // scratch, then its storage is reused for the output bytes.
+            // Three stable passes sort by latency first and endpoint last. The current text buffer
+            // is scratch, so the result is copied out, and its storage is reused for the output bytes.
             text.resize(records.len() * 4 + 3, 0);
             // SAFETY: four spare bytes cover any alignment prefix; assert the aligned slice fits.
             let (_, scratch, _) = unsafe { text.align_to_mut::<u32>() };
             assert!(scratch.len() >= records.len());
-            radix_pass(records, scratch, |r| ((r >> 1) & 127) as usize);
-            radix_pass(scratch, records, |r| ((r >> 8) & 63) as usize);
-            radix_pass(records, scratch, |r| ((r >> 14) & 63) as usize);
-            radix_pass(scratch, records, |r| {
-                ranks[(r >> ID_SHIFT) as usize] as usize
-            });
+            radix_pass(records, scratch, |r| ((r >> 1) & 511) as usize, &all[..512]);
+            radix_pass(scratch, records, |r| ((r >> 10) & 1023) as usize, &all);
+            radix_pass(records, scratch, |r| (r >> ID_SHIFT) as usize, ids);
+            records.copy_from_slice(scratch);
             let zeros = records.partition_point(|&record| record == 0);
             let mut big = big.into_inner().unwrap();
-            big.sort_unstable_by_key(|entry| (ranks[(entry >> 32) as usize], *entry));
+            big.sort_unstable();
             text.clear();
             format_hour(hour, &records[zeros..], &big, keys, &mut text);
             drop(slots);
@@ -413,13 +411,13 @@ fn main() -> io::Result<()> {
         (slots, AtomicUsize::new(0), Mutex::default())
     };
     let hours: Vec<Hour> = (0..HOURS).map(new_hour).collect();
-    let table: Vec<AtomicU32> = (0..SLOTS).map(|_| AtomicU32::new(0)).collect();
+    let table = [const { AtomicU32::new(0) }; SLOTS];
     let cursor = AtomicUsize::new(0);
     // Eight segments per thread balances the load. Tying the size to the thread count also makes
     // the SD_THREADS test sweep move every cut, down to cuts smaller than a line on tiny inputs.
     let size = (log.len() / (threads * 8)).max(1);
     on_threads(threads, || parse(log, &table, &hours, &cursor, size));
-    let (keys, ranks) = rank_ids(&table, log);
-    write_summary(file, &keys, &ranks, hours, threads.min(10));
+    let (keys, ids) = order_ids(&table, log);
+    write_summary(file, &keys, &ids, hours, threads.min(10));
     Ok(())
 }

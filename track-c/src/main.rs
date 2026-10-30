@@ -127,10 +127,9 @@ fn next_boundary(file: &[u8], pos: usize) -> usize {
         .map_or(file.len(), |cr| pos + cr + 2)
 }
 
-/// The join table: country indices by region id, and the codes in byte order. Indices follow that
-/// order, so printing by index sorts the output. The last index stands for `_UNMATCHED`, which sorts
-/// after every code because `_` is above `Z`. The table's last entry is past every region id, and
-/// holds that index, for every id above them.
+/// The join table: country indices by region id, and each index's key. Index 0 is `_UNMATCHED`, and
+/// the codes take the next indices as they first appear, so the output is sorted when it's written.
+/// The table's last entry is past every region id, and stays unmatched, for every id above them.
 struct Regions {
     country_of: Vec<u8>,
     keys: Vec<String>,
@@ -138,29 +137,23 @@ struct Regions {
 
 fn parse_regions(file: &[u8]) -> Regions {
     let mut pos = after_header(file);
-    let (mut lines, mut seen) = (Vec::new(), vec![false; CODES]);
+    let (mut country_of, mut index_of) = (vec![0u8], vec![0u8; CODES]);
+    let mut keys = vec!["_UNMATCHED".to_string()];
     while pos < file.len() {
         let id = next_number(file, &mut pos) as usize;
         let letter = |i: usize| usize::from(file[pos + i] - b'A');
         let code = letter(0) * 26 * 26 + letter(1) * 26 + letter(2);
+        if index_of[code] == 0 {
+            assert!(keys.len() < 256, "the spec has 240 countries");
+            index_of[code] = keys.len() as u8;
+            keys.push(String::from_utf8_lossy(&file[pos..pos + 3]).into_owned());
+        }
         pos += 4; // The three letters and the LF.
-        seen[code] = true;
-        lines.push((id as u32, code as u16));
-    }
-    let mut index_of = vec![0u8; CODES];
-    let mut keys = Vec::new();
-    for code in (0..CODES).filter(|&code| seen[code]) {
-        index_of[code] = keys.len() as u8;
-        let l = |value: usize| char::from(b'A' + (value % 26) as u8);
-        keys.push(format!("{}{}{}", l(code / 676), l(code / 26), l(code)));
-    }
-    assert!(keys.len() < 256, "the spec has 240 countries");
-    let unmatched = keys.len() as u8;
-    keys.push("_UNMATCHED".to_string());
-    let highest_id = lines.iter().map(|line| line.0).max().unwrap_or(0) as usize;
-    let mut country_of = vec![unmatched; highest_id + 2];
-    for &(id, code) in &lines {
-        country_of[id as usize] = index_of[usize::from(code)];
+        // Grown in doubling steps, so the table takes 1 MB for ids up to a million.
+        if country_of.len() <= id + 1 {
+            country_of.resize((id + 2).next_power_of_two(), 0);
+        }
+        country_of[id] = index_of[code];
     }
     Regions { country_of, keys }
 }
@@ -438,29 +431,21 @@ fn main() -> io::Result<()> {
         INITIAL_SLOTS,
     );
 
+    // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are
+    // already in output order, and a group without records gets no line.
+    let mut lines: Vec<_> = regions.keys.iter().zip(&totals).collect();
+    lines.sort();
     let mut out = BufWriter::new(File::create(Path::new(&out_dir).join("aggregates.txt"))?);
-    for (key, row) in regions.keys.iter().zip(&totals) {
-        let [
-            count,
-            id_sum,
-            amount_sum,
-            lowest,
-            highest,
-            distinct,
-            name_bytes,
-            note_bytes,
-        ] = *row;
-        if count > 0 {
-            write!(out, "{key} {count} {id_sum}")?;
-            // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
-            // which would lose the sign of -0.75. Zero never gets a sign.
-            for cents in [amount_sum, lowest, highest] {
-                let sign = if cents < 0 { "-" } else { "" };
-                let magnitude = cents.unsigned_abs();
-                write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
-            }
-            writeln!(out, " {distinct} {name_bytes} {note_bytes}")?;
+    for (key, row) in lines.into_iter().filter(|(_, row)| row[0] > 0) {
+        write!(out, "{key} {} {}", row[0], row[1])?;
+        // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
+        // which would lose the sign of -0.75. Zero never gets a sign.
+        for cents in &row[2..5] {
+            let sign = if *cents < 0 { "-" } else { "" };
+            let magnitude = cents.unsigned_abs();
+            write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
         }
+        writeln!(out, " {} {} {}", row[5], row[6], row[7])?;
     }
     out.flush()
 }

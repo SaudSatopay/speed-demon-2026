@@ -6,8 +6,8 @@
 
 ## Where it loses
 
-- M is 22 MB locally, against the 7.3 MB where more savings stop counting. The name table takes 8.4 MB of that.
-- S is 485 code lines against the reference's 108, which costs about 4.9 speed points.
+- M is 13 MB on the board, against the 7.3 MB where more savings stop counting. The name table takes 8.4 MB of that.
+- S is 339 code lines against the reference's 108, which costs about 3.7 speed points.
 
 ## Where the reference spends its time
 
@@ -25,6 +25,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 3 | Block loads for every field, and lookups batched with prefetching | About 470 cycles per record, with a mispredicted loop exit per field and a stall per name lookup | run-239daeb7287a | 0.055 | 14.2 | 69.3 |
 | 4 | Slow paths the spec rules out removed, 1-byte region entries | Sanjay Sah passed us with half our lines and less memory, and S and M were costing more than T | run-c96eba9a4379 | 0.050 | 12.9 | 71.2 |
 | 5 | Same design in 369 lines: one exit from the table's loop, a row that is an array, and regions parsed once | Two passes over `regions.csv` were serial time, and rivals have half our lines | run-126b276f6fae | 0.061 | 12.8 | 69.9 |
+| 6 | Regions parsed in one pass, and the output sorted once, when it's written | The temporary list, the `seen` table and the output loop's destructuring were all lines with no job at run time | run-… | 0.0304 *local* | 23.5 *local* | 68.8 *local* |
 
 ## Decision log
 
@@ -39,6 +40,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D5. Remove what the spec rules out.** Context: Sanjay Sah took 1st with T 0.066 s against our 0.051, but S 275 against our 549. Section 2.2 caps ids, region ids and amounts at 8 bytes, so their byte-loop fallbacks could go, and 240 countries fit in a byte, which frees 1 MB. More than 255 countries now aborts rather than risking a wrong answer. Cost: none in time. Evidence: S 549 -> 485, M 22.2 -> 20.8 MB, K 23.46 -> 24.09 (local). Outcome: see the journey table.
 
 **D6. Cut the code, not the design.** Context: on Track A, cutting lines without touching the hot paths took first place. Options: the same here. Chose: a row as an array of eight numbers, where a single record is a row too, so one `merge` adds a record to its country and adds up the threads' rows. Regions are parsed once, into a temporary list, instead of twice, because that stage is serial. Ids past the highest region share one last entry of the table, so finding a country has no branch. Evidence: S 485 -> 369, with local T -2.5% (noise 7.4%), and all checks passing. What would change our minds: a higher T on the board, over a few runs, since T swings between 0.050 and 0.063 s on the board with no change in the code.
+
+**D7. Give out country indices as codes appear, and sort at the end.** Context: byte-order indices needed every code before the first index could be given out, so regions took a temporary list and a second pass. Options: keep that, or give out indices on first sight and sort the 241 output lines once. Chose: the latter, with index 0 as `_UNMATCHED`, and `country_of` grown in doubling steps, so its last entry still lies past every id. Cost: none; the sort is 241 short strings. Evidence: S 356 -> 339, counts.sh 415.0 -> 414.5 instructions and 1.53 -> 1.54 mispredicts per record, K 23.27 -> 23.81 (local, with T and M inside their noise). Outcome: kept.
 
 ## What didn't work
 

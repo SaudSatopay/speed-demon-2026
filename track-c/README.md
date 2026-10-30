@@ -13,13 +13,12 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 
 ## Limits
 
-- The parser reads one byte at a time.
 - It relies on two spec guarantees: a mid-file BOM only ever starts a record, and a CR only ever starts a CRLF. A file with no CRLF would still be right, but wouldn't get split across threads.
 - The name table is 8.4 MB, which keeps M above the 7.3 MB where more savings stop counting.
 
 ## Approach
 
-The region table becomes an array from region id to country index, with indices in byte order, so printing by index sorts the output. Threads claim segments of the mapped CSV from an atomic cursor, and cut them just after a CRLF, which is always a record boundary because the spec promises a CR appears nowhere else. A scalar parser written straight from section 2.1 of the spec walks each segment. It never unescapes anything: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length is the raw length minus the number of pairs. Each thread sums into its own rows. One lock-free table, shared by all threads, counts distinct names: each slot is one cache line, holding the name's first 24 bytes and one bit per country.
+The region table becomes an array from region id to country index, with indices in byte order, so printing by index sorts the output. Threads claim segments of the mapped CSV from an atomic cursor, and cut them just after a CRLF, which is always a record boundary because the spec promises a CR appears nowhere else. The parser follows section 2.1 of the spec, with block loads in place of byte loops: 64-byte quote masks for text fields, and one 8-byte load for each number. It never unescapes anything: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length is the raw length minus the number of pairs. Records wait in batches of 16 while their lookups are prefetched. Each thread sums into its own rows. One lock-free table, shared by all threads, counts distinct names: each slot is one cache line, holding the name's first 24 bytes and one bit per country.
 
 ## Why it's fast
 
@@ -33,6 +32,7 @@ See [PERF.md](PERF.md) for run IDs.
 ## Ideas and where they came from
 
 - Comparing raw bytes instead of unescaping: our own reading of section 2.1.
+- The 8-digit SWAR parse: Lemire (2022).
 - Cutting on CRLF instead of counting quotes: our own reading of section 2.2. Ge et al. (SIGMOD 2019) describe the two-pass quote-counting method it replaces.
 - A full-key compare on every hash hit: the 1BRC contest rejected entries that trusted hashes (Morling, 2024).
 
@@ -42,7 +42,7 @@ Each of the spec's 20 edge cases falls out of the field rules. An empty unquoted
 
 ## Dependencies
 
-None. `mmap` is declared directly against glibc, which `std` already links.
+None. `mmap` is declared directly against glibc, which `std` already links, and the AVX2 loads and prefetches come from `std::arch`.
 
 ## Build and run
 

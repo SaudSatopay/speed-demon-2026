@@ -18,9 +18,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
-/// Above any real distance, since node ids fit far below 2^30 and weights below 2^32, and low enough
-/// that a distance can be added to it without wrapping. It also marks "no path" in the answers.
-const INF: u64 = 1 << 62;
+/// Above any real distance, which the spec puts below 2^63, so two of them add without wrapping. It
+/// also marks "no path" in the answers, where it prints as -1. Nothing adds to it: a label is never
+/// INF, and the other side's label is checked first.
+const INF: u64 = u64::MAX;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -546,12 +547,7 @@ fn main() -> io::Result<()> {
 
     let mut out = BufWriter::new(File::create(Path::new(&out_dir).join("distances.txt"))?);
     for (_, _, answer) in &queries {
-        let distance = answer.load(Relaxed);
-        writeln!(
-            out,
-            "{}",
-            if distance == INF { -1 } else { distance as i64 }
-        )?;
+        writeln!(out, "{}", answer.load(Relaxed) as i64)?;
     }
     out.flush()
 }

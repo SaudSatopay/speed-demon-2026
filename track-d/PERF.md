@@ -33,6 +33,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 11 | A radix queue instead of binary heaps | Keys never go below the last one popped, so a key moves a few times in all, with no comparisons against other keys | run-20366d30099c | 0.184 | 82.1 | 67.8 |
 | 12 | Nodes numbered in clusters the size of a label page, breadth first inside each | Two links per node instead of three cost 20%, so the numbering's quality matters far more than we'd assumed | run-03f74b0ab497 | 0.180 | 78.2 | 68.2 |
 | 13 | Queries parsed and `numbers` dropped before the reverse graph is built | The 7 MB of old-to-new numbers were still live at the memory peak, and nothing in the reverse build reads them | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
+| 14 | `INF` as `u64::MAX`, so an answer prints as a plain cast | The cast already gives -1 for "no path", which removes the output loop's branch and 5 lines | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 
 ## Decision log
 
@@ -63,6 +64,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D13. Number in clusters.** Context: dropping from three links per node to two made the whole run 19.6% slower, so better numbering might pay as much. Options measured on `ab.sh` against depth first: pure breadth first +6.8%, clusters of 16 -0.2%, 64 -5.3% and -4.6% on a second run, 256 -2.4%, 1,024 +1.4%, and four or more links per node +3.5% and up, from the larger entries. Chose: clusters of 64, the size of a label page, growing breadth first, with the newest unexpanded node starting the next one. What would change our minds: no gain on the board.
 
 **D14. Free the numbers before the reverse build.** Context: a review found the anonymous peak at 60.8 MB when the reverse graph finished, with `numbers` (7 MB) still live, while the queries reach only 54.8 MB. Chose: `build_graphs` splits into `build_graph` and `reverse`, and `main` parses the queries and drops `numbers` between them. Cost: S +5. Evidence: the peak by phase fell from 60.75 to 54.76 MB, now in the query phase. Scorer M is noisier: HEAD gave 71.8 and 69.6 MB (74.0 earlier), the new build 69.5, 69.5 and 69.6, so the gain shows as a steadier and lower ceiling, not a clean 6 MB. `counts.sh`: instructions 1,268.0 -> 1,186.4 per record, mispredicts 7.23 -> 7.26, which we didn't expect from a move and can't yet explain. What would change our minds: no lower M on the board.
+
+**D15. A larger `INF`.** Context: the output loop only tested for `INF` to print -1, and `u64::MAX as i64` is -1. Nothing adds to `INF`, and the spec puts every real distance below 2^63, so two of them add without wrapping. Cost: S -5. Evidence: `counts.sh` instructions 1,186.4 -> 1,186.3 per record, mispredicts 7.26 -> 7.27, so this is a line saving only.
 
 ## What didn't work
 

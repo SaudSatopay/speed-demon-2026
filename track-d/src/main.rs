@@ -154,10 +154,12 @@ const NUMBER_BLOCK: u32 = 1 << 10;
 const RECORD: usize = 4;
 
 /// Numbers the nodes so that neighbours sit close in memory, because the input's ids are random, which
-/// makes every hop a cache miss. Each thread walks depth first from a seed, giving each node it
-/// reaches first its next number, from a block of its own. Nodes the walks miss become seeds
-/// themselves, so all of them get a number. Any numbering gives the same answers, and numbers needn't
-/// be dense: a thread's last block has a few unused, and so does number 0, which means no number yet.
+/// makes every hop a cache miss. Each thread grows clusters breadth first, about the size of a label
+/// page, giving each node it reaches first its next number, from a block of its own. A cluster's
+/// unexpanded nodes stay on a stack, and the newest starts the next cluster, so nearby clusters get
+/// nearby numbers. Nodes the walks miss become seeds themselves, so all of them get a number. Any
+/// numbering gives the same answers, and numbers needn't be dense: a thread's last block has a few
+/// unused, and so does number 0, which means no number yet.
 /// Returns the numbers, and how many entries an array indexed by number needs, plus one.
 fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<AtomicU32>, usize) {
     let numbers = zeroed_u32s(nodes);
@@ -189,14 +191,20 @@ fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<
                 if claim(seed) {
                     stack.push(seed);
                 }
-                while let Some(node) = stack.pop() {
-                    for link in &records[node * RECORD + 1..][..RECORD - 1] {
-                        let neighbour = link.load(Relaxed) as usize;
-                        if neighbour != 0 && claim(neighbour - 1) {
-                            stack.push(neighbour - 1);
-                            prefetch(&records[(neighbour - 1) * RECORD]);
+                while !stack.is_empty() {
+                    let first = stack.len() - 1;
+                    let mut next = first;
+                    while next < stack.len() && stack.len() - first < PAGE {
+                        for link in &records[stack[next] * RECORD + 1..][..RECORD - 1] {
+                            let neighbour = link.load(Relaxed) as usize;
+                            if neighbour != 0 && claim(neighbour - 1) {
+                                stack.push(neighbour - 1);
+                                prefetch(&records[(neighbour - 1) * RECORD]);
+                            }
                         }
+                        next += 1;
                     }
+                    stack.drain(first..next);
                 }
             }
         }

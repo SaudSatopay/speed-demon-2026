@@ -30,7 +30,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 8 | Labels in pages found through a directory, no hash table, new numbers given at the first visit, and 104 fewer lines | A directory read and a page read replace probing and key compares, and each side fills only its own pages | run-d47336fddad4 | 0.238 | 78.0 | 65.4 |
 | 9 | A node's out-count and links on one cache line, and prefetching into L2 | Each edge of the count pass touched three lines, and on a shared core the L1 prefetch queue is small | run-6c4a3ec99255 | 0.230 | 80.4 | 65.7 |
 | 10 | The reverse graph derived from the forward one, by sweeping it | After renumbering, neighbours are close, so a sweep has few misses, where the file's order made every edge a random touch of six lines | run-3cffbc842db0 | 0.208 | 79.4 | 66.7 |
-| 11 | A radix queue instead of binary heaps | Keys never go below the last one popped, so a key moves a few times in all, with no comparisons against other keys | RUN11 | T11 | M11 | P11 |
+| 11 | A radix queue instead of binary heaps | Keys never go below the last one popped, so a key moves a few times in all, with no comparisons against other keys | run-20366d30099c | 0.184 | 82.1 | 67.8 |
+| 12 | Nodes numbered in clusters the size of a label page, breadth first inside each | Two links per node instead of three cost 20%, so the numbering's quality matters far more than we'd assumed | RUN12 | T12 | M12 | P12 |
 
 ## Decision log
 
@@ -57,6 +58,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D11. Derive the reverse graph.** Context: Cause Of Death passed us with T 0.165 s against 0.230, at M 126 MB. Our stage timings were count 20 ms, numbering 12, moving counts 5, placing 43 and queries 64, so the build was over half the time, and a reader of the file can only visit edges in random order. Options: hold an edge list (costs M), or partition (a review found it slower). Chose: place only the forward arcs from the file, then fill the reverse array by sweeping them in node order. By then neighbours have nearby numbers, so in-degrees and reverse arcs land in memory that's nearly in cache, with no parsing and no number lookups, and the first pass no longer counts in-degrees. Evidence: local T -12.9% on `ab.sh`. What would change our minds: no gain on the board.
 
 **D12. A radix queue.** Context: a review measured -6 to -8% with a radix queue, and our heaps took a mispredict on most sift steps. Chose: 65 buckets by the highest bit differing from the last key popped. It relies on Dijkstra's keys never going below that key. Evidence: local T -11.8% (noise 5.5%) on `ab.sh`, for 26 more lines. What would change our minds: no gain on the board.
+
+**D13. Number in clusters.** Context: dropping from three links per node to two made the whole run 19.6% slower, so better numbering might pay as much. Options measured on `ab.sh` against depth first: pure breadth first +6.8%, clusters of 16 -0.2%, 64 -5.3% and -4.6% on a second run, 256 -2.4%, 1,024 +1.4%, and four or more links per node +3.5% and up, from the larger entries. Chose: clusters of 64, the size of a label page, growing breadth first, with the newest unexpanded node starting the next one. What would change our minds: no gain on the board.
 
 ## What didn't work
 

@@ -13,12 +13,12 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Limits
 
-- It's single-threaded for now.
+- Each thread has its own 7 MB slot array, which random node ids soon touch in full, so M is about 200 MB locally.
 - Node ids are random, so nearly every hop is a cache miss.
 
 ## Approach
 
-The mapped graph file is parsed twice: once to count each node's edges, once to place them into forward and reverse compressed adjacency arrays. That way, no temporary edge list is ever held. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Labels live in a sparse set, so a new query clears nothing.
+The mapped graph file is parsed twice by 12 threads, which claim segments from an atomic cursor: once to count each node's edges, once to place them into forward and reverse compressed adjacency arrays. That way, no temporary edge list is ever held. Threads then claim queries from an atomic counter. Each query runs a two-ended Dijkstra, with one binary heap per side and lazy deletion. The side with less work so far goes next, and the search stops when the two queue tops add up to at least the best path seen. Labels live in a sparse set per thread, so a new query clears nothing. Each answer goes into its own slot, so the output order doesn't depend on scheduling.
 
 ## Why it's fast
 

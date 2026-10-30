@@ -421,8 +421,9 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
         });
     });
 
-    // A bitmap costs N/8 bytes and a chained posting about 2.3 bytes, so they cross near df = N/18. Any
-    // choice gives the same answers, and a wrong guess only costs some memory.
+    // On memory alone, a bitmap (N/8 bytes) and a chain (about 3.3 bytes per posting) cross near df =
+    // N/26. But setting a bit is cheaper than extending a chain, and measuring put the best K near
+    // N/48. Any choice gives the same answers, and a wrong guess only costs some memory.
     let mut store_of = vec![PHRASE_ONLY; term_count];
     let (mut bitmap_count, mut list_count) = (0, 0);
     let mut anchors = Vec::new();
@@ -437,7 +438,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
             for step in steps {
                 let term = step.term as usize;
                 if store_of[term] == PHRASE_ONLY {
-                    if sample_df[term] * 18 >= sampled_docs {
+                    if sample_df[term] * 48 >= sampled_docs {
                         store_of[term] = BITMAP | bitmap_count;
                         bitmap_count += 1;
                     } else {

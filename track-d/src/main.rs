@@ -386,9 +386,9 @@ const KEPT_ENTRIES: usize = 1 << 15;
 /// `i - 1 + COARSE_BITS`. When bucket 0 runs dry, the lowest bucket in use spreads into the ones below,
 /// so a key moves a few times in all, with no comparisons against other keys.
 struct Side<D> {
-    directory: Vec<u32>,
+    directory: Vec<u16>,
     pages: Vec<D>,
-    used: Vec<u32>,
+    used: Vec<u16>,
     buckets: Vec<Vec<(D, u32)>>,
     last: D,
 }
@@ -452,9 +452,9 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
     fn set_label(&mut self, node: u32, dist: D) {
         let entry = node as usize / PAGE;
         if self.directory[entry] == 0 {
-            self.directory[entry] = (self.pages.len() / PAGE) as u32;
+            self.directory[entry] = (self.pages.len() / PAGE) as u16;
             self.pages.resize(self.pages.len() + PAGE, !D::default());
-            self.used.push(entry as u32);
+            self.used.push(entry as u16);
         }
         self.pages[self.directory[entry] as usize * PAGE + node as usize % PAGE] = dist;
     }
@@ -550,6 +550,11 @@ fn main() -> io::Result<()> {
     let backward = reverse(&forward, threads);
     let graphs = [forward, backward];
 
+    // Keep page-id narrowing exact; the full contest graph is well below this bound.
+    assert!(
+        (entries - 1) / PAGE <= u16::MAX as usize,
+        "node page index exceeds the compact directory"
+    );
     let next_query = AtomicUsize::new(0);
     on_threads(threads, || {
         let mut narrow = [Side::<u32>::new(entries), Side::new(entries)];

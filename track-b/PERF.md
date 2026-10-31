@@ -36,6 +36,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 13 | Vectors in lookup, tokens' edges from a byte table, three-way term sets, a byte per term, leaner BOOL checks and bitmap answers | Counters showed 200 instructions per token and per-core IPC of 2.4, so instruction count was the limit, not memory | pending | — | — | — |
 | 14 | The same design in 960 lines: a plan that owns everything, one counting sort for all lists | S 1325 cost 5% of K against the leader's 782, and most of it was structure and formatting, not features | pending | — | — | — |
 | 15 | exp: read the corpus in 128 KiB pieces, linked statically | On C, reading in pieces beat mmap on the box, though local timing couldn't tell | pending | — | — | — |
+| 16 | exp: 32 KiB pieces in place of 128 KiB | 128 KiB gave T 0.1047, 0.1037 and 0.1033 against 0.1045, 0.1041 and 0.1045 with mmap, flat for 23 more lines | pending | — | — | — |
 
 ## Decision log
 
@@ -70,6 +71,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D15. Cut lines with no loss of speed. Plan now owns the queries, answers and bitmaps, which removes Index, Queries, Answers, Evaluator and AnchorLists and their struct literals; make_plan is one loop plus one `group` counting sort, also used for phrase hits, with number_terms and list_phrases split out. Chain state holds its first document (-2.5% of cycles), total_hits visits each answer once (-0.4 ms), and one round of threads evaluates and prints (-0.5 ms). Blocks stay in chunks, as a reserved Vec put M at 47 MB. On seed 1, 12 threads: cycles 2.62G -> 2.56G, instructions 4.07G -> 3.96G, S 1325 -> 964, M max 43.75 -> 42.62 MB. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 **D16. Experiment. Locally: page faults 4091 -> 428, thread cycles 2.55G -> 2.44G, sys CPU 38 -> 60 ms, wall flat, S 964 -> 987. Hyper-V inflates both faults and syscalls here, so the board decides, against T 0.1045 at S 964. Static linking saves 0.25 ms from exec to main.
+
+**D17. Experiment: the other piece size, before deciding. On A and C, 32 KiB is what paid. If this isn't clearly better either, B goes back to mmap, which has fewer lines.
 
 ## What didn't work
 

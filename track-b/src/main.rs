@@ -60,7 +60,7 @@ const SMALLEST: usize = 10;
 const PADDING: usize = 4096;
 /// Bytes per read of the corpus: few enough to stay in the caches, many enough that a read costs little
 /// per document.
-const PIECE: usize = 1 << 17;
+const PIECE: usize = 1 << 15;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -657,7 +657,6 @@ fn number_terms(plan: &mut Plan, df: &[u32], store_of: &[usize], flags: &mut [u3
 fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u32]) {
     let keyed = anchored.iter().map(|&(t, p)| (new_number[t as usize], p));
     let (start, phrases) = group(plan.terms.keys.len(), keyed);
-    plan.phrase_start.reserve_exact(start.len());
     for range in start.windows(2) {
         plan.phrase_start.push(plan.phrases.len() as u32);
         for &(number, position) in &phrases[range[0] as usize..range[1] as usize] {
@@ -989,7 +988,7 @@ fn check_phrases(ats: &[u32], tokens: &[u32], plan: &Plan, doc: u32, hits: &mut 
 /// replaces an unpredictable loop exit per anchor by one loop.
 #[inline(never)]
 fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mut Scan) {
-    let (hits, short) = (&mut scan.hits[..], &mut scan.short);
+    let (hits, short) = (&mut scan.hits[..], &mut scan.short[..]);
     let (checks, short_hits) = (plan.short_checks.as_ptr(), hits.as_ptr());
     let this_doc = (1 << SUM_BITS) + u64::from(doc);
     let lists = &plan.anchor_lists[..];
@@ -1008,13 +1007,10 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
     for &term in anchors {
         prefetch(lists.as_ptr().wrapping_add(term as usize).cast());
     }
-    // Each anchor writes four, and one with more checks makes room for them when it comes to it. Room for
-    // all the checks there are would hold on to more than a megabyte over the threads.
-    let (short_count, mut listed, room) = (plan.short_checks.len(), 0, 4 * anchors.len() + 4);
-    short.resize(short.len().max(room), 0);
+    let (short_count, mut listed) = (plan.short_checks.len(), 0);
     for &term in anchors {
-        // SAFETY: `lists` has one entry more than there are terms, `short` has room for this anchor's
-        // four and the other anchors' as well, and an anchor's checks are all in `long_checks`.
+        // SAFETY: `lists` has one entry more than there are terms, `short` has room for all the checks
+        // and four more, and an anchor's checks are all in `long_checks`.
         unsafe {
             let (from, long_from, shared) = *lists.get_unchecked(term as usize);
             let (to, long_to, _) = *lists.get_unchecked(term as usize + 1);
@@ -1022,11 +1018,8 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
             prefetch(short_hits.wrapping_add(from as usize).cast());
             let at = _mm_add_epi32(_mm_set1_epi32(from as i32), _mm_setr_epi32(0, 1, 2, 3));
             _mm_storeu_si128(short.as_mut_ptr().add(listed).cast(), at);
-            if to > from + 4 {
-                short.resize(short.len().max(listed + (to - from) as usize + room), 0);
-                for at in from + 4..to {
-                    short[listed + (at - from) as usize] = at;
-                }
+            for at in from + 4..to {
+                short[listed + (at - from) as usize] = at;
             }
             listed += (to - from) as usize;
             add(1, shared as usize);
@@ -1048,6 +1041,7 @@ fn scan_ranges((docs, len): (&File, usize), plan: &Plan, size: usize, next: &Ato
     let mut scan = Scan::default();
     scan.hits.resize(plan.slot_of.len(), 0);
     scan.chains = vec![(NONE, BLOCK_POSTINGS as u32, 0); plan.list_count];
+    scan.short = vec![0; plan.short_checks.len() + 4];
     let mut present = vec![0u8; plan.terms.keys.len()];
     let chain_from = FIRST_TERM + plan.bitmap_count.next_multiple_of(64);
     let start = plan.bitmaps.as_ptr().cast();
@@ -1062,10 +1056,8 @@ fn scan_ranges((docs, len): (&File, usize), plan: &Plan, size: usize, next: &Ato
         for_each_doc(docs, start, start + size, &mut room, |doc, text, edges| {
             let count = edges.len() / 2 - 4;
             if lists.1[0].len() < count + 4 {
-                // A document has about a thousand tokens at most, and doubling would leave more room.
-                let fits = (count + 4).max(1100);
-                lists.0.iter_mut().for_each(|l| l.resize(fits, 0));
-                lists.1.iter_mut().for_each(|l| l.resize(fits, 0));
+                lists.0.iter_mut().for_each(|l| l.resize(count + 4, 0));
+                lists.1.iter_mut().for_each(|l| l.resize(count + 4, 0));
             }
             let [marked, phrases] = look_up(&plan.terms, text, edges, &mut lists);
             let [tokens, _, marks, phrase_at, bool_terms, chained] = &mut lists.0;

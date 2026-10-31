@@ -1239,6 +1239,18 @@ fn main() -> io::Result<()> {
     let file = File::create(format!("{out_dir}/results.txt"))?;
     // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
     let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
+    // exp: the scan once more first, into throwaway results, so that T minus the usual T is the scan's
+    // wall time with the mapping already populated.
+    let claimed0 = AtomicUsize::new(0);
+    std::mem::forget(on_threads(threads, || {
+        scan_ranges(docs, &plan, range_size, &claimed0)
+    }));
+    for answer in &plan.answers {
+        *answer.lock().unwrap() = (0, 0, [NONE; SMALLEST]);
+    }
+    for (_, limit) in &plan.slots {
+        limit.store(NONE, Relaxed);
+    }
     let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
     answer_queries(file, &plan, &scans, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.

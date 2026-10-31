@@ -68,6 +68,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 46 | 32 KiB pieces, to stay | 64 KiB gave T 0.0249 and M 11.1 even with no faults on the stack pages, so faults weren't why it gained nothing. Also tried and dropped, by hardware counters: listing only commas (cycles flat, S +9), counting long notes' quotes with masks (cycles +1%), prefetching rows (+1%) | superseded before it ran | — | — | — |
 | 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | pending | — | — | — |
 | 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | pending | — | — | — |
+| 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | pending | — | — | — |
 
 ## Decision log
 
@@ -167,6 +168,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D47. A Fable agent's pipeline work. Local: instructions 296.7 -> 279.3, cycles about -3.5%, S 491 -> 530. Grid, sweep, constant-hash and 300 stress runs pass. What would change our minds: K below 40 over samples.
 
 **D48. A Fable agent's work on the name table. Local: L1 misses from L2 2.24 -> 1.24, from L3 0.30 -> 0.13, load waits -9 cycles, instructions +14, cycles about -1%, S +11. Keep only if T clearly beats 0.0232.
+
+**D49. Keep the design. S 541 -> 485, instructions +0.4 per record, cycles flat, stack use unchanged. A barrier between the phases cost 2% wall locally, so threads wait on a count of finished region jobs instead. What would change our minds: T up on the box.
 
 ## What didn't work
 

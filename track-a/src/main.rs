@@ -3,7 +3,8 @@
 //! The log is cut into segments that threads claim from an atomic cursor, so a thread that falls behind
 //! simply claims fewer, and each thread reads a segment in small pieces into its own buffer, which stays
 //! in its caches and costs no page faults. Each line is read at fixed offsets where the format allows
-//! it, and with block loads where it doesn't. One lock-free table, shared by all threads, turns
+//! it, and with block loads where it doesn't, and its end before its fields, so that the core can start
+//! the next line early. One lock-free table, shared by all threads, turns
 //! endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
 //! where each thread reserves small blocks. The log runs in rough time order, so a few threads finish
 //! hours while the others still read: once the reading is well past where a thread last came to an
@@ -168,31 +169,39 @@ fn hour_index(bytes: u64) -> usize {
     ((bytes & 0x000F_0F00_0300_0001).wrapping_mul(0x1800_0018_000A_0100) >> 56) as usize - 18
 }
 
-/// Reads the latency at `pos`, and returns it with the number of digits. Digits have bit 4 set and an
-/// LF doesn't, so one load finds the end of up to 8 digits, and three vector multiplies parse them,
-/// with their constants in registers that the rest of the line doesn't need. That leaves only the
-/// rarest latencies, those with more than 8 digits, to the loop.
+/// Reads the latency of `digits` digits at `pos`. Three vector multiplies parse up to 8, with their
+/// constants in registers that the rest of the line doesn't need, and a loop takes the rarest
+/// latencies, which have more.
 ///
 /// # Safety
 /// `pos + 8` must be at most `text.len()`.
-unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
-    // SAFETY: the caller vouches for this load, and the loop below uses checked indexing.
-    let word = unsafe { load::<u64>(text, pos) };
-    let mut digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
-    // SAFETY: the build targets x86-64-v3, which has SSE4.1.
-    let mut value = unsafe {
-        let aligned = _mm_cvtsi64_si128((word << (64 - 8 * digits)) as i64);
+unsafe fn parse_latency(text: &[u8], pos: usize, digits: usize) -> u32 {
+    if digits > 8 {
+        let digit = |value: u64, &b: &u8| value * 10 + u64::from(b - b'0');
+        return text[pos..pos + digits].iter().fold(0, digit) as u32;
+    }
+    // SAFETY: the caller vouches for the load, and the build targets x86-64-v3, which has SSE4.1.
+    unsafe {
+        let aligned = _mm_cvtsi64_si128((load::<u64>(text, pos) << (64 - 8 * digits)) as i64);
         let bytes = _mm_and_si128(aligned, _mm_set1_epi8(15));
         let pairs = _mm_maddubs_epi16(bytes, _mm_set1_epi16(10 + (1 << 8)));
         let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(100 + (1 << 16)));
         let eight = _mm_packus_epi32(quads, quads);
-        _mm_cvtsi128_si32(_mm_madd_epi16(eight, _mm_set1_epi32(10000 + (1 << 16)))) as u64
-    };
-    while digits >= 8 && text[pos + digits] != b'\n' {
-        value = value * 10 + u64::from(text[pos + digits] - b'0');
-        digits += 1;
+        _mm_cvtsi128_si32(_mm_madd_epi16(eight, _mm_set1_epi32(10000 + (1 << 16)))) as u32
     }
-    (value as u32, digits)
+}
+
+/// The start of the line after the latency at `pos`, for the one line in ten that runs past the block
+/// `parse` searches for its end. Digits have bit 4 set and an LF doesn't, so one load finds the end of
+/// up to 8 digits.
+#[cold]
+fn line_end(text: &[u8], pos: usize) -> usize {
+    // SAFETY: `pos` is inside the piece, whose padding covers the load.
+    let digits = (!unsafe { load::<u64>(text, pos) } & 0x1010_1010_1010_1010).trailing_zeros() / 8;
+    match digits as usize {
+        8 => pos + 9 + text[pos + 8..].iter().position(|&b| b == b'\n').unwrap(),
+        digits => pos + digits + 1,
+    }
 }
 
 /// Reads the segments that `go` gives. Each line is `ts method endpoint status latency`, where the
@@ -207,7 +216,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
     // place means the block is used up, and hours change only between chunks of the log.
     let (mut hour, mut place) = (0, blocks[0]);
     // SAFETY: the build targets x86-64-v3, which has AVX2.
-    let space = unsafe { _mm256_set1_epi8(b' ' as i8) };
+    let (space, feed) = unsafe { (_mm256_set1_epi8(b' ' as i8), _mm256_set1_epi8(b'\n' as i8)) };
     while let Some([start, end]) = go() {
         let (mut pos, mut bytes) = (start, 0);
         // A line belongs to the segment holding its first byte, so skip the one already started. The
@@ -240,6 +249,11 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
                         return;
                     }
                 }
+                // The line's end comes first, from the 64 bytes from where the shortest line, of 39
+                // bytes, ends: nine lines in ten end there, and the next line can then start before
+                // this one's key and latency are done, which is what keeps the core busy.
+                // SAFETY: this ends 102 bytes after `line`, inside the padding.
+                let feeds = equal_bytes(unsafe { load(text, line + 38) }, [feed; 2]);
                 let at = line + 29 + (METHOD_LENS >> 4 * (method & 15) & 15) as usize;
                 // SAFETY: the method's length is at most 15, so this ends within 108 bytes of `line`.
                 let key = unsafe { load(text, at) };
@@ -257,9 +271,14 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
                 // Statuses are 100 to 599.
                 // SAFETY: as above.
                 let is_error = u32::from(unsafe { load::<u8>(text, key_end + 1) } == b'5');
-                // Three status digits sit between two spaces, so the latency starts 5 bytes on.
+                // Three status digits sit between two spaces, so the latency starts 5 bytes on and
+                // runs to the LF.
+                let next = match feeds {
+                    0 => line_end(text, key_end + 5),
+                    _ => line + 39 + feeds.trailing_zeros() as usize,
+                };
                 // SAFETY: as above.
-                let (latency, digits) = unsafe { parse_latency(text, key_end + 5) };
+                let latency = unsafe { parse_latency(text, key_end + 5, next - 6 - key_end) };
                 // Short keys hash by their length alone: a load would hold more than the key, and there
                 // are very few of them.
                 // SAFETY: both start inside the piece, as `at` is at least 29.
@@ -299,7 +318,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
                 // SAFETY: `place` is inside a block this thread reserved, until it's aligned again.
                 unsafe { (*place).store(record, Relaxed) };
                 place = place.wrapping_add(1);
-                line = key_end + 6 + digits;
+                line = next;
             }
             pos += line;
         }

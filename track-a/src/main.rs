@@ -447,22 +447,6 @@ fn main() -> std::io::Result<()> {
     // Eight segments per thread balances the load. Tying the size to the thread count also makes
     // the SD_THREADS test sweep move every cut, down to cuts smaller than a line on tiny inputs.
     let size = (end / (threads * 8)).max(1);
-    {
-        // SAFETY: as for `base`.
-        let base = unsafe { mmap(std::ptr::null_mut(), keys_at + (1 << 22), 3, 0x4022, -1, 0) };
-        assert!(base as isize != -1);
-        // SAFETY: as for `arena`.
-        let arena =
-            unsafe { std::slice::from_raw_parts_mut(base.cast::<AtomicU32>(), HOURS * len) };
-        // SAFETY: as for `lines`.
-        let lines =
-            unsafe { std::slice::from_raw_parts(base.add(keys_at).cast::<Line>(), 1 << 16) };
-        let hours: Vec<Hour> = arena.chunks_mut(len).map(new_hour).collect();
-        let slots = [const { AtomicU16::new(0) }; SLOTS];
-        let table = (slots, AtomicUsize::new(1), lines);
-        let cursor = AtomicUsize::new(0);
-        on_threads(threads, || parse(&log, end, &table, &hours, &cursor, size));
-    }
     on_threads(threads, || parse(&log, end, &table, &hours, &cursor, size));
     let (keys, ids) = order_ids(&table);
     write_summary(file, &keys, &ids, hours, threads.min(8));

@@ -67,6 +67,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 45 | exp: 64 KiB pieces again, now that stack pages take no faults | 64 KiB pieces halve the reads but gained nothing before; if faults on the extra stack pages were the reason, this should show it | run-9969baf99d50 | 0.0249 | 11.1 | 79.3 |
 | 46 | 32 KiB pieces, to stay | 64 KiB gave T 0.0249 and M 11.1 even with no faults on the stack pages, so faults weren't why it gained nothing. Also tried and dropped, by hardware counters: listing only commas (cycles flat, S +9), counting long notes' quotes with masks (cycles +1%), prefetching rows (+1%) | superseded before it ran | — | — | — |
 | 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | pending | — | — | — |
+| 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | pending | — | — | — |
 
 ## Decision log
 
@@ -164,6 +165,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D46. 32 KiB is settled.
 
 **D47. A Fable agent's pipeline work. Local: instructions 296.7 -> 279.3, cycles about -3.5%, S 491 -> 530. Grid, sweep, constant-hash and 300 stress runs pass. What would change our minds: K below 40 over samples.
+
+**D48. A Fable agent's work on the name table. Local: L1 misses from L2 2.24 -> 1.24, from L3 0.30 -> 0.13, load waits -9 cycles, instructions +14, cycles about -1%, S +11. Keep only if T clearly beats 0.0232.
 
 ## What didn't work
 

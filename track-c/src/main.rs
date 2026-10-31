@@ -548,8 +548,25 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         };
         at.map(|position| position as usize)
     };
+    // The tags are the one load in a record's chain that the caches don't answer at once, and a
+    // thread's share of the core can't run far enough ahead to cover it, so each record's window is
+    // asked for a loop before its use, and the hash kept for that. The window may straddle two lines.
     for record in 0..records {
-        let [mut start, name_at, note_at, region_at, amount_at, _] = separators(record);
+        // SAFETY: the caller passes `records * 5 + 1` positions, `found` has room for every record,
+        // the window is inside the tags, and prefetching has no effect on memory anyway.
+        unsafe {
+            let position = |i| *listed.get_unchecked(record * 5 + i) as usize;
+            let (name_at, note_at) = (position(1), position(2));
+            let hash =
+                NameTable::hash(text, name_at + 1, (note_at - name_at - 1).saturating_sub(2));
+            let window = names.tags.as_ptr().add(names.home(hash) * GROUP);
+            _mm_prefetch::<_MM_HINT_T0>(window.cast());
+            _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
+            found.get_unchecked_mut(record)[0] = hash;
+        }
+    }
+    for record in 0..records {
+        let [mut start, name_at, _, region_at, amount_at, _] = separators(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
@@ -574,8 +591,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
             let region = (region as usize).min(REGION_IDS - 1);
             _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast());
-            let raw = (note_at - name_at - 1).saturating_sub(2);
-            let guess = names.guess_slot(NameTable::hash(text, name_at + 1, raw));
+            let guess = names.guess_slot(found.get_unchecked(record)[0]);
             *found.get_unchecked_mut(record) =
                 [guess, region, id as usize, cents as usize].map(|v| v as u32);
         }

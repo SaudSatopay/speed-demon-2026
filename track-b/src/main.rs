@@ -7,14 +7,16 @@
 //! table, and no posting of any of its terms is ever stored. Only queries anchored on a common term
 //! read postings afterwards: bitmaps for their common terms, set during the scan, and chains of 2-byte
 //! offsets for their other terms. Each occurrence of a phrase's rarest term checks the phrase around it
-//! when the document ends. Threads claim ranges of the corpus in order and scan a document at a time in
-//! stages without a branch per token: find the tokens, look them up, mark them, then act on what the
-//! marks listed. Then they answer the queries that read postings, and print all the answers in order.
+//! when the document ends. Threads claim ranges of the corpus in order, read them in small pieces, and
+//! scan a document at a time in stages without a branch per token: find the tokens, look them up, mark
+//! them, then act on what the marks listed. Then they answer the queries that read postings, and print
+//! all the answers in order.
 
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex};
 use std::thread;
@@ -53,8 +55,12 @@ const SAMPLE_BYTES: usize = 1 << 21;
 /// How many of a query's matching documents are printed.
 const SMALLEST: usize = 10;
 
-/// Readable zero bytes after each mapped file, so that block loads can run past its end.
+/// Readable bytes after each mapped file and after the text in a buffer, so that block loads can run
+/// past its end.
 const PADDING: usize = 4096;
+/// Bytes per read of the corpus: few enough to stay in the caches, many enough that a read costs little
+/// per document.
+const PIECE: usize = 1 << 17;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -62,9 +68,9 @@ unsafe extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
-/// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
-/// scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
-fn map_file(path: &str) -> io::Result<&'static [u8]> {
+/// Opens a file, and maps it read-only for the life of the process, followed by `PADDING` readable zero
+/// bytes. The scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
+fn map_file(path: &str) -> io::Result<(File, &'static [u8])> {
     let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
@@ -76,7 +82,7 @@ fn map_file(path: &str) -> io::Result<&'static [u8]> {
         let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
         let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
-        Ok(std::slice::from_raw_parts(base.cast(), len))
+        Ok((file, std::slice::from_raw_parts(base.cast(), len)))
     }
 }
 
@@ -85,7 +91,7 @@ fn map_file(path: &str) -> io::Result<&'static [u8]> {
 /// (spec section 2.2).
 fn block_masks(file: &[u8], pos: usize) -> (u64, u64) {
     assert!(pos + 64 <= file.len() + PADDING);
-    // SAFETY: the assert keeps the loads inside the mapping, they need no alignment, and the build
+    // SAFETY: the assert keeps the loads inside the mapping or buffer, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
         let byte_set = |byte: u8| _mm256_set1_epi8(byte as i8);
@@ -176,7 +182,7 @@ fn on_threads<R: Send>(threads: usize, work: impl Fn() -> R + Sync) -> Vec<R> {
 /// have it set.
 fn short_key(token: &[u8]) -> u64 {
     let len = token.len();
-    // SAFETY: a token is inside a mapping that continues for `PADDING` bytes past the file. The load
+    // SAFETY: a token is inside a mapping or buffer that continues for `PADDING` bytes past the text. The load
     // needs no alignment, and the build targets x86-64-v3, which has BMI2, whose BZHI keeps the given
     // number of low bits, or all of them if that's more than the width.
     unsafe {
@@ -352,7 +358,7 @@ fn parse_queries(text: &[u8]) -> Plan<'_> {
     terms.sets = empty_sets((text.len() / 32).next_power_of_two().max(1 << 10));
     terms.keys = vec![&[]; FIRST_TERM];
     list.reserve(text.len() / 32);
-    steps.reserve(text.len() / 8);
+    steps.reserve(text.len() / 10);
     let (mut edges, mut pending, mut pos, mut slots) = (vec![], vec![], 0, 0);
     while pos < text.len() {
         let line_feed = token_edges(text, pos, &mut edges);
@@ -385,32 +391,56 @@ fn parse_queries(text: &[u8]) -> Plan<'_> {
     plan
 }
 
-/// Visits the documents whose lines start in `start..end`, passing each one's id, its text and what
-/// follows, and its tokens' edges in that, then eight zeros, so that `look_up` can read four pairs at a
-/// time. A line belongs to the range holding its first byte.
-fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32, &[u8], &[u32])) {
-    let mut line = start;
-    while line > 0 && docs[line - 1] != b'\n' {
-        line += 1;
-    }
+/// What gets each document: its id, its line and what follows, and its tokens' edges in that.
+trait Visit: FnMut(u32, &[u8], &[u32]) {}
+impl<T: FnMut(u32, &[u8], &[u32])> Visit for T {}
+
+/// Visits the documents whose lines start in `start..end`, passing each one's id, its line and what
+/// follows, and its tokens' edges in that, after its id's, then eight zeros, so that `look_up` can read four
+/// pairs at a time. A line belongs to the range holding its first byte. The file comes in pieces, into a
+/// thread's small buffer that stays in the caches, where a mapping would take page faults and cache misses,
+/// and what a piece cuts short moves to the buffer's start, to go with the next piece.
+fn for_each_doc(docs: &File, start: usize, end: usize, room: &mut Vec<u8>, mut visit: impl Visit) {
+    // `at` is where the buffer's start is in the file. Reading starts a byte early and skips a line, as
+    // the range's first line starts after the first LF from there.
+    let (mut at, mut skip, mut kept) = (start.saturating_sub(1), start > 0, 0);
     // The range is rounded to whole words of 64 documents: it starts at its first document whose id
     // is a multiple of 64 and runs to the next range's, so threads never share a bitmap word.
     let (mut aligned, mut edges) = (false, Vec::new());
-    while line < docs.len() {
-        let (mut pos, mut id) = (line, 0);
-        while docs[pos] != b'\t' {
-            id = id * 10 + u32::from(docs[pos] - b'0');
-            pos += 1;
+    loop {
+        // A line longer than a piece gets a longer read, so that its length doesn't go quadratic.
+        let want = PIECE.max(kept);
+        room.resize(room.len().max(kept + want + PADDING), 0);
+        let piece = &mut room[kept..kept + want];
+        let got = docs.read_at(piece, (at + kept) as u64).unwrap();
+        let (filled, mut line) = (kept + got, 0);
+        // This ends the last line, and anything after it is ignored, whatever an earlier piece left there.
+        room[filled] = b'\n';
+        while line < filled {
+            let line_feed = token_edges(&room[..filled], line, &mut edges);
+            // A line that reaches the end of the text is whole only at the end of the file.
+            if line_feed == filled && got > 0 {
+                break;
+            }
+            if !std::mem::take(&mut skip) {
+                let digits = &room[line + edges[0] as usize..line + edges[1] as usize];
+                let id = digits.iter().fold(0, |id, d| id * 10 + u32::from(d - b'0'));
+                if id % 64 == 0 && at + line >= end {
+                    return;
+                }
+                aligned |= id % 64 == 0;
+                edges.extend([0; 8]);
+                if aligned {
+                    visit(id, &room[line..], &edges[2..]);
+                }
+            }
+            line = line_feed + 1;
         }
-        if id % 64 == 0 && line >= end {
+        if got == 0 {
             return;
         }
-        aligned |= id % 64 == 0;
-        line = token_edges(docs, pos + 1, &mut edges) + 1;
-        edges.extend([0; 8]);
-        if aligned {
-            visit(id, &docs[pos + 1..], &edges);
-        }
+        room.copy_within(line..filled, 0);
+        (at, kept) = (at + line, filled - line);
     }
 }
 
@@ -563,15 +593,15 @@ fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
 
 /// How many documents hold each term, among pieces of the corpus as big as `SAMPLE_BYTES` in all, and
 /// how many documents those pieces have.
-fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, u32) {
+fn sample_terms((docs, len): (&File, usize), terms: &TermTable, threads: usize) -> (Vec<u32>, u32) {
     let df: Vec<AtomicU32> = (0..terms.keys.len()).map(|_| AtomicU32::new(0)).collect();
     let (sampled_docs, next_piece) = (AtomicU32::new(0), AtomicUsize::new(0));
-    let piece = SAMPLE_BYTES.min(docs.len()) / threads;
+    let piece = SAMPLE_BYTES.min(len) / threads;
     on_threads(threads, || {
-        let start = next_piece.fetch_add(1, Relaxed) * (docs.len() / threads);
+        let start = next_piece.fetch_add(1, Relaxed) * (len / threads);
         // The low byte of the last document holding each term. A rare mistake only skews the guess.
-        let mut seen_in = vec![0u8; df.len()];
-        for_each_doc(docs, start, start + piece, |doc, text, edges| {
+        let (mut seen_in, mut room) = (vec![0u8; df.len()], Vec::new());
+        for_each_doc(docs, start, start + piece, &mut room, |doc, text, edges| {
             sampled_docs.fetch_add(1, Relaxed);
             for pair in edges[..edges.len() - 8].as_chunks::<2>().0 {
                 let term = terms.find_token(&text[pair[0] as usize..pair[1] as usize]) as usize;
@@ -627,6 +657,7 @@ fn number_terms(plan: &mut Plan, df: &[u32], store_of: &[usize], flags: &mut [u3
 fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u32]) {
     let keyed = anchored.iter().map(|&(t, p)| (new_number[t as usize], p));
     let (start, phrases) = group(plan.terms.keys.len(), keyed);
+    plan.phrase_start.reserve_exact(start.len());
     for range in start.windows(2) {
         plan.phrase_start.push(plan.phrases.len() as u32);
         for &(number, position) in &phrases[range[0] as usize..range[1] as usize] {
@@ -640,7 +671,7 @@ fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u
 
 /// Decides from the sample how each query is answered and how each term is stored, then lists what to
 /// check at each term's occurrences.
-fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
+fn make_plan(plan: &mut Plan, docs: (&File, usize), threads: usize) {
     let (df, sampled_docs) = sample_terms(docs, &plan.terms, threads);
     // A query anchored on a common term, with df above about N/24, is answered from postings: bitmaps
     // for its common terms and chains for the others. On memory alone, a bitmap (N/8 bytes) and a
@@ -793,7 +824,7 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut Lists) -> 
     let shift = 64 - terms.sets.len().trailing_zeros() as i32;
     for at in (0..count).step_by(4) {
         // SAFETY: `edges` has four pairs more than there are tokens, each at or before a token's start,
-        // whose load stays in the mapping as in `short_key`. Keys and places have room for three more.
+        // whose load stays in the buffer as in `short_key`. Keys and places have room for three more.
         // The set is in the table, and a prefetch has no other effect. The build targets x86-64-v3,
         // which has AVX2.
         unsafe {
@@ -958,7 +989,7 @@ fn check_phrases(ats: &[u32], tokens: &[u32], plan: &Plan, doc: u32, hits: &mut 
 /// replaces an unpredictable loop exit per anchor by one loop.
 #[inline(never)]
 fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mut Scan) {
-    let (hits, short) = (&mut scan.hits[..], &mut scan.short[..]);
+    let (hits, short) = (&mut scan.hits[..], &mut scan.short);
     let (checks, short_hits) = (plan.short_checks.as_ptr(), hits.as_ptr());
     let this_doc = (1 << SUM_BITS) + u64::from(doc);
     let lists = &plan.anchor_lists[..];
@@ -977,10 +1008,13 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
     for &term in anchors {
         prefetch(lists.as_ptr().wrapping_add(term as usize).cast());
     }
-    let (short_count, mut listed) = (plan.short_checks.len(), 0);
+    // Each anchor writes four, and one with more checks makes room for them when it comes to it. Room for
+    // all the checks there are would hold on to more than a megabyte over the threads.
+    let (short_count, mut listed, room) = (plan.short_checks.len(), 0, 4 * anchors.len() + 4);
+    short.resize(short.len().max(room), 0);
     for &term in anchors {
-        // SAFETY: `lists` has one entry more than there are terms, `short` has room for all the checks
-        // and four more, and an anchor's checks are all in `long_checks`.
+        // SAFETY: `lists` has one entry more than there are terms, `short` has room for this anchor's
+        // four and the other anchors' as well, and an anchor's checks are all in `long_checks`.
         unsafe {
             let (from, long_from, shared) = *lists.get_unchecked(term as usize);
             let (to, long_to, _) = *lists.get_unchecked(term as usize + 1);
@@ -988,8 +1022,11 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
             prefetch(short_hits.wrapping_add(from as usize).cast());
             let at = _mm_add_epi32(_mm_set1_epi32(from as i32), _mm_setr_epi32(0, 1, 2, 3));
             _mm_storeu_si128(short.as_mut_ptr().add(listed).cast(), at);
-            for at in from + 4..to {
-                short[listed + (at - from) as usize] = at;
+            if to > from + 4 {
+                short.resize(short.len().max(listed + (to - from) as usize + room), 0);
+                for at in from + 4..to {
+                    short[listed + (at - from) as usize] = at;
+                }
             }
             listed += (to - from) as usize;
             add(1, shared as usize);
@@ -1007,27 +1044,28 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
 }
 
 /// Claims ranges of the corpus until none is left, and scans them.
-fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicUsize) -> Scan {
+fn scan_ranges((docs, len): (&File, usize), plan: &Plan, size: usize, next: &AtomicUsize) -> Scan {
     let mut scan = Scan::default();
     scan.hits.resize(plan.slot_of.len(), 0);
     scan.chains = vec![(NONE, BLOCK_POSTINGS as u32, 0); plan.list_count];
-    scan.short = vec![0; plan.short_checks.len() + 4];
     let mut present = vec![0u8; plan.terms.keys.len()];
     let chain_from = FIRST_TERM + plan.bitmap_count.next_multiple_of(64);
     let start = plan.bitmaps.as_ptr().cast();
     // SAFETY: AtomicU64 has the layout of u64, and nothing else uses the bitmaps during the scan.
     let bitmaps: &[AtomicU64] = unsafe { std::slice::from_raw_parts(start, plan.bitmaps.len()) };
-    let mut lists = Lists::default();
+    let (mut lists, mut room) = (Lists::default(), Vec::new());
     loop {
-        let start = next_range.fetch_add(range_size, Relaxed);
-        if start >= docs.len() {
+        let start = next.fetch_add(size, Relaxed);
+        if start >= len {
             return scan;
         }
-        for_each_doc(docs, start, start + range_size, |doc, text, edges| {
+        for_each_doc(docs, start, start + size, &mut room, |doc, text, edges| {
             let count = edges.len() / 2 - 4;
             if lists.1[0].len() < count + 4 {
-                lists.0.iter_mut().for_each(|l| l.resize(count + 4, 0));
-                lists.1.iter_mut().for_each(|l| l.resize(count + 4, 0));
+                // A document has about a thousand tokens at most, and doubling would leave more room.
+                let fits = (count + 4).max(1100);
+                lists.0.iter_mut().for_each(|l| l.resize(fits, 0));
+                lists.1.iter_mut().for_each(|l| l.resize(fits, 0));
             }
             let [marked, phrases] = look_up(&plan.terms, text, edges, &mut lists);
             let [tokens, _, marks, phrase_at, bool_terms, chained] = &mut lists.0;
@@ -1246,10 +1284,12 @@ fn main() -> io::Result<()> {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let threads = thread_count();
-    let docs = map_file(&format!("{data_dir}/docs.txt"))?;
-    let mut plan = parse_queries(map_file(&format!("{data_dir}/queries.txt"))?);
+    // The mapping only gives the corpus's length and its last line.
+    let (input, mapped) = map_file(&format!("{data_dir}/docs.txt"))?;
+    let docs = (&input, mapped.len());
+    let mut plan = parse_queries(map_file(&format!("{data_dir}/queries.txt"))?.1);
     make_plan(&mut plan, docs, threads);
-    plan.words = document_count(docs).div_ceil(64);
+    plan.words = document_count(mapped).div_ceil(64);
     assert!(plan.words * 64 < 1 << (SUM_BITS / 2), "too many documents");
     plan.bitmaps = vec![0; plan.bitmap_count * plan.words];
     // One thread touches each 2 MiB, as otherwise threads racing to fault in the same huge page each
@@ -1260,7 +1300,7 @@ fn main() -> io::Result<()> {
     }
     let file = File::create(format!("{out_dir}/results.txt"))?;
     // Enough ranges that a thread slowed for a while doesn't hold the others up.
-    let range_size = (docs.len() / (threads * RANGES_PER_THREAD)).max(1);
+    let range_size = (mapped.len() / (threads * RANGES_PER_THREAD)).max(1);
     let claimed = AtomicUsize::new(0);
     let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
     total_hits(&scans, &mut plan);

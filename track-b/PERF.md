@@ -37,6 +37,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 14 | The same design in 960 lines: a plan that owns everything, one counting sort for all lists | S 1325 cost 5% of K against the leader's 782, and most of it was structure and formatting, not features | pending | — | — | — |
 | 15 | exp: read the corpus in 128 KiB pieces, linked statically | On C, reading in pieces beat mmap on the box, though local timing couldn't tell | pending | — | — | — |
 | 16 | exp: 32 KiB pieces in place of 128 KiB | 128 KiB gave T 0.1047, 0.1037 and 0.1033 against 0.1045, 0.1041 and 0.1045 with mmap, flat for 23 more lines | pending | — | — | — |
+| 17 | Back to mapping the corpus, linked statically | Reading in pieces gained nothing on B: T 0.1033 to 0.1051 against 0.1041 to 0.1045 mapped, for 18 to 23 more lines | pending | — | — | — |
 
 ## Decision log
 
@@ -73,6 +74,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D16. Experiment. Locally: page faults 4091 -> 428, thread cycles 2.55G -> 2.44G, sys CPU 38 -> 60 ms, wall flat, S 964 -> 987. Hyper-V inflates both faults and syscalls here, so the board decides, against T 0.1045 at S 964. Static linking saves 0.25 ms from exec to main.
 
 **D17. Experiment: the other piece size, before deciding. On A and C, 32 KiB is what paid. If this isn't clearly better either, B goes back to mmap, which has fewer lines.
+
+**D18. Decided by the board. B's time is its user code, unlike A and C, where faults mattered. Mapped, S 964. The static link stays, as it saves 0.25 ms from exec to main.
 
 ## What didn't work
 

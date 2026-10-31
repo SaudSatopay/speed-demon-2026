@@ -29,6 +29,7 @@ type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
     fn pthread_attr_init(attr: *mut Attr) -> i32;
     fn pthread_attr_setstack(attr: *mut Attr, stack: *mut u8, len: usize) -> i32;
     fn pthread_create(id: *mut u64, attr: *const Attr, start: Start, arg: *mut u8) -> i32;
@@ -140,7 +141,7 @@ const REGION_IDS: usize = 1 << 20;
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 80 << 10;
+const STACK: usize = 68 << 10;
 /// Words per slot, which is one cache line: four words of key, then 256 bits that end in a header.
 const SLOT_WORDS: usize = 8;
 /// Slots per group. A name's home is a group, and it may sit there or in the next one.
@@ -187,8 +188,8 @@ impl<'a> NameTable<'a> {
         let tags = (slots / GROUP + 1) * GROUP;
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
-        let bytes = stacks_at + threads * STACK;
-        let (read_write, private_anonymous, huge_page) = (3, 0x22, 1 << 21);
+        let bytes = stacks_at + (threads - 1) * STACK;
+        let (read_write, private_anonymous, huge_page, no_huge_pages) = (3, 0x22, 1 << 21, 15);
         let (mut allowed, mut here) = ([0u64; 16], [0u64; 16]);
         // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
         // so the parts don't overlap, and zero is a valid value of each atomic. The CPU sets are the
@@ -208,6 +209,12 @@ impl<'a> NameTable<'a> {
             );
             assert!(at as isize != -1);
             let base = at.add(at.align_offset(huge_page));
+            // Past the last whole huge page: whether it could hold another depends on the address.
+            madvise(
+                base.add(bytes / huge_page * huge_page),
+                huge_page,
+                no_huge_pages,
+            );
             for page in (0..bytes).step_by(4096) {
                 base.add(page).write_volatile(0);
             }

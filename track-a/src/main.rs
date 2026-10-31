@@ -461,6 +461,22 @@ fn main() -> std::io::Result<()> {
     // Eight segments per thread balances the load. Tying the size to the thread count also makes
     // the SD_THREADS test sweep move every cut, down to cuts smaller than a line on tiny inputs.
     let size = (end / (threads * 8)).max(1);
+    // A pass that only reads, for the board to time. It takes the same 32 KiB pieces as the parse, and
+    // keeps a checksum so that nothing can drop the reads.
+    let next_piece = AtomicUsize::new(0);
+    on_threads(threads, || {
+        let mut piece = vec![0u8; 1 << 15];
+        let mut sum = 0u8;
+        loop {
+            let at = next_piece.fetch_add(piece.len(), Relaxed);
+            if at >= end {
+                break;
+            }
+            std::os::unix::fs::FileExt::read_at(&log, &mut piece, at as u64).unwrap();
+            sum ^= piece[0];
+        }
+        std::hint::black_box(sum);
+    });
     on_threads(threads, || parse(&log, end, &table, &hours, &cursor, size));
     let (keys, ids) = order_ids(&table);
     write_summary(file, &keys, &ids, hours, threads.min(8));

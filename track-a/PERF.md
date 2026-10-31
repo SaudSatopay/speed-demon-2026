@@ -56,6 +56,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 34 | exp: parse the whole log twice, to measure the parse on the box | Local timing has misled us on A twice, and nothing measures the box's split between parse and output | pending | — | — | — |
 | 35 | Back to one parse | The measurement of step 32 is done | pending | — | — | — |
 | 36 | Long keys compared by block, ids from each key's first line, a smaller table, group ends found once | Parse is 71% of T on the box, and 13.7% of lines took the table's slow path, for long keys or keys away from their home slot | pending | — | — | — |
+| 37 | exp: read the whole log once before the parse, to time the copy on the box | 16% fewer user cycles left T at 0.0244, so user code isn't what bounds the parse there | pending | — | — | — |
 
 ## Decision log
 
@@ -127,6 +128,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D28. Revert the experiment.
 
 **D29. Take the slow path away. Keys over a block compare by blocks; a key's id is its first line in the key arena, in a table of 2^14 slots, so far fewer keys sit away from home; group ends come from one scan. On seed 1, 12 threads: instructions 601M -> 535M, mispredicts 1.28M -> 0.94M, user cycles 389M -> 325M, paired wall -6.4%, M flat, S 289 -> 299 by scc. Grid 44/44, threads 234/234, const-hash 44/44, stress 0 wrong in 300.
+
+**D30. Measurement only. T minus T without the pass is the wall time of copying 238 MB in 32 KiB pieces on 12 threads. If it's most of the parse's 17.5 ms, the limit is the memory path. Reverted in the next push.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

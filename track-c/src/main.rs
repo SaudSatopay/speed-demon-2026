@@ -44,10 +44,12 @@ fn load_u64(file: &[u8], pos: usize) -> u64 {
     unsafe { file.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
-/// Asks for the cache line holding `item`, so that a later access doesn't stall on it.
-fn prefetch<T>(item: &T) {
+/// Asks for the cache line holding `item`, so that a later access doesn't stall on it. `_MM_HINT_ET0`
+/// asks to own the line, for a write: a locked update then needs no second trip to take it from the
+/// core that wrote it last.
+fn prefetch<const HINT: i32, T>(item: &T) {
     // SAFETY: prefetching has no effect on memory, and the reference is valid anyway.
-    unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) }
+    unsafe { _mm_prefetch::<HINT>(std::ptr::from_ref(item).cast()) }
 }
 
 /// One bit per byte of the 64 at `pos`, set where there's a double quote.
@@ -176,7 +178,7 @@ impl<'a> NameTable<'a> {
             hits = Self::matches(self.tags[group].load(Relaxed), hash);
         }
         let slot = group * GROUP + (hits.trailing_zeros() as usize / 8 & 7);
-        prefetch(&self.words[self.first + slot * SLOT_WORDS]);
+        prefetch::<_MM_HINT_ET0, _>(&self.words[self.first + slot * SLOT_WORDS]);
     }
 
     /// Whether this taken slot holds the name. Its writer may not have finished with it yet.
@@ -233,7 +235,9 @@ impl<'a> NameTable<'a> {
         };
         let word = &self.words[base + 4 + country / 64];
         let bit = 1u64 << (country % 64);
-        word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0
+        // Nine records in ten set a new bit, so a plain load first would rarely save the locked OR,
+        // and the prefetch has already asked to own the line.
+        word.fetch_or(bit, Relaxed) & bit == 0
     }
 }
 
@@ -334,7 +338,7 @@ fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, 
         });
         let hash = if cfg!(sd_const_hash) { 0 } else { hash };
         names.prefetch_slot(hash);
-        prefetch(&regions[region]);
+        prefetch::<_MM_HINT_T0, _>(&regions[region]);
         batch[count] = (id, cents, region, name, note.2, key_words, hash);
         count += 1;
         if count == batch.len() {

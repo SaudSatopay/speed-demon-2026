@@ -32,6 +32,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 10 | Thirty-two input segments per thread | Smaller chunks keep worker finishes closer and reduce the tail | run-39305ec9b1ed | 0.044 | 23.5 | 71.1 |
 | 11 | Touch one word per 2 MiB table extent before workers | Avoid racing to first-fault shared THP extents | run-a906ff073a9f | 0.043 | 11.8 | 74.4 |
 | 12 | Line cuts after the tag table landed: helpers merged, region table fixed at the spec's 1 MiB, no early exit from a full table | S 348 -> 294 for K about +2.6%, with 461.8 -> 455.9 instructions and 1.45 mispredicts per record flat, and a 21-pair local A/B at -0.1% | pending | — | — | — |
+| 13 | exp: the slot line is prefetched with intent to write (`+prfchw`, `_MM_HINT_ET0`), and `mark` does one locked OR instead of a load and an OR | Nine records in ten set a new bit on a line another core wrote last. A read prefetch leaves the line shared, so the locked OR paid a second cross-core trip to own it, and the plain load before it rarely saved anything. counts.sh sample 455.9 -> 453.4 instructions and 1.45 -> 1.43 mispredicts per record; quick 59/59, threads 324/324, constant-hash 29/29; S unchanged; local ab.sh -2.5 to -3.2%, inside its noise, so the board decides | pending | — | — | — |
 
 ## Decision log
 
@@ -59,6 +60,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D9. Tags instead of probing. Context: linear probing at this load touched 2.53 slot lines per lookup, and every insert updated a shared counter. Chose a word of 8 tag bytes per group, so a lookup goes straight to the slot's line and a full group spills into the next. No counter: a pass gives up only when a search has seen every group full. The table starts at 110,000 slots for the spec's pool of 100,000 names, and more names than slots still restart with a bigger table.
 
 **D10. Fewer lines, same hot path. Context: the tag table and first-touch took S from 317 to 348. Chose to merge helpers and drop what the spec rules out. A file with more names than slots now finishes its pass before restarting, which only costs time in that case.
+
+**D11. Prefetch the slot line for writing. Context: PREFETCHW was tried once with inline assembly (-3.6% locally, inside 16% noise, for 5 lines) and dropped. The `+prfchw` target feature, which the box's i5-13500 has, makes it one hint constant and no lines, and the locked OR then needs no plain load first. Evidence: `prefetchw` in the binary; counts.sh 455.9 -> 453.4 instructions and 1.45 -> 1.43 mispredicts per record; all grids pass. What would change our minds: no gain on the board over two runs, since local timing can't see a cross-core effect on this one-CCD PC.
 
 ## What didn't work
 

@@ -1,63 +1,98 @@
 //! Track C (Join): aggregates per country, from a hostile CSV joined against a region table.
 //!
-//! Threads claim segments of the mapped file from an atomic cursor. Segments are cut just after a
-//! CRLF, because the spec promises that a CR appears nowhere else, so that is always a record
-//! boundary, and no quote counting is needed. Inside a segment the parser has two stages, because a
-//! parser that finds each field from the end of the last one is limited by that chain of loads, not
-//! by its instructions. The first stage walks fixed 64-byte blocks, and lists every comma and line end
-//! outside quotes. The second reads each record's fields from its five listed positions, and no record
-//! waits for the one before it. Nothing is unescaped: a quoted field's raw bytes, with its `""` pairs
-//! intact, encode its value one to one, and the value's length follows from counting its quotes. Each
-//! thread sums into its own rows. One shared table counts the distinct names per country, and a chunk
-//! of records has its cache lines prefetched before any of it is added up.
+//! Threads claim segments of the file from a shared cursor. Segments are cut just after a CRLF,
+//! because the spec promises that a CR appears nowhere else, so that is always a record boundary, and
+//! no quote counting is needed. A thread reads its segment in small pieces into its own buffer, which
+//! stays in its caches, needs no page mapped and is no more memory than the page tables would be.
+//! Inside a piece the parser has two stages, because a parser that finds each field from the end of
+//! the last one is limited by that chain of loads, not by its instructions. The first stage walks
+//! fixed 64-byte blocks, and lists every comma and line end outside quotes. The second reads each
+//! record's fields from its five listed positions, and no record waits for the one before it. Nothing
+//! is unescaped: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one,
+//! and the value's length follows from counting its quotes. Each thread sums into its own rows. One
+//! shared table counts the distinct names per country, and a chunk of records has its cache lines
+//! prefetched before any of it is added up.
 
 use std::io::{self, BufWriter, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, os::fd::AsRawFd, ptr::null_mut, thread};
+use std::{arch::x86_64::*, fs::File, os::unix::fs::FileExt, thread};
 
-// Declared by hand to keep the crate at zero dependencies; std already links glibc.
-unsafe extern "C" {
-    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
+/// Zero bytes after the text in a buffer, so that block loads can run past its end.
+const PADDING: usize = 128;
+/// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
+const PIECE: usize = 1 << 15;
+
+/// An input file, read in parts.
+struct Input {
+    file: File,
+    len: usize,
 }
 
-/// Readable zero bytes after each mapped file, so that block loads can run past its end.
-const PADDING: usize = 4096;
+impl Input {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        Ok(Input { file, len })
+    }
 
-/// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
-/// scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
-fn map_file(path: &str) -> io::Result<&'static [u8]> {
-    let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
-    let file = File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    // SAFETY: the first call reserves fresh zero pages, and the second maps the file over the start
-    // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
-    // dataset while we run.
-    unsafe {
-        let base = mmap(null_mut(), len + PADDING, read, private | anonymous, -1, 0);
-        let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
-        assert!(base as isize != -1 && (mapped == base || len == 0));
-        Ok(std::slice::from_raw_parts(base.cast(), len))
+    /// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
+    /// file. In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2),
+    /// so it's never inside quotes, and about half the records end in one, so it's never far. A file
+    /// without one simply doesn't get split.
+    fn boundary(&self, mut pos: usize, terminator: &[u8]) -> usize {
+        let mut bytes = [0; 512];
+        while let Some(read) = self
+            .file
+            .read_at(&mut bytes, pos as u64)
+            .ok()
+            .filter(|&n| n > 0)
+        {
+            if let Some(at) = bytes[..read].iter().position(|&c| c == terminator[0]) {
+                return pos + at + terminator.len();
+            }
+            pos += read;
+        }
+        self.len
+    }
+
+    /// Where part `at` of `parts` starts and ends. The first boundary in a file ends its header.
+    fn part(&self, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
+        let size = self.len.div_ceil(parts).max(1);
+        let cut = |at: usize| self.boundary((at * size).min(self.len), terminator);
+        (cut(at), cut(at + 1))
+    }
+
+    /// Reads `pos..end` to the start of `buffer`, with `PADDING` zeros after them.
+    fn read<'a>(&self, pos: usize, end: usize, buffer: &'a mut Vec<u8>) -> &'a [u8] {
+        let len = end - pos;
+        if buffer.len() < len + PADDING {
+            buffer.resize(len + PADDING, 0);
+        }
+        self.file
+            .read_exact_at(&mut buffer[..len], pos as u64)
+            .unwrap();
+        buffer[len..len + PADDING].fill(0);
+        buffer
     }
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
 ///
 /// # Safety
-/// `pos + 8` must be at most `file.len() + PADDING`. The hot path can't afford a check per load, so
-/// its callers bound their positions once instead.
-unsafe fn load_u64(file: &[u8], pos: usize) -> u64 {
-    // SAFETY: the caller keeps the load inside the mapping, and the load needs no alignment.
-    unsafe { file.as_ptr().add(pos).cast::<u64>().read_unaligned() }
+/// `pos + 8` must be inside `text`. The hot path can't afford a check per load, so its callers bound
+/// their positions once instead.
+unsafe fn load_u64(text: &[u8], pos: usize) -> u64 {
+    // SAFETY: the caller keeps the load inside the buffer, and the load needs no alignment.
+    unsafe { text.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
 /// One bit per byte of the 64 at `pos`, set where the byte is `first` or `second`.
 ///
 /// # Safety
-/// `pos + 64` must be at most `file.len() + PADDING`.
-unsafe fn byte_mask(file: &[u8], pos: usize, first: u8, second: u8) -> u64 {
-    // SAFETY: the caller keeps both loads inside the mapping, they need no alignment, and the build
+/// `pos + 64` must be inside `text`.
+unsafe fn byte_mask(text: &[u8], pos: usize, first: u8, second: u8) -> u64 {
+    // SAFETY: the caller keeps both loads inside the buffer, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
         let is = |byte| _mm256_set1_epi8(byte as i8);
@@ -69,7 +104,7 @@ unsafe fn byte_mask(file: &[u8], pos: usize, first: u8, second: u8) -> u64 {
             );
             _mm256_movemask_epi8(either) as u32
         };
-        let at = file.as_ptr().add(pos).cast::<__m256i>();
+        let at = text.as_ptr().add(pos).cast::<__m256i>();
         u64::from(mask(at)) | u64::from(mask(at.add(1))) << 32
     }
 }
@@ -95,28 +130,9 @@ fn parse_three(words: [u64; 3]) -> [u64; 3] {
     }
 }
 
-/// How many bits of `word` the digits at its bottom fill, with the digits moved to its top. Ids and
-/// region ids have at most 8 digits (spec sections 2.2 and 3), so one 8-byte load settles them:
-/// digits have bit 4 set, and commas and line ends don't, so the first clear bit marks the end, with
-/// no loop to mispredict.
-fn digits_of(word: u64) -> (u64, u32) {
-    let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
-    (word << (64 - bits), bits)
-}
-
-/// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the file.
-/// In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2), so it's
-/// never inside quotes, and about half the records end in one, so it's never far. A file without one
-/// simply doesn't get split.
-fn next_boundary(file: &[u8], pos: usize, terminator: &[u8]) -> usize {
-    let at = file[pos..].iter().position(|&c| c == terminator[0]);
-    at.map_or(file.len(), |at| pos + at + terminator.len())
-}
-
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1 << 20;
-
 /// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
@@ -136,11 +152,12 @@ static KEY_MASKS: [u64; 7] = [!0, !0, !0, 0, 0, 0, 0];
 /// has seen this name. The tags, one byte per slot, zero while it's free and then 8 bits of the hash
 /// of its name, say which slot to open, so a lookup costs one cache miss, with no probing through
 /// other names' lines. One vector holds two groups' tags, so a name in its home group or the next
-/// costs the same, with no branch. Full ones spill two groups on. Names are compared in full, and never unescaped: the raw bytes encode the value one to one. The slots are
-/// insert-only: a key's words are written before its header is published and never again, so whoever
-/// sees the header may read them as plain memory.
+/// costs the same, with no branch. Full ones spill two groups on. Names are compared in full, and
+/// never unescaped: the raw bytes encode the value one to one. The slots are insert-only: a key's
+/// words are written before its header is published and never again, so whoever sees the header may
+/// read them as plain memory.
 struct NameTable<'a> {
-    file: &'a [u8],
+    records: &'a Input,
     words: Vec<AtomicU64>,
     tags: Vec<AtomicU8>,
     regions: Vec<AtomicU8>,   // The join table, country indices by region id.
@@ -152,7 +169,7 @@ struct NameTable<'a> {
 }
 
 impl<'a> NameTable<'a> {
-    fn new(file: &'a [u8], slots: usize) -> Self {
+    fn new(records: &'a Input, slots: usize) -> Self {
         let tags = (slots / GROUP + 1) * GROUP;
         // These are fresh zero pages from the system, untouched until a thread needs them.
         let words: Vec<_> = vec![0u64; tags * SLOT_WORDS + 8]
@@ -161,7 +178,7 @@ impl<'a> NameTable<'a> {
             .collect();
         let bytes = |len| vec![0u8; len].into_iter().map(AtomicU8::new).collect();
         NameTable {
-            file,
+            records,
             first: words.as_ptr().align_offset(64),
             words,
             tags: bytes(tags),
@@ -173,20 +190,23 @@ impl<'a> NameTable<'a> {
         }
     }
 
-    /// Fills the join table from the region lines in `pos..end`.
-    fn parse_regions(&self, file: &[u8], mut pos: usize, end: usize) {
-        while pos < end {
-            // SAFETY: `pos` is inside the file, and the padding covers the load.
-            let (word, bits) = digits_of(unsafe { load_u64(file, pos) });
+    /// Fills the join table from `len` bytes of whole region lines. Ids have at most 8 digits (spec
+    /// section 2.3): digits have bit 4 set, and commas don't, so the first clear bit marks the end.
+    fn parse_regions(&self, text: &[u8], len: usize) {
+        let mut pos = 0;
+        while pos < len {
+            // SAFETY: `pos` is inside the text, and the padding covers the load.
+            let word = unsafe { load_u64(text, pos) };
+            let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
+            let [id, ..] = parse_three([word << (64 - bits), 0, 0]);
             pos += bits as usize / 8 + 1;
-            let [id, ..] = parse_three([word, 0, 0]);
-            let code = (0..3).fold(0, |code, i| code * 26 + usize::from(file[pos + i] - b'A'));
+            let code = (0..3).fold(0, |code, i| code * 26 + usize::from(text[pos + i] - b'A'));
             let index = &self.index_of[code];
             if index.load(Relaxed) == 0 {
                 let mut keys = self.keys.lock().unwrap();
                 if index.load(Relaxed) == 0 {
                     index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
-                    keys.push(String::from_utf8_lossy(&file[pos..pos + 3]).into_owned());
+                    keys.push(String::from_utf8_lossy(&text[pos..pos + 3]).into_owned());
                 }
             }
             self.regions[id as usize].store(index.load(Relaxed), Relaxed);
@@ -199,14 +219,14 @@ impl<'a> NameTable<'a> {
     /// more can keep extra bytes. That's still the same word for the same name, and the key decides
     /// anyway. A test build swaps this for a constant, so that every key collides and any logic that
     /// trusts a hash without comparing the key shows up as a wrong answer.
-    fn hash(&self, start: usize, len: usize) -> u32 {
+    fn hash(text: &[u8], start: usize, len: usize) -> u32 {
         if cfg!(sd_const_hash) {
             return 0;
         }
-        // SAFETY: a name starts inside the file and the padding covers the load. BZHI is in BMI2 and
+        // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
         // CRC32 in SSE4.2, and x86-64-v3 includes both.
         unsafe {
-            let head = _bzhi_u64(load_u64(self.file, start), 8 * len as u32);
+            let head = _bzhi_u64(load_u64(text, start), 8 * len as u32);
             _mm_crc32_u64(len as u64, head) as u32
         }
     }
@@ -255,9 +275,9 @@ impl<'a> NameTable<'a> {
     ///
     /// # Safety
     /// `base` must be where a slot's words start.
-    unsafe fn holds(&self, base: usize, start: usize, len: usize) -> bool {
+    unsafe fn holds(&self, base: usize, text: &[u8], start: usize, len: usize) -> bool {
         // SAFETY: the slot is inside the table. Its header shows the key words were published, so they
-        // no longer change. The name starts inside the file and the padding covers the load. Its
+        // no longer change. The name starts inside the text and the padding covers the load. Its
         // length is at most `INLINE_BYTES` there, which keeps the mask's load inside the table.
         // x86-64-v3 has AVX2.
         unsafe {
@@ -266,21 +286,24 @@ impl<'a> NameTable<'a> {
                 return false;
             }
             if len > INLINE_BYTES {
-                let at = (*stored).load(Relaxed) as usize;
-                return self.file[at..at + len] == self.file[start..start + len];
+                let mut other = vec![0; len];
+                let at = (*stored).load(Relaxed);
+                self.records.file.read_exact_at(&mut other, at).unwrap();
+                return other == text[start..start + len];
             }
             let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
-            let name = at(self.file.as_ptr().add(start));
+            let name = at(text.as_ptr().add(start));
             let mask = at(KEY_MASKS.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
             _mm256_testz_si256(_mm256_xor_si256(name, at(stored.cast())), mask) == 1
         }
     }
 
-    /// Finds the name's slot, or takes a free one for it. Only a wrong guess or a new name comes here.
-    /// When every slot is taken it gives up, and `aggregate` throws the whole pass away.
+    /// Finds the name's slot, or takes a free one for it, given where the text is in the file. Only a
+    /// wrong guess or a new name comes here. When every slot is taken it gives up, and `aggregate`
+    /// throws the whole pass away.
     #[cold]
-    fn find(&self, start: usize, len: usize) -> Option<usize> {
-        let hash = self.hash(start, len);
+    fn find(&self, text: &[u8], text_at: usize, start: usize, len: usize) -> Option<usize> {
+        let hash = Self::hash(text, start, len);
         let mut group = self.home(hash);
         let mut spills = 0;
         while spills < self.groups {
@@ -294,7 +317,7 @@ impl<'a> NameTable<'a> {
                 let base = self.base(group, hits.trailing_zeros());
                 while self.words[base + 3].load(Acquire) == 0 {}
                 // SAFETY: `base` is where a slot's words start.
-                if unsafe { self.holds(base, start, len) } {
+                if unsafe { self.holds(base, text, start, len) } {
                     return Some(base);
                 }
                 hits &= hits - 1;
@@ -318,11 +341,11 @@ impl<'a> NameTable<'a> {
             {
                 let base = self.base(group, at);
                 let stored = &self.words[base..base + 4];
-                // SAFETY: the name starts inside the file, and the padding covers the loads.
-                let word = |i| unsafe { load_u64(self.file, start + 8 * i) };
+                // SAFETY: the name starts inside the text, and the padding covers the loads.
+                let word = |i| unsafe { load_u64(text, start + 8 * i) };
                 (0..3).for_each(|i| stored[i].store(word(i), Relaxed));
                 if len > INLINE_BYTES {
-                    stored[0].store(start as u64, Relaxed);
+                    stored[0].store((text_at + start) as u64, Relaxed);
                 }
                 stored[3].store(len as u64 + 1, Release);
                 return Some(base);
@@ -336,13 +359,21 @@ impl<'a> NameTable<'a> {
     ///
     /// # Safety
     /// `guess` must be where a slot's words start, and `country` below 256.
-    unsafe fn mark(&self, guess: usize, start: usize, len: usize, country: usize) -> bool {
+    unsafe fn mark(
+        &self,
+        guess: usize,
+        text: &[u8],
+        text_at: usize,
+        start: usize,
+        len: usize,
+        country: usize,
+    ) -> bool {
         // SAFETY: the caller's promises, and `find` returns where a slot's words start. Its 256 bits
         // start 4 words in.
         unsafe {
-            let base = if self.holds(guess, start, len) {
+            let base = if self.holds(guess, text, start, len) {
                 guess
-            } else if let Some(base) = self.find(start, len) {
+            } else if let Some(base) = self.find(text, text_at, start, len) {
                 base
             } else {
                 return false;
@@ -378,62 +409,88 @@ const BLOCKS: usize = 16;
 const LISTED: usize = BLOCKS * 64 + 16;
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(pos: usize, end: usize, names: &NameTable, rows: &mut Rows) {
-    let file = names.file;
-    // The positions of commas and line ends outside quotes, after the line end before the first of
-    // them, so a record's five come after its start. Positions fit 32 bits: the file is far below 4 GB
-    // (spec section 5).
-    let (mut listed, mut count, mut looked_up) = ([0u32; LISTED], 1, [[0u32; 4]; LISTED / 5]);
-    listed[0] = pos as u32 - 1;
-    let (mut scan, mut odd_so_far) = (pos, 0);
-    while scan < end {
-        for _ in 0..BLOCKS.min((end - scan).div_ceil(64)) {
-            // SAFETY: `scan` is inside the file and the padding covers a block. PCLMULQDQ is in the
-            // build's target features. The carry-less multiply by all ones gives each bit the parity
-            // of the quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels
-            // out. `count` stays below `LISTED - 8`, as the chunk holds at most `BLOCKS` blocks.
-            unsafe {
-                let quotes = byte_mask(file, scan, b'"', b'"');
-                let ones = _mm_set1_epi8(-1);
-                let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
-                let odd = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
-                odd_so_far = (odd as i64 >> 63) as u64;
-                let mut found = byte_mask(file, scan, b',', b'\n') & !odd;
-                let total = found.count_ones() as usize;
-                // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
-                // writes 8 whatever the number, and moves on by the right amount.
-                let out = listed.as_mut_ptr().add(count);
-                for i in 0..8 {
-                    *out.add(i) = scan as u32 + found.trailing_zeros();
-                    found &= found.wrapping_sub(1);
+fn parse_records(
+    mut pos: usize,
+    end: usize,
+    names: &NameTable,
+    rows: &mut Rows,
+    buffer: &mut Vec<u8>,
+) {
+    // The positions just past commas and line ends outside quotes, after a record's start, so a
+    // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
+    let (mut listed, mut looked_up) = ([0u32; LISTED], [[0u32; 4]; LISTED / 5]);
+    let mut piece = PIECE;
+    while pos < end {
+        let len = piece.min(end - pos);
+        let text = names.records.read(pos, pos + len, buffer);
+        // A piece starts at a record's start, so outside quotes.
+        let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
+        listed[0] = 0;
+        while scan < len {
+            for _ in 0..BLOCKS.min((len - scan).div_ceil(64)) {
+                // SAFETY: `scan` is inside the text and the padding covers a block. PCLMULQDQ is in
+                // the build's target features. The carry-less multiply by all ones gives each bit the
+                // parity of the quotes up to it, and that's odd exactly inside quotes, since a `""`
+                // pair cancels out. `count` stays below `LISTED - 8`, as a chunk has `BLOCKS` blocks.
+                unsafe {
+                    let quotes = byte_mask(text, scan, b'"', b'"');
+                    let ones = _mm_set1_epi8(-1);
+                    let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
+                    let odd = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
+                    odd_so_far = (odd as i64 >> 63) as u64;
+                    let mut found = byte_mask(text, scan, b',', b'\n') & !odd;
+                    let total = found.count_ones() as usize;
+                    // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so
+                    // this writes 8 whatever the number, and moves on by the right amount.
+                    let out = listed.as_mut_ptr().add(count);
+                    for i in 0..8 {
+                        *out.add(i) = scan as u32 + found.trailing_zeros() + 1;
+                        found &= found.wrapping_sub(1);
+                    }
+                    for i in 8..total {
+                        *out.add(i) = scan as u32 + found.trailing_zeros() + 1;
+                        found &= found - 1;
+                    }
+                    count += total;
                 }
-                for i in 8..total {
-                    *out.add(i) = scan as u32 + found.trailing_zeros();
-                    found &= found - 1;
-                }
-                count += total;
+                scan += 64;
             }
-            scan += 64;
+            // The final record may have no terminator (spec section 2.1).
+            if scan >= len && pos + len == names.records.len && count % 5 == 0 {
+                listed[count] = len as u32 + 1;
+                count += 1;
+            }
+            let records = (count - 1) / 5;
+            add_records(
+                text,
+                pos,
+                &listed[..=records * 5],
+                &mut looked_up,
+                names,
+                rows,
+            );
+            listed.copy_within(records * 5..count, 0);
+            count -= records * 5;
         }
-        // The last block runs into the next segment, whose start isn't known to be outside quotes.
-        while count > 1 && listed[count - 1] as usize >= end {
-            count -= 1;
-        }
-        // The final record may have no terminator (spec section 2.1).
-        if scan >= file.len() && count % 5 == 0 {
-            listed[count] = file.len() as u32;
-            count += 1;
-        }
-        let records = (count - 1) / 5;
-        add_records(&listed[..=records * 5], &mut looked_up, names, rows);
-        listed.copy_within(records * 5..count, 0);
-        count -= records * 5;
+        // What's left is the start of a record the piece cut short. A record longer than a piece gets
+        // a longer piece.
+        let done = listed[0] as usize;
+        assert!(done > 0 || pos + len < end);
+        piece = if done > 0 { PIECE } else { piece * 2 };
+        pos += done;
     }
 }
 
-/// Adds up a chunk of whole records, given the line end before them and each one's five separators.
-fn add_records(listed: &[u32], looked_up: &mut [[u32; 4]], names: &NameTable, rows: &mut Rows) {
-    let file = names.file;
+/// Adds up a chunk of whole records from `text`, which is at `text_at` in the file, given where they
+/// start and the positions just past each one's five separators.
+fn add_records(
+    text: &[u8],
+    text_at: usize,
+    listed: &[u32],
+    looked_up: &mut [[u32; 4]],
+    names: &NameTable,
+    rows: &mut Rows,
+) {
     let records = listed.len() / 5;
     let separators = |record: usize| {
         // SAFETY: the caller passes `records * 5 + 1` positions.
@@ -447,53 +504,49 @@ fn add_records(listed: &[u32], looked_up: &mut [[u32; 4]], names: &NameTable, ro
         at.map(|position| position as usize)
     };
     for record in 0..records {
-        let [before, id_end, name_end, note_end, region_end, line_end] = separators(record);
-        // SAFETY: every position is inside the file, or just after it, and a record starts at least
-        // 32 bytes in, after the header, so the padding covers the loads above and below them.
-        // `region` stays inside the join table. Prefetching has no effect on memory.
+        let [mut start, name_at, note_at, region_at, amount_at, next] = separators(record);
+        // SAFETY: every position is inside the text, or just after it, so the padding covers the
+        // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
-            let digits = |end: usize, bytes: usize| {
-                let shift = 64 - 8 * bytes as u32;
-                load_u64(file, end - 8) >> shift << shift
-            };
+            // Moves the digits at `start` to the top of a word, with zeros below them.
+            let digits = |start, end| load_u64(text, start) << (64 - 8 * (end - start) as u32);
             // A byte order mark can only start a record here, and no record otherwise starts with it.
-            let start = before + 1 + 3 * usize::from(*file.get_unchecked(before + 1) == 0xEF);
-            let id = digits(id_end, id_end - start);
-            let region = digits(region_end, region_end - note_end - 1);
+            if *text.get_unchecked(start) == 0xEF {
+                start += 3;
+            }
+            let id = digits(start, name_at - 1);
+            let region = digits(region_at, amount_at - 1);
             // Amounts are at most 8 bytes, and negative ones at most 7 (spec section 2.2), so one load
             // holds them. Moving the digits before the point up a byte squeezes it out, which leaves
             // 8 digits to parse. CRLF or LF, with no branch to mispredict.
-            let end = line_end - usize::from(*file.get_unchecked(line_end - 1) == b'\r');
-            let negative = usize::from(*file.get_unchecked(region_end + 1) == b'-');
-            let aligned = digits(end, end - region_end - 1 - negative);
+            let end = next - 1 - usize::from(*text.get_unchecked(next - 2) == b'\r');
+            let negative = usize::from(*text.get_unchecked(amount_at) == b'-');
+            let aligned = digits(amount_at + negative, end);
             let squeezed = (aligned & 0xFFFF_0000_0000_0000) | (aligned & 0x00FF_FFFF_FFFF) << 8;
             let [id, region, cents] = parse_three([id, region, squeezed]);
             let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
             let region = (region as usize).min(REGION_IDS - 1);
             _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast());
-            let name = (name_end - id_end - 1).saturating_sub(2);
-            let guess = names.guess_slot(names.hash(id_end + 2, name));
+            let raw = (note_at - name_at - 1).saturating_sub(2);
+            let guess = names.guess_slot(NameTable::hash(text, name_at + 1, raw));
             *looked_up.get_unchecked_mut(record) =
                 [guess as u32, region as u32, id as u32, cents as u32];
         }
     }
     for record in 0..records {
-        let [_, id_end, name_end, note_end, ..] = separators(record);
+        let [_, name_at, note_at, region_at, ..] = separators(record);
         let [guess, region, id, cents] = looked_up[record];
-        let (name, note) = (name_end - id_end - 1, note_end - name_end - 1);
-        // SAFETY: `id_end` is inside the file, and the padding covers the mask. BZHI keeps every bit
+        let (name, note) = (note_at - name_at - 1, region_at - note_at - 1);
+        // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
         // for a count of 64.
-        let (name_quotes, quotes) = if note_end - id_end - 1 <= 64 {
-            let mask = unsafe { byte_mask(file, id_end + 1, b'"', b'"') };
+        let (name_quotes, quotes) = if region_at - name_at - 1 <= 64 {
+            let mask = unsafe { byte_mask(text, name_at, b'"', b'"') };
             let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
-            (below(name), below(note_end - id_end - 1))
+            (below(name), below(region_at - name_at - 1))
         } else {
             let count = |bytes: &[u8]| bytes.iter().filter(|&&byte| byte == b'"').count();
-            let name_quotes = count(&file[id_end + 1..name_end]);
-            (
-                name_quotes,
-                name_quotes + count(&file[name_end + 1..note_end]),
-            )
+            let name_quotes = count(&text[name_at..note_at]);
+            (name_quotes, name_quotes + count(&text[note_at..region_at]))
         };
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
@@ -503,10 +556,8 @@ fn add_records(listed: &[u32], looked_up: &mut [[u32; 4]], names: &NameTable, ro
         let (country, is_new) = unsafe {
             let country = usize::from(names.regions.get_unchecked(region as usize).load(Relaxed));
             let raw = name.saturating_sub(2);
-            (
-                country,
-                names.mark(guess as usize, id_end + 2, raw, country),
-            )
+            let is_new = names.mark(guess as usize, text, text_at, name_at + 1, raw, country);
+            (country, is_new)
         };
         let cents = i64::from(cents as i32);
         let row = &mut rows[country];
@@ -550,38 +601,31 @@ impl Jobs {
 /// load. Tying the sizes to the thread count also makes the SD_THREADS test sweep move every cut. The
 /// spec's pool of names is a distribution, not a promise: if a file holds more names than the table,
 /// the pass is thrown away and redone with a bigger table.
-fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<String>, Vec<Row>) {
-    let names = NameTable::new(file, slots);
+fn aggregate(
+    records: &Input,
+    lookup: &Input,
+    threads: usize,
+    slots: usize,
+) -> (Vec<String>, Vec<Row>) {
+    let names = NameTable::new(records, slots);
     let (pages, lines, segments) = (Jobs::default(), Jobs::default(), Jobs::default());
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
-    let cuts = |file: &[u8], parts: usize, at, terminator| {
-        let size = file.len().div_ceil(parts).max(1);
-        let end = |at: usize| next_boundary(file, (at * size).min(file.len()), terminator);
-        (end(at), end(at + 1))
-    };
     let work = || {
         let page_count = names.words.len().div_ceil(PAGE_WORDS);
         pages.run_all(page_count, |page| {
             names.words[page * PAGE_WORDS].store(0, Relaxed)
         });
+        let mut buffer = Vec::new();
         lines.run_all(threads * 4, |at| {
-            let (pos, end) = cuts(lookup, threads * 4, at, b"\n".as_slice());
-            names.parse_regions(lookup, pos, end);
+            let (pos, end) = lookup.part(threads * 4, at, b"\n");
+            names.parse_regions(lookup.read(pos, end, &mut buffer), end - pos);
         });
         let mut rows = Box::new([EMPTY_ROW; 256]);
         segments.run(threads * SEGMENTS, |at| {
-            // The first boundary in the file ends the header, which always ends in CRLF (spec
-            // section 2.2), so the first segment starts just after it.
-            let (pos, end) = cuts(file, threads * SEGMENTS, at, b"\r\n".as_slice());
-            if names.full.load(Relaxed) || pos >= end {
-                return;
+            let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
+            if !names.full.load(Relaxed) {
+                parse_records(pos, end, &names, &mut rows, &mut buffer);
             }
-            // Maps the segment's pages in one call, instead of a page fault per 16 pages. A kernel
-            // without this call just refuses it, and the faults come as before.
-            let at = (file.as_ptr() as usize + pos) & !4095;
-            // SAFETY: the advice only reads pages in. A range past the mapping is refused.
-            unsafe { madvise(at as *mut u8, end - pos + 4096, 22) };
-            parse_records(pos, end, &names, &mut rows);
         });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
             merge(total, row);
@@ -598,7 +642,7 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
         work();
     });
     if names.full.load(Relaxed) {
-        return aggregate(file, lookup, threads, slots * 4);
+        return aggregate(records, lookup, threads, slots * 4);
     }
     (
         names.keys.into_inner().unwrap(),
@@ -614,9 +658,9 @@ fn main() -> io::Result<()> {
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let lookup = map_file(&format!("{data_dir}/regions.csv"))?;
-    let records = map_file(&format!("{data_dir}/records.csv"))?;
-    let (keys, totals) = aggregate(records, lookup, threads, INITIAL_SLOTS);
+    let lookup = Input::open(&format!("{data_dir}/regions.csv"))?;
+    let records = Input::open(&format!("{data_dir}/records.csv"))?;
+    let (keys, totals) = aggregate(&records, &lookup, threads, INITIAL_SLOTS);
 
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are
     // already in output order, and a group without records gets no line.

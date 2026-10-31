@@ -43,6 +43,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 21 | Back to separate slots, tags and join table, and threads share the setup: first touches, then region chunks, through one job counter | The shared mapping lost on the box (T flat, M 11.6 -> 12.0: the old layout's last huge page was never whole, so nothing was being wasted). Setup is the only serial part left, about 2 of 16 ms locally | pending | — | — | — |
 | 22 | Segment sizes round up, so that no tail is lost at many threads on a tiny file | aede9f8 lost the end of a tiny file at 64 threads (the 12-thread full run was never affected); a chained script of mine pushed it past the failed sweep | pending | — | — | — |
 | 23 | exp: two-stage parse: fixed blocks list the separators, then records read their fields from the list | Parse IPC stuck at 2.1 matches the 75-cycle chain through pos: each field's position depends on loading the one before. One-thread time held with far more instructions, so the chain was the limit | pending | — | — | — |
+| 24 | exp: read the file in 32 KiB pieces with pread, instead of mapping it | Mapping costs about 15% of the CPU in the kernel, plus TLB misses on small pages and the page tables in M; a small buffer also stays in the thread's caches | pending | — | — | — |
 
 ## Decision log
 
@@ -92,6 +93,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D22. Fix the rounding. The push script now refuses without a passed check on the exact tree.
 
 **D23. Test on the box. Options: tune the single-pass parser, or break the chain. Local: 1 thread -8%, 12 threads +8%, 307 instructions per record against 265, no fallback parser. The local 12-thread run is dominated by Hyper-V's lock waits, so only the box can decide.
+
+**D24. Test on the box, where syscalls and page faults cost differently from WSL. Local 12 threads: +3%, with system time up. Removes the mapping, padding and populate code. What would change our minds: T or M worse than the mapped two-stage build over three samples.
 
 ## What didn't work
 

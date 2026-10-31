@@ -49,6 +49,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 27 | The fix itself: a slot's key bytes copied, exactly 60 of them | The commit before this one carried only its PERF.md row, as the patch failed on formatted source and nothing stopped the script | pending | — | — | — |
 | 28 | Back to slots of one position: cache-line slots gained nothing on the board | Steps 25 to 27 gave T 0.0287 and 0.0294 at S 289, against T 0.0284 at S 264 for the old slots | pending | — | — | — |
 | 29 | The per-line path without repeated work, one counting scan, big latencies in the hour array's far end, one arena, eight writers | Counters put 226 instructions on each line and 40 ms of the 125 ms of CPU in the kernel, and rivals hold M at 16 to 18 MB | pending | — | — | — |
+| 30 | exp: map each segment's log pages ahead with MADV_POPULATE_READ | The box's T barely moved with an 18% instruction cut, so test what the kernel's share is there | pending | — | — | — |
 
 ## Decision log
 
@@ -106,6 +107,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D21. Revert. Local cycles fell 6%, and the board's T didn't: K 42.66 -> 41.37. The box has 1.5 times our L1 and larger L2, so the key compare that stalled here may not stall there. Lesson: a local cycle count ranks instruction cuts, not cache layouts, and cache layouts need the board.
 
 **D22. Cut work per line and memory together. The first probe inline, the hour kept in locals, the block as a pointer and SSE digits take 227 -> 202 instructions per line; one counting scan and unchecked moves take that to 185. Big latencies at the far end of the hour's own array need no heap in the parse. One arena and reserved writer buffers save 0.4 MB, and eight writers 0.76 MB. A byte loop for long keys saves 12 lines. On seed 1, 12 threads: instructions 702M -> 577M, wall -8.4% paired, M 20.25 -> 18.38 MB, S 264 -> 278. Grid 44/44, threads 234/234, const-hash 39/39, stress 0 wrong in 300. The box's A varies about 4% between runs of one build, so judge this over several runs.
+
+**D23. Experiment. Locally this halves faults and cuts user cycles 7% while wall rises 5 to 12%, in a VM where kernel entries cost more than on the box. Only the board can say. Revert if T doesn't fall over two runs.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

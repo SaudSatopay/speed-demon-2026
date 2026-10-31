@@ -34,6 +34,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 11 | One prefetched term table instead of two levels, no coin-toss branches in lookups or checks, BOOL checks listed and prefetched before they run | Hardware counters showed lookup at 35% of cycles and 43% of mispredicts: half the tokens went through the second level, and the compiler had turned a select into a branch | pending | — | — | — |
 | 12 | Query terms prefetched before they're added, a word per term written to the table with no branch, shorter numbering | Serial phases are now the largest cheap target: 12 of 95 ms before the scan | pending | — | — | — |
 | 13 | Vectors in lookup, tokens' edges from a byte table, three-way term sets, a byte per term, leaner BOOL checks and bitmap answers | Counters showed 200 instructions per token and per-core IPC of 2.4, so instruction count was the limit, not memory | pending | — | — | — |
+| 14 | The same design in 960 lines: a plan that owns everything, one counting sort for all lists | S 1325 cost 5% of K against the leader's 782, and most of it was structure and formatting, not features | pending | — | — | — |
 
 ## Decision log
 
@@ -64,6 +65,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D13. Keep cutting what runs on one thread. Chose: terms of the queries wait in a short list with their sets prefetched (parse 5.3 -> 3.7 ms); the table's words change in one pass with no branch on which ways are in use (1.45 -> 0.48 ms); term numbers come from one counting pass over classes. Evidence: local serial phases 12 -> 9 ms, hash unchanged, grids pass.
 
 **D14. Cut instructions everywhere in the scan. Keys and hashes of four tokens at a time in AVX2, and the compare in vectors with table-driven lists (-10% of cycles); edges from a per-byte table instead of 24 takes (-6%); sets of three ways whose fourth word holds what the key tests used to (-7%); checks with the add inlined and no branch on their result (-5%); AVX2 nibble popcounts for bitmap answers (-3%); a byte per term instead of a bit for what a document holds, the one cache trade here, for the board to judge (-1%). On seed 1, 12 threads: cycles 3.97G -> 2.66G, instructions 7.58G -> 4.07G, mispredicts 12.4M -> 11.8M, M flat at 42 MB, S 1213 -> 1318. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300. What would change our minds: the board's T falling by less than the cycles suggest.
+
+**D15. Cut lines with no loss of speed. Plan now owns the queries, answers and bitmaps, which removes Index, Queries, Answers, Evaluator and AnchorLists and their struct literals; make_plan is one loop plus one `group` counting sort, also used for phrase hits, with number_terms and list_phrases split out. Chain state holds its first document (-2.5% of cycles), total_hits visits each answer once (-0.4 ms), and one round of threads evaluates and prints (-0.5 ms). Blocks stay in chunks, as a reserved Vec put M at 47 MB. On seed 1, 12 threads: cycles 2.62G -> 2.56G, instructions 4.07G -> 3.96G, S 1325 -> 964, M max 43.75 -> 42.62 MB. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 ## What didn't work
 

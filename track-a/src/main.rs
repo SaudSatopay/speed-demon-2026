@@ -10,8 +10,13 @@
 //! in a fixed order whatever the scheduling and never sits in memory whole.
 
 use std::arch::x86_64::*;
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::{fs::File, io::Write, os::fd::AsRawFd, path::Path, sync::Mutex, thread};
+use std::thread;
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
 const HOURS: usize = 72;
@@ -47,15 +52,17 @@ unsafe extern "C" {
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
 /// scorer's memory peak doesn't charge us for these pages, unlike reading the log onto the heap.
-fn map_file(path: &Path) -> std::io::Result<&'static [u8]> {
+fn map_file(path: &Path) -> io::Result<&'static [u8]> {
+    let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
-    // SAFETY: the first call reserves fresh zero pages (PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS), and
-    // the second maps the file over the start of them (MAP_PRIVATE | MAP_FIXED), which fails only on
-    // an empty file. Neither is ever unmapped, and nothing writes to the dataset while we run.
+    // SAFETY: the first call reserves fresh zero pages, and the second maps the file over the start
+    // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
+    // dataset while we run.
     unsafe {
-        let base = mmap(std::ptr::null_mut(), len + PADDING, 1, 0x22, -1, 0);
-        let mapped = mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
+        let null = std::ptr::null_mut();
+        let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
+        let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
         assert!(base as isize != -1 && (mapped == base || len == 0));
         Ok(std::slice::from_raw_parts(base.cast(), len))
     }
@@ -74,8 +81,11 @@ unsafe fn load<T: Copy>(log: &[u8], pos: usize) -> T {
 /// One bit per byte of two blocks, set where they're equal.
 fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
     // SAFETY: the build targets x86-64-v3, which has AVX2.
-    let mask = |i: usize| unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[i], b[i])) as u32 };
-    u64::from(mask(0)) | u64::from(mask(1)) << 32
+    unsafe {
+        let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[0], b[0])) as u32;
+        let high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[1], b[1])) as u32;
+        u64::from(low) | u64::from(high) << 32
+    }
 }
 
 /// The offset of the next space at or after `pos`. Endpoints average 34 bytes, and 94% of them end
@@ -100,10 +110,21 @@ unsafe fn offset_of_space(log: &[u8], pos: usize) -> usize {
     }
 }
 
-/// Runs `work` on `threads` threads, and waits for them all: the scope joins every thread, so the
-/// handles have no use.
+/// `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
+/// box's 12 threads.
+fn thread_count() -> usize {
+    let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
+    let allowed = || thread::available_parallelism().map_or(1, |n| n.get().min(12));
+    Some(asked).filter(|&n| n > 0).unwrap_or_else(allowed)
+}
+
+/// Runs `work` on `threads` threads, and waits for them all.
 fn on_threads(threads: usize, work: impl Fn() + Sync) {
-    thread::scope(|scope| (0..threads).for_each(|_| drop(scope.spawn(&work))));
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(&work);
+        }
+    });
 }
 
 /// Mixes an endpoint's length with its first and last 8 bytes, which tell nearly all templated paths
@@ -166,7 +187,8 @@ fn order_ids<'a>(table: &[AtomicU32; SLOTS], log: &'a [u8]) -> (Vec<&'a [u8]>, V
     let keys: Vec<&[u8]> = table.iter().map(key_of).collect();
     let mut ids: Vec<usize> = (1..SLOTS).filter(|&id| !keys[id].is_empty()).collect();
     ids.sort_unstable_by_key(|&id| keys[id]);
-    (keys, std::iter::once(0).chain(ids).collect())
+    ids.insert(0, 0);
+    (keys, ids)
 }
 
 /// One hour's records: an array that threads reserve blocks of, where the next block starts, and the
@@ -317,11 +339,7 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
         let n = group.len();
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
-        let big_count = group
-            .iter()
-            .rev()
-            .take_while(|&&r| latency(r) == BIG_LATENCY)
-            .count();
+        let big_count = n - group.partition_point(|&r| latency(r) < BIG_LATENCY);
         let id = group[0] >> ID_SHIFT;
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
@@ -330,9 +348,8 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
                 None => u64::from(latency(group[index])),
             }
         };
-        let p50 = pct(50);
-        let p99 = pct(99);
-        let p95 = if n <= 19 { p99 } else { pct(95) };
+        let (p50, p99) = (pct(50), pct(99));
+        let p95 = if n <= 19 { p99 } else { pct(95) }; // Both ranks are then n.
         out.extend_from_slice(stamp.as_bytes());
         out.extend_from_slice(keys[id as usize]);
         let count = n as u64;
@@ -355,9 +372,9 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             // Three stable passes sort by latency first and endpoint last. The current text buffer
             // is scratch, so the result is copied out, and its storage is reused for the output bytes.
             text.resize(records.len() * 4 + 3, 0);
-            // SAFETY: any bytes make a valid `u32`. Three spare bytes cover the alignment prefix, so
-            // the slice holds every record, and the passes index it with bounds checks anyway.
+            // SAFETY: four spare bytes cover any alignment prefix; assert the aligned slice fits.
             let (_, scratch, _) = unsafe { text.align_to_mut::<u32>() };
+            assert!(scratch.len() >= records.len());
             radix_pass(records, scratch, |r| ((r >> 1) & 511) as usize, &all[..512]);
             radix_pass(scratch, records, |r| ((r >> 10) & 1023) as usize, &all);
             radix_pass(records, scratch, |r| (r >> ID_SHIFT) as usize, ids);
@@ -380,28 +397,26 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
     });
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     // Transparent huge pages would round each hour's sparse array up to 2 MB, so turn them off, with
     // PR_SET_THP_DISABLE. Failing is harmless.
     // SAFETY: this only sets a flag on our own process.
     unsafe { prctl(41, 1, 0, 0, 0) };
-    let arg = |i, default: &str| std::env::args().nth(i).unwrap_or(default.into());
-    // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
-    // box's 12 threads.
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
-    let threads = if asked > 0 { asked } else { allowed };
-    let log = map_file(&Path::new(&arg(1, "/data")).join("requests.log"))?;
+    let mut args = std::env::args().skip(1);
+    let data_dir = args.next().unwrap_or_else(|| "/data".into());
+    let out_dir = args.next().unwrap_or_else(|| "/out".into());
+    let threads = thread_count();
+    let log = map_file(&Path::new(&data_dir).join("requests.log"))?;
     assert!(log.len() < 1 << 32, "table slots hold 32-bit positions");
-    let file = File::create(Path::new(&arg(2, "/out")).join("summary.txt"))?;
+    let file = File::create(Path::new(&out_dir).join("summary.txt"))?;
     // Room for every line, the shortest being 40 bytes, plus each thread's unfinished block.
     let len = (log.len() / 40 + BLOCK_RECORDS * (threads + 1)).next_multiple_of(1024);
-    // SAFETY: this maps fresh zero pages (PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS), for
-    // the life of the process.
-    let base = unsafe { mmap(std::ptr::null_mut(), HOURS * len * 4, 3, 0x22, -1, 0) };
-    assert!(base as isize != -1);
-    // SAFETY: the mapping holds `HOURS * len` zero words, reached only through `arena`.
-    let arena = unsafe { std::slice::from_raw_parts_mut(base.cast::<AtomicU32>(), HOURS * len) };
+    // SAFETY: this maps fresh zero pages, for the life of the process, reached only through `arena`.
+    let arena = unsafe {
+        let base = mmap(std::ptr::null_mut(), HOURS * len * 4, 3, 0x22, -1, 0);
+        assert!(base as isize != -1);
+        std::slice::from_raw_parts_mut(base.cast::<AtomicU32>(), HOURS * len)
+    };
     let new_hour = |slots| (slots, AtomicUsize::new(0), Mutex::default());
     let hours: Vec<Hour> = arena.chunks_mut(len).map(new_hour).collect();
     let table = [const { AtomicU32::new(0) }; SLOTS];

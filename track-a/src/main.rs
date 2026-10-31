@@ -14,8 +14,8 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::{Condvar, Mutex};
 use std::thread;
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
@@ -360,34 +360,16 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
     }
 }
 
-const READY_BYTES: usize = 1 << 20;
-
-struct PendingOutput {
-    ready: Vec<Option<Vec<u8>>>,
-    next: usize,
-    bytes: usize,
-    free: Vec<Vec<u8>>,
-}
-
 fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, threads: usize) {
     let all: Vec<usize> = (0..1024).collect();
     let queue = Mutex::new(hours.into_iter().enumerate());
-    let pending = Mutex::new(PendingOutput {
-        ready: std::iter::repeat_with(|| None).take(HOURS).collect(),
-        next: 0,
-        bytes: 0,
-        free: Vec::with_capacity(threads),
-    });
-    let changed = Condvar::new();
+    let written = AtomicUsize::new(0);
     on_threads(threads, || {
         let mut text = Vec::new();
         for (hour, (slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
-            if text.capacity() == 0 {
-                text = pending.lock().unwrap().free.pop().unwrap_or_default();
-            }
             let records = AtomicU32::get_mut_slice(&mut slots[..next.into_inner()]);
-            // Three stable passes sort by latency first and endpoint last. The output buffer is
-            // scratch so text is copied out, then its storage is reused for the output bytes.
+            // Three stable passes sort by latency first and endpoint last. The current text buffer
+            // is scratch, so the result is copied out, and its storage is reused for the output bytes.
             text.resize(records.len() * 4 + 3, 0);
             // SAFETY: four spare bytes cover any alignment prefix; assert the aligned slice fits.
             let (_, scratch, _) = unsafe { text.align_to_mut::<u32>() };
@@ -403,33 +385,17 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             format_hour(hour, &records[zeros..], &big, keys, &mut text);
             // SAFETY: nothing else refers to these whole pages, and nothing reads them again.
             unsafe { madvise(slots.as_mut_ptr().cast(), slots.len() * 4, 4) }; // MADV_DONTNEED.
-            let mut output = pending.lock().unwrap();
-            let capacity = text.capacity();
-            while hour != output.next && output.bytes.saturating_add(capacity) > READY_BYTES {
-                output = changed.wait(output).unwrap();
+            while written.load(Acquire) != hour {
+                thread::yield_now();
             }
-            output.bytes += capacity;
-            output.ready[hour] = Some(std::mem::take(&mut text));
-            while output.next < output.ready.len() {
-                let next = output.next;
-                let Some(mut ready) = output.ready[next].take() else {
-                    break;
-                };
-                (&file).write_all(&ready).expect("writing the summary");
-                output.bytes -= ready.capacity();
-                ready.clear();
-                output.next += 1;
-                if output.free.len() < threads {
-                    output.free.push(ready);
-                }
-            }
-            if let Some(buffer) = output.free.pop() {
-                text = buffer;
-            }
-            changed.notify_all();
+            // `panic = "abort"`: a failed write ends the process rather than leaving the other
+            // threads waiting for their turn.
+            (&file).write_all(&text).expect("writing the summary");
+            written.store(hour + 1, Release);
         }
     });
 }
+
 fn main() -> io::Result<()> {
     // Transparent huge pages would round each hour's sparse array up to 2 MB, so turn them off, with
     // PR_SET_THP_DISABLE. Failing is harmless.

@@ -58,6 +58,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 36 | exp: chunks of 8 blocks instead of 16, without the tag prefetch | Tag prefetch gave T 0.0241, no gain. Fewer records between a prefetch and its use could keep more of them in L1 | pending | — | — | — |
 | 37 | One open file per thread, and chunks of 16 blocks again | Every read takes and drops a reference on the file, so a shared descriptor bounces that cache line between all the threads; 8-block chunks gave T 0.0238, no gain | pending | — | — | — |
 | 38 | One shared file again | One file per thread gave T 0.0236, no gain over 0.0235, for 12 more lines | pending | — | — | — |
+| 39 | Each row on its own cache line | Hardware counters (perf stat works in WSL now): 165 thread cycles per record, 108 not retiring, 45 of those waiting on loads, 2.9 first-level misses per record. A row straddling two lines is one of them | pending | — | — | — |
 
 ## Decision log
 
@@ -137,6 +138,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D37. Local -1%, S +6. What would change our minds: K below 40.3 over samples.
 
 **D38. Simpler. M 12.1 on that run looks like a rare outlier that also hit the 64 KiB run: watching for more.
+
+**D39. Align rows. Cycles 164.7 -> 160.6 per record, misses 2.93 -> 2.21, both steady over repeats. A 40-byte row gave the same, for more code. 8, 4 and 32-block chunks, 24 KiB pieces and a tag prefetch all land at 160 to 164. What would change our minds: K below 40.3 over samples.
 
 ## What didn't work
 

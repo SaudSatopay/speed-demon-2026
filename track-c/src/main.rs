@@ -420,8 +420,10 @@ impl<'a> NameTable<'a> {
 
 /// A country's totals, in output order: count, id sum, amount sum, lowest amount, highest amount,
 /// distinct names, name bytes and note bytes.
-type Row = [i64; 8];
-const EMPTY_ROW: Row = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
+#[repr(align(64))]
+#[derive(Clone, Copy)]
+struct Row([i64; 8]);
+const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
@@ -559,7 +561,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             (country, names.mark(guess as usize, text, key, country))
         };
         let cents = i64::from(cents as i32);
-        let row = &mut rows[country];
+        let row = &mut rows[country].0;
         row[0] += 1;
         row[1] += i64::from(id);
         row[2] += cents;
@@ -647,6 +649,7 @@ fn aggregate(
             }
         });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
+            let (total, row) = (&mut total.0, &row.0);
             let (low, high) = (total[3].min(row[3]), total[4].max(row[4]));
             (0..8).for_each(|i| total[i] = total[i].wrapping_add(row[i]));
             (total[3], total[4]) = (low, high);
@@ -685,9 +688,9 @@ fn main() -> io::Result<()> {
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are
     // already in output order, and a group without records gets no line.
     let mut lines: Vec<_> = keys.iter().zip(&totals).collect();
-    lines.sort();
+    lines.sort_by_key(|&(key, _)| key);
     let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt"))?);
-    for (key, row) in lines.into_iter().filter(|(_, row)| row[0] > 0) {
+    for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] > 0) {
         write!(out, "{key} {} {}", row[0], row[1])?;
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
         // which would lose the sign of -0.75. Zero never gets a sign.

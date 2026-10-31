@@ -34,7 +34,7 @@ const PIECE: usize = 1 << 15;
 
 /// Spare bytes after a piece in its buffer, so that a load that starts at a short fixed distance from a
 /// line needs no check of its own.
-const PADDING: usize = 128;
+const PADDING: usize = 192;
 
 /// A method's length, as the nibble selected by the low nibble of its 4th byte, which tells the seven
 /// apart: GET and PUT have a space there (0), POST and HEAD have T and D (4), PATCH has C (3), DELETE
@@ -42,14 +42,18 @@ const PADDING: usize = 128;
 const METHOD_LENS: u64 = 0x70_0064_5003;
 
 /// Room for the spec's exactly 1,842 endpoints, at a low load.
-const SLOTS: usize = 1 << 12;
+const SLOTS: usize = 1 << 14;
+
+/// Ids that a record can hold: the spec's endpoints have at most 2 lines each.
+const IDS: usize = 1 << 12;
 
 /// The lock-free endpoint table: slots, lines used, and lines. A slot holds its key's first line, so 0
 /// means empty, as line 0 is never used, and a published slot never changes. A key has whole lines,
 /// through its closing space, so no block load meets another thread's stores, and a compare touches
-/// one cache line.
+/// one cache line. A key's first line is its id.
 type Table = ([AtomicU16; SLOTS], AtomicUsize, &'static [Line]);
 type Line = [AtomicU8; 64];
+type Order<'a> = (&'a [&'a [u8]], &'a [usize]);
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -94,59 +98,63 @@ fn hash(first: u64, last: u64, len: usize) -> u64 {
 /// The id of `key`, which ends in its closing space, from slot `index` on, adding it if it's new: the
 /// path for the lines that `parse` can't settle in one compare. `through` marks the key's bytes among
 /// the first 64. A key is always compared in full, because templated paths share prefixes, suffixes and
-/// lengths. Slot 0 stays free: see `Hour`.
+/// lengths.
 #[cold]
 fn id_of((slots, used, lines): &Table, key: &[u8], through: u64, mut index: usize) -> u32 {
-    // SAFETY: `key` is inside a buffer, whose padding covers the load.
-    let block = unsafe { load(key, 0) };
+    // SAFETY: `key` is inside a buffer, whose padding covers the loads.
+    let (block, second) = unsafe { (load(key, 0), load(key, 64)) };
+    // The key's bytes in the second block: at most 62, as it has at most 126 with its space.
+    let rest = (1u64 << key.len().saturating_sub(64)) - 1;
+    // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes were stored
+    // before it was published. Only a key with a second line gets its second line read here.
+    let read = |at: usize| unsafe { lines.as_ptr().add(at).cast::<[__m256i; 2]>().read() };
     loop {
-        index = (index & (SLOTS - 1)).max(1);
+        index &= SLOTS - 1;
         let slot = &slots[index];
         let mut line = slot.load(Acquire) as usize;
         if line == 0 {
             let count = key.len().div_ceil(64);
             let at = used.fetch_add(count, Relaxed);
+            assert!(at + count <= IDS);
             let cells = lines[at..at + count].as_flattened().iter();
             cells.zip(key).for_each(|(c, &b)| c.store(b, Relaxed));
             // If another thread's key took the slot first, the lines reserved here stay unused.
             match slot.compare_exchange(0, at as u16, Release, Acquire) {
-                Ok(_) => return index as u32,
+                Ok(_) => return at as u32,
                 Err(now) => line = now as usize,
             }
         }
-        // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes were
-        // stored before it was published.
-        let seen = unsafe { lines.as_ptr().add(line).cast::<[__m256i; 2]>().read() };
-        let tail = &key[key.len().min(64)..];
-        let mut rest = lines[line + 1..].as_flattened().iter().zip(tail);
-        if !equal_bytes(seen, block) & through == 0 && rest.all(|(c, &b)| c.load(Relaxed) == b) {
-            return index as u32;
+        if !equal_bytes(read(line), block) & through == 0
+            && (rest == 0 || !equal_bytes(read(line + 1), second) & rest == 0)
+        {
+            return line as u32;
         }
         index += 1;
     }
 }
 
-/// Each id's endpoint, with an empty key for unused ids, and the ids in use, in the byte order of
-/// their endpoints (`[u8]` compares as unsigned bytes, with a proper prefix first), after id 0,
-/// which no endpoint has: it's what the unused ends of blocks hold.
+/// The ids in use and their endpoints, in the byte order of the endpoints (`[u8]` compares as unsigned
+/// bytes, with a proper prefix first), after id 0, which no endpoint has: it's what the unused ends of
+/// blocks hold.
 fn order_ids((slots, _, lines): &Table) -> (Vec<&'static [u8]>, Vec<usize>) {
     // SAFETY: all threads are done with the lines, and an atomic byte has the layout of a byte.
     let text = unsafe { std::slice::from_raw_parts(lines.as_ptr().cast::<u8>(), lines.len() * 64) };
-    let key_of = |slot: &AtomicU16| match slot.load(Relaxed) as usize {
-        0 => &text[..0],
-        line => text[line * 64..].split(|&b| b == b' ').next().unwrap(),
-    };
-    let keys: Vec<&[u8]> = slots.iter().map(key_of).collect();
-    let mut ids: Vec<usize> = (1..SLOTS).filter(|&id| !keys[id].is_empty()).collect();
-    ids.sort_unstable_by_key(|&id| keys[id]);
-    (keys, std::iter::once(0).chain(ids).collect())
+    let key_of = |line: usize| text[line * 64..].split(|&b| b == b' ').next().unwrap();
+    let ids = slots
+        .iter()
+        .map(|slot| slot.load(Relaxed) as usize)
+        .filter(|&line| line > 0);
+    let mut ids: Vec<(&[u8], usize)> = ids.map(|line| (key_of(line), line)).collect();
+    ids.push((&[], 0));
+    ids.sort_unstable();
+    ids.into_iter().unzip()
 }
 
 /// One hour's words: an array that threads reserve blocks of, where the next block of records starts
 /// from the front, and how many words of big latencies are reserved at the back, each latency as two
 /// words (id << 32 | latency) in the array's byte order. The array has room for every line of the log,
 /// since a log may be lopsided, and untouched pages cost nothing. A block's unused end stays zero, which
-/// no real record is, since slot 0 is never an id. All the arrays share one mapping, and each is whole
+/// no real record is, since line 0 is never an id. All the arrays share one mapping, and each is whole
 /// pages, because a mapping per hour costs a call each, and unmapping one stalls every thread that wants
 /// the address space's lock.
 type Hour = (&'static mut [AtomicU32], AtomicUsize, AtomicUsize);
@@ -230,7 +238,11 @@ fn parse(log: &File, len: usize, table: &Table, hours: &[Hour], head: &AtomicUsi
                 let spaces = equal_bytes(key, [space; 2]);
                 let len = match spaces {
                     // Endpoints average 34 bytes, and 94% of them end within 64.
-                    0 => 64 + text[at + 64..got].iter().position(|&b| b == b' ').unwrap(),
+                    // SAFETY: the padding covers it.
+                    0 => {
+                        64 + unsafe { equal_bytes(load(text, at + 64), [space; 2]) }
+                            .trailing_zeros() as usize
+                    }
                     _ => spaces.trailing_zeros() as usize,
                 };
                 // Either way `key_end` is at most 108 bytes after `line`, or inside the piece, so the
@@ -247,17 +259,17 @@ fn parse(log: &File, len: usize, table: &Table, hours: &[Hour], head: &AtomicUsi
                 // SAFETY: both start inside the piece, as `at` is at least 29.
                 let (first, last) = unsafe { (load(text, at), load(text, key_end - 8)) };
                 let (first, last) = if len < 8 { (0, 0) } else { (first, last) };
-                let index = (hash(first, last, len) >> 52) as usize;
+                let index = (hash(first, last, len) >> 50) as usize;
                 // One compare of a whole line of the table, through the closing space, settles nearly
                 // every line of the log, with no branch on the length. An empty slot holds 0, and line 0
-                // is all zeros, so it can't match, and neither can slot 0, which stays empty.
+                // is all zeros, so it can't match.
                 let kept = slots[index].load(Acquire) as usize;
                 // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes
                 // were stored before it was published.
                 let seen = unsafe { lines.as_ptr().add(kept).cast::<[__m256i; 2]>().read() };
                 let through = spaces ^ spaces.wrapping_sub(1);
                 let id = if !equal_bytes(seen, key) & through == 0 && spaces != 0 {
-                    index as u32
+                    kept as u32
                 } else {
                     id_of(table, &text[at..=key_end], through, index)
                 };
@@ -332,22 +344,25 @@ fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl F
     }
 }
 
-/// Appends one hour's output lines, given its records sorted by endpoint and then latency, and its
-/// big latencies sorted by id and then latency.
-fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &mut Vec<u8>) {
-    let clock = hour + 18;
+/// Appends one hour's output lines, given its records sorted by endpoint and then latency, where each
+/// id's group ends, its big latencies sorted by id and then latency, and the endpoints and ids in order.
+fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, out: &mut Vec<u8>) {
+    let clock = h + 18;
     let stamp = format!("{}T{:02}:00:00Z ", DATES[clock / 24], clock % 24);
-    for group in sorted.chunk_by(|a, b| a >> ID_SHIFT == b >> ID_SHIFT) {
+    let mut start = ends[0] as usize;
+    for (key, &id) in order.0.iter().zip(order.1).skip(1) {
+        let group = &recs[start..ends[id] as usize];
+        let Some(_) = group.first() else { continue };
         let n = group.len();
+        start += n;
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
         let is_big = |&&r: &&u32| latency(r) == BIG_LATENCY;
         let big_count = group.iter().rev().take_while(is_big).count();
-        let id = group[0] >> ID_SHIFT;
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
             match index.checked_sub(n - big_count) {
-                Some(i) => big[big.partition_point(|e| e >> 32 < id.into()) + i] & 0xFFFF_FFFF,
+                Some(i) => big[big.partition_point(|e| e >> 32 < id as u64) + i] & 0xFFFF_FFFF,
                 None => u64::from(latency(group[index])),
             }
         };
@@ -355,7 +370,7 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
         let p99 = pct(99);
         let p95 = if n <= 19 { p99 } else { pct(95) };
         out.extend_from_slice(stamp.as_bytes());
-        out.extend_from_slice(keys[id as usize]);
+        out.extend_from_slice(key);
         let count = n as u64;
         for value in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
             out.push(b' ');
@@ -380,7 +395,7 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             // SAFETY: any bytes make a valid `u32`. Three spare bytes cover the alignment prefix, so
             // the slice holds exactly one word per record.
             let (_, tmp, _) = unsafe { text.align_to_mut::<u32>() };
-            let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; SLOTS]);
+            let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
             for &record in recs.iter() {
                 low[(record >> 1 & 511) as usize] += 1;
                 high[(record >> 10 & 1023) as usize] += 1;
@@ -390,7 +405,6 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
             pass(recs, tmp, &mut groups, ids, |r| (r >> ID_SHIFT) as usize);
             recs.copy_from_slice(tmp);
-            let zeros = recs.partition_point(|&record| record == 0);
             // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
             // ones are zero, which sorts before id 1.
             let big = unsafe {
@@ -398,7 +412,7 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             };
             big.sort_unstable();
             text.clear();
-            format_hour(hour, &recs[zeros..], big, keys, &mut text);
+            format_hour(hour, recs, &groups, big, (keys, ids), &mut text);
             // SAFETY: nothing else refers to these whole pages, and nothing reads them again.
             unsafe { madvise(slots.as_mut_ptr().cast(), slots.len() * 4, 4) }; // MADV_DONTNEED.
             while written.load(Acquire) != hour {

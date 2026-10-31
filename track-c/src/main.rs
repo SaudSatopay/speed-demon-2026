@@ -405,13 +405,13 @@ fn add_records(batch: &[Pending], regions: &[u8], names: &NameTable, rows: &mut 
     }
 }
 
-/// Parses the whole file on `threads` threads and merges their rows. Eight segments per thread
-/// balances the load. Tying the size to the thread count also makes the SD_THREADS test sweep move
-/// every cut. The spec's pool of names is a distribution, not a promise: if a file holds more names
-/// than the table, the pass is thrown away and redone with a bigger table.
+/// Parses the whole file on `threads` threads and merges their rows. Thirty-two segments per thread
+/// keep the finishes close, so a thread idles for at most one segment at the end. Tying segment size
+/// to the thread count also makes the SD_THREADS sweep move every cut. If the name pool exceeds the
+/// table, the pass is thrown away and redone with a bigger table.
 fn aggregate(file: &[u8], regions: &[u8], groups: usize, threads: usize, slots: usize) -> Vec<Row> {
     let names = NameTable::new(file, slots);
-    let segment = (file.len() / (threads * 8)).max(1);
+    let segment = (file.len() / (threads * 32)).max(1);
     let cursor = AtomicUsize::new(0);
     let totals = Mutex::new(vec![EMPTY_ROW; groups]);
     let work = || {

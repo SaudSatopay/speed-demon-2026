@@ -10,8 +10,8 @@
 //! small batches while their cache lines are prefetched.
 
 use std::io::{self, BufWriter, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Mutex, OnceLock};
 use std::{arch::x86_64::*, fs::File, os::fd::AsRawFd, ptr::null_mut, thread};
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
@@ -95,48 +95,24 @@ fn digits_of(word: u64) -> (u64, u32) {
     (word << (64 - bits), bits)
 }
 
-/// The first record boundary at or after `pos`: just past the next CRLF, or the end of the file.
-/// A CR can only be the first byte of a CRLF terminator (spec section 2.2), so this is never inside
-/// quotes. About half the records end in CRLF, so it's never far. A file without one simply doesn't
-/// get split.
-fn next_boundary(file: &[u8], pos: usize) -> usize {
-    let cr = file[pos..].iter().position(|&c| c == b'\r');
-    cr.map_or(file.len(), |cr| pos + cr + 2)
+/// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the file.
+/// In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2), so it's
+/// never inside quotes, and about half the records end in one, so it's never far. A file without one
+/// simply doesn't get split.
+fn next_boundary(file: &[u8], pos: usize, terminator: &[u8]) -> usize {
+    let at = file[pos..].iter().position(|&c| c == terminator[0]);
+    at.map_or(file.len(), |at| pos + at + terminator.len())
 }
 
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1 << 20;
 
-/// Returns the join table, country indices by region id, and each index's key. Index 0 is
-/// `_UNMATCHED`, and the codes take the next indices as they first appear, so the output is sorted
-/// when it's written.
-fn parse_regions(file: &[u8], country_of: &[AtomicU8]) -> Vec<String> {
-    let mut pos = b"region_id,country\n".len(); // The header never varies (spec section 2.3).
-    // `index_of` takes every code in `[A-Z]{3}`.
-    let mut index_of = vec![0u8; 26 * 26 * 26];
-    let mut keys = vec!["_UNMATCHED".to_string()];
-    while pos < file.len() {
-        // SAFETY: `pos` is inside the file, and the padding covers the load.
-        let (word, bits) = digits_of(unsafe { load_u64(file, pos) });
-        pos += bits as usize / 8 + 1;
-        let [id, ..] = parse_three([word, 0, 0]);
-        let code = (0..3).fold(0, |code, i| code * 26 + usize::from(file[pos + i] - b'A'));
-        if index_of[code] == 0 {
-            index_of[code] = keys.len() as u8; // At most 240 countries (spec section 2.3).
-            keys.push(String::from_utf8_lossy(&file[pos..pos + 3]).into_owned());
-        }
-        pos += 4; // The three letters and the LF.
-        country_of[id as usize].store(index_of[code], Relaxed);
-    }
-    keys
-}
-
 /// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
-const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 112_000 };
-/// On the box, the kernel backs a mapping aligned to this with huge pages, and charges them in full.
-const HUGE_PAGE: usize = 1 << 21;
+const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
+/// Words per huge page.
+const PAGE_WORDS: usize = 1 << 18;
 /// Words per slot, which is one cache line: three words of key, a header, and 256 country bits.
 const SLOT_WORDS: usize = 8;
 /// Most names fit in the slot itself: on seed 1, 99.99% of them.
@@ -156,47 +132,56 @@ static KEY_MASKS: [u64; 7] = [!0, !0, !0, 0, 0, 0, 0];
 /// sees the header may read them as plain memory.
 struct NameTable<'a> {
     file: &'a [u8],
-    words: &'static [AtomicU64],
-    tags: &'static [AtomicU8],
-    regions: &'static [AtomicU8], // The join table, country indices by region id.
+    words: Vec<AtomicU64>,
+    tags: Vec<AtomicU8>,
+    regions: Vec<AtomicU8>,   // The join table, country indices by region id.
+    index_of: Vec<AtomicU8>,  // Country indices by code, which takes every one in `[A-Z]{3}`.
+    keys: Mutex<Vec<String>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
+    first: usize,             // The word where the first slot starts, on a cache line boundary.
     groups: usize, // Homes. The tags and slots have one more group, for the last home's window.
     full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
-    /// Maps the slots, tags and join table together, so that at the initial size they just fill four
-    /// huge pages: the memory charged for them anyway, and very few TLB entries to walk for.
     fn new(file: &'a [u8], slots: usize) -> Self {
         let tags = (slots / GROUP + 1) * GROUP;
-        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
-        let bytes = regions_at + REGION_IDS;
-        let (read_write, private_anonymous, hugepage) = (3, 0x22, 14);
-        // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
-        // so the three parts don't overlap, and zero is a valid value of each atomic. Touching each
-        // huge page here, before parallel writes begin, keeps two threads from each getting one.
-        unsafe {
-            let at = mmap(
-                null_mut(),
-                bytes + HUGE_PAGE,
-                read_write,
-                private_anonymous,
-                -1,
-                0,
-            );
-            assert!(at as isize != -1);
-            let base = at.add(at.align_offset(HUGE_PAGE));
-            madvise(base, bytes, hugepage);
-            (0..bytes)
-                .step_by(HUGE_PAGE)
-                .for_each(|at| base.add(at).write_volatile(0));
-            NameTable {
-                file,
-                words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),
-                tags: std::slice::from_raw_parts(base.add(tags_at).cast(), tags),
-                regions: std::slice::from_raw_parts(base.add(regions_at).cast(), REGION_IDS),
-                groups: slots / GROUP,
-                full: AtomicBool::new(false),
+        // These are fresh zero pages from the system, untouched until a thread needs them.
+        let words: Vec<_> = vec![0u64; tags * SLOT_WORDS + 8]
+            .into_iter()
+            .map(AtomicU64::new)
+            .collect();
+        let bytes = |len| vec![0u8; len].into_iter().map(AtomicU8::new).collect();
+        NameTable {
+            file,
+            first: words.as_ptr().align_offset(64),
+            words,
+            tags: bytes(tags),
+            regions: bytes(REGION_IDS),
+            index_of: bytes(26 * 26 * 26),
+            keys: Mutex::new(vec!["_UNMATCHED".to_string()]),
+            groups: slots / GROUP,
+            full: AtomicBool::new(false),
+        }
+    }
+
+    /// Fills the join table from the region lines in `pos..end`.
+    fn parse_regions(&self, file: &[u8], mut pos: usize, end: usize) {
+        while pos < end {
+            // SAFETY: `pos` is inside the file, and the padding covers the load.
+            let (word, bits) = digits_of(unsafe { load_u64(file, pos) });
+            pos += bits as usize / 8 + 1;
+            let [id, ..] = parse_three([word, 0, 0]);
+            let code = (0..3).fold(0, |code, i| code * 26 + usize::from(file[pos + i] - b'A'));
+            let index = &self.index_of[code];
+            if index.load(Relaxed) == 0 {
+                let mut keys = self.keys.lock().unwrap();
+                if index.load(Relaxed) == 0 {
+                    index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
+                    keys.push(String::from_utf8_lossy(&file[pos..pos + 3]).into_owned());
+                }
             }
+            self.regions[id as usize].store(index.load(Relaxed), Relaxed);
+            pos += 4; // The three letters and the LF.
         }
     }
 
@@ -227,7 +212,7 @@ impl<'a> NameTable<'a> {
 
     /// Where a slot's words start.
     fn base(&self, group: usize, slot: u32) -> usize {
-        (group * GROUP + slot as usize) * SLOT_WORDS
+        self.first + (group * GROUP + slot as usize) * SLOT_WORDS
     }
 
     /// The tags of the two groups at `group`, which must be a home.
@@ -532,31 +517,69 @@ fn add_records(batch: &[Pending], names: &NameTable, rows: &mut Rows) {
     }
 }
 
+/// Numbered jobs that threads claim from a shared cursor, however many have started so far.
+#[derive(Default)]
+struct Jobs {
+    next: AtomicUsize,
+    done: AtomicUsize,
+}
+
+impl Jobs {
+    fn run(&self, count: usize, mut job: impl FnMut(usize)) {
+        while let Some(at) = Some(self.next.fetch_add(1, Relaxed)).filter(|&at| at < count) {
+            job(at);
+            self.done.fetch_add(1, Release);
+        }
+    }
+
+    /// Runs the jobs, and returns when all are finished, by whichever threads.
+    fn run_all(&self, count: usize, job: impl FnMut(usize)) {
+        self.run(count, job);
+        while self.done.load(Acquire) < count {
+            thread::yield_now();
+        }
+    }
+}
+
 /// Parses the whole file on `threads` threads and merges their rows, returning them with their keys.
-/// The threads start before the join table does, from a second thread, so that the two setups overlap
-/// and every thread is there when the table is ready. Eight segments per thread balances the load.
-/// Tying the size to the thread count also makes the SD_THREADS test sweep move every cut. The spec's
-/// pool of names is a distribution, not a promise: if a file holds more names than the table, the pass
-/// is thrown away and redone with a bigger table.
+/// The threads share the setup too: touching each huge page once before anything writes to it, which
+/// keeps two threads from each getting one, then the regions. Eight segments per thread balances the
+/// load. Tying the sizes to the thread count also makes the SD_THREADS test sweep move every cut. The
+/// spec's pool of names is a distribution, not a promise: if a file holds more names than the table,
+/// the pass is thrown away and redone with a bigger table.
 fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<String>, Vec<Row>) {
-    let setup = OnceLock::new();
-    let segment = (file.len() / (threads * SEGMENTS)).max(1);
-    let (cursor, totals) = (AtomicUsize::new(0), Mutex::new(vec![EMPTY_ROW; 256]));
+    let names = NameTable::new(file, slots);
+    let (pages, lines, segments) = (Jobs::default(), Jobs::default(), Jobs::default());
+    let totals = Mutex::new(vec![EMPTY_ROW; 256]);
+    let cuts = |file: &[u8], parts: usize, at, terminator| {
+        let size = (file.len() / parts).max(1);
+        let end = |at: usize| next_boundary(file, (at * size).min(file.len()), terminator);
+        (end(at), end(at + 1))
+    };
     let work = || {
-        let (_, names): &(Vec<String>, NameTable) = setup.wait();
+        let page_count = names.words.len().div_ceil(PAGE_WORDS);
+        pages.run_all(page_count, |page| {
+            names.words[page * PAGE_WORDS].store(0, Relaxed)
+        });
+        lines.run_all(threads * 4 + 1, |at| {
+            let (pos, end) = cuts(lookup, threads * 4, at, b"\n".as_slice());
+            names.parse_regions(lookup, pos, end);
+        });
         let mut rows = Box::new([EMPTY_ROW; 256]);
-        let claim = || Some(cursor.fetch_add(segment, Relaxed)).filter(|&s| s < file.len());
-        while let Some(start) = claim().filter(|_| !names.full.load(Relaxed)) {
+        segments.run(threads * SEGMENTS + 1, |at| {
             // The first boundary in the file ends the header, which always ends in CRLF (spec
             // section 2.2), so the first segment starts just after it.
-            let last = next_boundary(file, (start + segment).min(file.len()));
+            let (pos, end) = cuts(file, threads * SEGMENTS, at, b"\r\n".as_slice());
+            if names.full.load(Relaxed) || pos >= end {
+                return;
+            }
             // Maps the segment's pages in one call, instead of a page fault per 16 pages. A kernel
             // without this call just refuses it, and the faults come as before.
-            let at = (file.as_ptr() as usize + start) & !4095;
+            let at = (file.as_ptr() as usize + pos) & !4095;
             // SAFETY: the advice only reads pages in. A range past the mapping is refused.
-            unsafe { madvise(at as *mut u8, segment + 4096, 22) };
-            parse_records(next_boundary(file, start), last, names, &mut rows);
-        }
+            unsafe { madvise(at as *mut u8, end - pos + 4096, 22) };
+            parse_records(pos, end, &names, &mut rows);
+        });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
             merge(total, row);
         }
@@ -569,19 +592,15 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
                 work();
             });
         }
-        let names = NameTable::new(file, slots);
-        assert!(
-            setup
-                .set((parse_regions(lookup, names.regions), names))
-                .is_ok()
-        );
         work();
     });
-    let (keys, names) = setup.into_inner().unwrap();
     if names.full.load(Relaxed) {
         return aggregate(file, lookup, threads, slots * 4);
     }
-    (keys, totals.into_inner().unwrap())
+    (
+        names.keys.into_inner().unwrap(),
+        totals.into_inner().unwrap(),
+    )
 }
 
 fn main() -> io::Result<()> {

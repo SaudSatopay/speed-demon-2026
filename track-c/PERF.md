@@ -40,6 +40,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 18 | Threads start before the join table, tags as one vector per two groups (no spill branch), three numbers in one vector, name hash from its first 8 bytes, no bounds checks in the apply step | Traces show 88% of the run is parallel with every thread busy, so instructions still rule; a sample of the disassembly showed the spill branch, three digit parsers and repeated checks | pending | — | — | — |
 | 19 | MADV_POPULATE_READ on each claimed segment | A sample of the 12-thread run showed about 14% in the kernel, mostly mapping file pages a fault at a time | pending | — | — | — |
 | 20 | Slots, tags and the join table in one 2 MiB aligned mapping | The four huge pages under the slots were charged in full with 1.3 MB spare, while the join table and tags sat elsewhere on small pages | pending | — | — | — |
+| 21 | Back to separate slots, tags and join table, and threads share the setup: first touches, then region chunks, through one job counter | The shared mapping lost on the box (T flat, M 11.6 -> 12.0: the old layout's last huge page was never whole, so nothing was being wasted). Setup is the only serial part left, about 2 of 16 ms locally | pending | — | — | — |
 
 ## Decision log
 
@@ -83,6 +84,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D19. Map each segment's pages in one call. Context: page faults cost about a tenth of the CPU. Options: read() into buffers, which costs memory and a copy, or this. Chose this: local scorer T up 434x -> 502x, paired -3.6%, 3 lines. What would change our minds: no T gain on the box, where faults may cost less.
 
 **D20. One mapping for all three. Options: leave them apart, or grow the slots to fill the pages. Chose this: paired local -9%, 2 more names' worth of spare slots, S +15. What would change our minds: M or T worse on the box.
+
+**D21. Parallel setup, no arena. Options: keep the arena, or parse regions on one thread. Chose this: paired local -6.5% against the populate build, S 400 -> 436. What would change our minds: K below 36.22 on the box.
 
 ## What didn't work
 

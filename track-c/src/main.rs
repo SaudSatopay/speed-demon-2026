@@ -196,9 +196,7 @@ impl<'a> NameTable<'a> {
             let base = at.add(at.align_offset(huge));
             // No huge page past the last whole one: whether one fits there depends on the address.
             madvise(base.add(bytes / huge * huge), huge, 15);
-            for page in (0..bytes).step_by(4096) {
-                base.add(page).write_volatile(0);
-            }
+            madvise(base, bytes, 23);
             sched_setaffinity(0, 128, &allowed);
             NameTable {
                 records,

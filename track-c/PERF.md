@@ -63,6 +63,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 41 | Reads again | Mapping, populating and copying gave T 0.0287 on the box against 0.0237, though it was 1.5% faster locally: mapping pages costs far more there | pending | — | — | — |
 | 42 | Sixteen fewer lines, same code | S costs K too | pending | — | — | — |
 | 43 | Count with repeats in one word, name bytes with note bytes in another | The compiler vectorised pairs of adjacent adds into four instructions each, and turning a set bit into a new-name flag took four more | pending | — | — | — |
+| 44 | MADV_POPULATE_WRITE on the mapping, in one call | Touching a page at a time took 150 page faults more, and the piece-size runs suggest small-page faults cost a lot on the box: each larger piece needed more stack pages | pending | — | — | — |
 
 ## Decision log
 
@@ -152,6 +153,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D42. Shorter names where rustfmt was breaking calls over several lines. Counters unchanged.
 
 **D43. Pack them: all fit 32 bits per spec section 3. Cycles 159.7 -> 158.0, instructions 300 -> 297, S +3.
+
+**D44. One call. Faults 210 -> 65, kernel cycles flat locally, M the same, S -2. What would change our minds: T or M worse on the box over samples.
 
 ## What didn't work
 

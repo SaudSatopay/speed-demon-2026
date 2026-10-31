@@ -52,6 +52,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 30 | exp: 16 KiB pieces instead of 32 | A smaller buffer fits L1 even with two hyper-threads sharing it, at twice the reads; local timing can't weigh that for the box | pending | — | — | — |
 | 31 | Read 128 KiB pieces, 12 region chunks fewer per thread, the file length once | 16 KiB pieces cost T 0.0236 -> 0.0290 on the box: about 10 us per read there, so 32 KiB pieces still spent about 5 ms of T in syscalls | pending | — | — | — |
 | 32 | exp: 64 KiB pieces | 128 KiB gave T 0.0256 M 11.5, worse than 32 KiB's T 0.0236 M 10.2, so L1 fit matters as well as the number of reads | pending | — | — | — |
+| 33 | Back to 32 KiB pieces, keeping fewer region chunks and one length query per file | Box, T and M: 16 KiB 0.0290 and 9.9, 32 KiB 0.0236 and 10.2, 64 KiB 0.0235 and 12.2, 128 KiB 0.0256 and 11.5. A piece that fits L1 matters as much as the number of reads | pending | — | — | — |
 
 ## Decision log
 
@@ -119,6 +120,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D31. Weigh T^0.5 against M^0.2: 64 KiB +5.2% K, 128 KiB +7%, 256 KiB +6% by the model. Start at 128 KiB. Each thread's stack grows by 96 KB. What would change our minds: K below 40.23.
 
 **D32. Find the optimum between them on the box.
+
+**D33. 32 KiB: the best K of the four, with no T left to gain above it.
 
 ## What didn't work
 

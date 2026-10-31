@@ -38,6 +38,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 15 | exp: read the corpus in 128 KiB pieces, linked statically | On C, reading in pieces beat mmap on the box, though local timing couldn't tell | pending | — | — | — |
 | 16 | exp: 32 KiB pieces in place of 128 KiB | 128 KiB gave T 0.1047, 0.1037 and 0.1033 against 0.1045, 0.1041 and 0.1045 with mmap, flat for 23 more lines | pending | — | — | — |
 | 17 | Back to mapping the corpus, linked statically | Reading in pieces gained nothing on B: T 0.1033 to 0.1051 against 0.1041 to 0.1045 mapped, for 18 to 23 more lines | pending | — | — | — |
+| 18 | Bitmap words listed on their own, rows transposed per 64 documents, a threaded query parse, cheaper second looks | Serial phases were 13% of T, and per-document bitmap writes and second looks still cost 5% of the instructions each | pending | — | — | — |
 
 ## Decision log
 
@@ -76,6 +77,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D17. Experiment: the other piece size, before deciding. On A and C, 32 KiB is what paid. If this isn't clearly better either, B goes back to mmap, which has fewer lines.
 
 **D18. Decided by the board. B's time is its user code, unlike A and C, where faults mattered. Mapped, S 964. The static link stays, as it saves 0.25 ms from exec to main.
+
+**D19. The next 11%. A list for bitmap-term words with a fill to clear them (-177M instructions); a cheaper second look (-186M); rows per document, transposed per 64 documents, instead of a store per bit (-86M, -1.9M mispredicts); chains walked in turn with prefetch (cycles -2.3%, a cache change); threaded query parse and totals (about -1 ms); MADV_POPULATE_READ per range (user cycles -3%, wall flat, for the board to judge). On seed 1, 12 threads: cycles 2.53G -> 2.24G, instructions 3.96G -> 3.57G, mispredicts 11.3M -> 10.3M, local wall -12%, M max 41.8 MB, S 964 -> 1060. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 ## What didn't work
 

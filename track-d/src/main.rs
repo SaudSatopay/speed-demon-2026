@@ -348,7 +348,7 @@ fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Vec<AtomicU32>) {
     let records = zeroed_u32s(nodes * RECORD);
     // Neighbour + 1 fits `bits`, and a graph past 2^21 nodes keeps two neighbours instead of three,
     // which only makes the numbering a little worse. A field can straddle the two words, so each
-    // word gets its part of it; the other threads' fields in the word make it a locked or.
+    // word gets its part of it.
     let bits = usize::BITS - nodes.leading_zeros();
     let fields = (64 / bits.max(1)).min(3);
     for_each_batch(edge_lines, threads, |batch| {
@@ -360,8 +360,14 @@ fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Vec<AtomicU32>) {
             let seen = record[0].fetch_add(1, Relaxed);
             if seen < fields {
                 let packed = u64::from(head + 1) << (seen * bits);
-                record[1].fetch_or(packed as u32, Relaxed);
-                record[2].fetch_or((packed >> 32) as u32, Relaxed);
+                // A plain read, or and write of both words, not a locked update, which costs as
+                // much as the parse on the box, and no branch on which word the field lands in. Two
+                // threads writing one word at the same instant can lose a link, which costs locality
+                // and nothing else: the count is exact, and a node the walks miss becomes a seed.
+                let parts = [packed as u32, (packed >> 32) as u32];
+                for (word, part) in record[1..].iter().zip(parts) {
+                    word.store(word.load(Relaxed) | part, Relaxed);
+                }
             }
         }
     });
@@ -469,18 +475,17 @@ fn through(first: u16, then: u16) -> u16 {
     (u32::from(first) + u32::from(then)).min(u32::from(NO_ARC)) as u16
 }
 
-/// The length of the shortest path of at most two arcs from `a` to `b`.
-fn two_hops(locals: &[Local], a: u16, b: u16) -> u32 {
-    let start = &locals[a as usize];
-    let direct = u32::from(start.arcs[0][start.find(b)]);
-    let via = start.ids[..start.len as usize]
-        .iter()
-        .zip(&start.arcs[0])
-        .map(|(&x, &to_x)| {
-            let then = &locals[x as usize];
-            u32::from(to_x) + u32::from(then.arcs[0][then.find(b)])
-        });
-    via.min().map_or(direct, |shortest| shortest.min(direct))
+/// Whether some path of at most two arcs from `a` to `b` is no longer than `bound`. It stops at the
+/// first one, and a `bound` of `NO_ARC` is met by the direct arc, present or not. Every arc is in
+/// both its ends' lists, so the second hop is read from `b`'s, which is in cache, not the middle node's.
+fn within(a: &Local, b: &Local, b_id: u16, bound: u16) -> bool {
+    a.arcs[0][a.find(b_id)] <= bound
+        || a.ids[..a.len as usize]
+            .iter()
+            .zip(&a.arcs[0])
+            .any(|(&x, &to_x)| {
+                u32::from(to_x) + u32::from(b.arcs[1][b.find(x)]) <= u32::from(bound)
+            })
 }
 
 /// Shrinks the graph to what the queries can use. Queries are known by now, so any node that no query
@@ -554,11 +559,21 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                 }
             }
             for tier in 2..=MAX_DEGREE {
-                stack.extend(0..size as u16);
+                // Only a node with up to `tier` neighbours can go, and a neighbour that loses one is
+                // worth a second look. The first candidates are picked with no branch to mispredict.
+                let wanted =
+                    |local: &Local| !local.stays && (1..=tier).contains(&(local.len as usize));
+                stack.resize(size, 0);
+                let mut top = 0;
+                for (v, local) in locals[..size].iter().enumerate() {
+                    stack[top] = v as u16;
+                    top += usize::from(wanted(local));
+                }
+                stack.truncate(top);
                 while let Some(v) = stack.pop() {
                     let node = locals[v as usize];
                     let (len, [to, from]) = (node.len as usize, &node.arcs);
-                    if node.stays || len == 0 || len > tier {
+                    if !wanted(&node) {
                         continue;
                     }
                     // Weights of at most 2^15 keep every shortcut below NO_ARC, and only a very long
@@ -576,18 +591,18 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                     locals[v as usize].len = 0;
                     for &x in neighbours {
                         locals[x as usize].remove(v);
-                        stack.push(x);
                     }
                     for (i, &a) in neighbours.iter().enumerate() {
                         for (j, &b) in neighbours[..i].iter().enumerate() {
                             let (a_to_b, b_to_a) =
                                 (through(from[i], to[j]), through(from[j], to[i]));
-                            let a_to_b = if tier >= 3 && two_hops(&locals, a, b) <= a_to_b.into() {
+                            let (at_a, at_b) = (&locals[a as usize], &locals[b as usize]);
+                            let a_to_b = if tier >= 3 && within(at_a, at_b, b, a_to_b) {
                                 NO_ARC
                             } else {
                                 a_to_b
                             };
-                            let b_to_a = if tier >= 3 && two_hops(&locals, b, a) <= b_to_a.into() {
+                            let b_to_a = if tier >= 3 && within(at_b, at_a, a, b_to_a) {
                                 NO_ARC
                             } else {
                                 b_to_a
@@ -598,6 +613,7 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                             }
                         }
                     }
+                    stack.extend(neighbours.iter().filter(|&&x| wanted(&locals[x as usize])));
                 }
             }
             let first = forward.offsets[start].load(Relaxed) as usize;

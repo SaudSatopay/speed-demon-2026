@@ -44,6 +44,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 21 | exp: plain faults, no populate | Where B's time goes on the box | pending | — | — | — |
 | 22 | exp: parse and plan twice | Where B's time goes on the box | pending | — | — | — |
 | 23 | exp: the answer phase twice | Where B's time goes on the box | pending | — | — | — |
+| 24 | Back to the build before the measurements | The measurements of B's phases are done | pending | — | — | — |
 
 ## Decision log
 
@@ -94,6 +95,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D23. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **D24. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D25. Revert the experiments.
 
 ## What didn't work
 

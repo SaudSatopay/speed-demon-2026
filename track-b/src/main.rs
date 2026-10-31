@@ -1240,14 +1240,6 @@ fn main() -> io::Result<()> {
     // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
     let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
     let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
-    // exp: the answers once more first, into the file, which is then written again from the start,
-    // so that T minus the usual T is the wall time of the totals, the posting queries and the printing.
-    let saved: Vec<Answer> = plan.answers.iter().map(|a| *a.lock().unwrap()).collect();
-    answer_queries(file, &plan, &scans, threads);
-    for (answer, saved) in plan.answers.iter().zip(saved) {
-        *answer.lock().unwrap() = saved;
-    }
-    let file = File::create(format!("{out_dir}/results.txt"))?;
     answer_queries(file, &plan, &scans, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)

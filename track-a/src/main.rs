@@ -157,10 +157,9 @@ unsafe fn id_of(table: &[Slot], log: &[u8], start: usize, end: usize) -> u32 {
             // SAFETY: winning the exchange makes this thread the only writer, and no one reads the
             // bytes until the store below. The log holds these 60 bytes, or the padding does.
             unsafe {
-                slot.bytes
-                    .get()
-                    .cast::<[__m256i; 2]>()
-                    .write_unaligned(block)
+                log.as_ptr()
+                    .add(start)
+                    .copy_to_nonoverlapping(slot.bytes.get().cast(), 60)
             };
             slot.position.store(start as u32, Release);
             return index as u32;

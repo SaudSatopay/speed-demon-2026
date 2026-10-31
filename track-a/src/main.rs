@@ -206,15 +206,6 @@ fn parse(log: &[u8], table: &Table, hours: &[Hour], head: &AtomicUsize, size: us
     let space = unsafe { _mm256_set1_epi8(b' ' as i8) };
     while let Some(start) = claim() {
         let end = (start + size).min(log.len());
-        // Maps the segment's pages in one call, not in a fault per 16 pages. MADV_POPULATE_READ.
-        // SAFETY: the range is in the mapping, and this has no effect on what it holds.
-        unsafe {
-            madvise(
-                log.as_ptr().add(start & !4095).cast_mut(),
-                end - (start & !4095),
-                22,
-            )
-        };
         // A line belongs to the segment holding its first byte, so skip the one already started.
         // The log ends in LF, so this stops at the end of the log at the latest.
         let mut line = start;

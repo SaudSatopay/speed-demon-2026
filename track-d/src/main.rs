@@ -13,7 +13,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::Not;
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
@@ -30,16 +30,30 @@ const COARSE_BITS: u32 = 7;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(option: i32, value: i32) -> i32;
 }
 
-/// Zero bytes after the text in a buffer, so that block loads can run past its end.
-const PADDING: usize = 128;
-/// Bytes per read: little enough to stay in a thread's caches, enough that a read costs little per
-/// line. On the box, page faults on a mapped file cost far more than these copies.
-const PIECE: usize = 1 << 15;
-/// No edge line is longer: two ids of up to 10 digits, a weight of up to 10, and their separators.
-const LONGEST_LINE: usize = 33;
+/// Readable zero bytes after each mapped file, so that block loads can run past its end.
+const PADDING: usize = 4096;
+
+/// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
+/// scorer's memory peak doesn't charge us for these pages, unlike reading the file onto the heap.
+fn map_file(path: &str) -> io::Result<&'static [u8]> {
+    let (read, private, fixed, anonymous) = (1, 2, 0x10, 0x20);
+    let file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    // SAFETY: the first call reserves fresh zero pages, and the second maps the file over the start
+    // of them, which fails only on an empty file. Neither is ever unmapped, and nothing writes to the
+    // dataset while we run.
+    unsafe {
+        let null = std::ptr::null_mut();
+        let base = mmap(null, len + PADDING, read, private | anonymous, -1, 0);
+        let mapped = mmap(base, len, read, private | fixed, file.as_raw_fd(), 0);
+        assert!(base as isize != -1 && (mapped == base || len == 0));
+        Ok(std::slice::from_raw_parts(base.cast(), len))
+    }
+}
 
 /// Asks for the cache line holding `item`, so that a later access doesn't stall on it.
 fn prefetch<T>(item: &T) {
@@ -61,7 +75,7 @@ fn next_chunk(counter: &AtomicUsize, step: usize, limit: usize) -> Option<usize>
 /// the longest numbers: digits have bit 4 set, and spaces and LFs don't, so the first clear bit marks
 /// the end, and three multiplications parse the digits, with no byte loop to mispredict.
 fn next_number(text: &[u8], pos: &mut usize) -> u64 {
-    assert!(*pos + 8 <= text.len());
+    assert!(*pos + 8 <= text.len() + PADDING);
     // SAFETY: the assert keeps the load inside the mapping, and it needs no alignment.
     let word = unsafe { text.as_ptr().add(*pos).cast::<u64>().read_unaligned() };
     let digits = (!word & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
@@ -94,45 +108,19 @@ fn for_ranges(len: usize, threads: usize, work: impl Fn(usize, usize) + Sync) {
 const BATCH: usize = 32;
 
 /// Passes every edge line to `visit` as (tail, head, weight), in batches, from several threads. A
-/// line belongs to the range holding its first byte. The lines are in `first..last` of the file.
-fn for_each_batch(
-    graph: &File,
-    (first, last): (usize, usize),
-    threads: usize,
-    visit: impl Fn(&[(u32, u32, u32)]) + Sync,
-) {
-    for_ranges(last - first, threads, |start, end| {
-        let mut room = [0u8; PIECE + PADDING];
-        let (mut pos, end) = (first + start, first + end);
-        if start > 0 {
-            // The byte before the range says whether a line starts at its first byte.
-            let mut bytes = [0; 64];
-            let read = graph.read_at(&mut bytes, pos as u64 - 1).unwrap();
-            pos += bytes[..read]
-                .iter()
-                .position(|&c| c == b'\n')
-                .map_or(read, |at| at);
-        }
+/// line belongs to the range holding its first byte.
+fn for_each_batch(edge_lines: &[u8], threads: usize, visit: impl Fn(&[(u32, u32, u32)]) + Sync) {
+    for_ranges(edge_lines.len(), threads, |start, end| {
+        let line_start = |p: &usize| *p == 0 || edge_lines[p - 1] == b'\n';
+        let mut pos = (start..).find(line_start).unwrap();
         let (mut batch, mut count) = ([(0, 0, 0); BATCH], 0);
         while pos < end {
-            let len = PIECE.min(last - pos);
-            graph.read_exact_at(&mut room[..len], pos as u64).unwrap();
-            room[len..len + PADDING].fill(0);
-            let safe = if pos + len == last {
-                len
-            } else {
-                len - LONGEST_LINE
-            };
-            let mut at = 0;
-            while at < safe && pos + at < end {
-                let mut field = || next_number(&room, &mut at) as u32;
-                batch[count] = (field(), field(), field());
-                count = (count + 1) % BATCH;
-                if count == 0 {
-                    visit(&batch);
-                }
+            let mut field = || next_number(edge_lines, &mut pos) as u32;
+            batch[count] = (field(), field(), field());
+            count = (count + 1) % BATCH;
+            if count == 0 {
+                visit(&batch);
             }
-            pos += at;
         }
         visit(&batch[..count]);
     });
@@ -319,19 +307,18 @@ impl Graph {
 /// Builds the forward graph from the graph file, in new node numbers, and returns those numbers too.
 /// `offsets` has a final entry that counts no node, so it ends up as the arc total, which no `reserve`
 /// moves.
-fn build_graph(graph: &File, threads: usize) -> (Graph, Words) {
-    let (mut pos, mut header) = (0, [0; 64]);
-    graph.read_at(&mut header, 0).unwrap();
-    let nodes = next_number(&header, &mut pos) as usize;
-    next_number(&header, &mut pos); // The edge count: the file's length says the same.
-    let edge_lines = (pos, graph.metadata().unwrap().len() as usize);
+fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Words) {
+    let mut pos = 0;
+    let nodes = next_number(graph_file, &mut pos) as usize;
+    next_number(graph_file, &mut pos); // The edge count: the file's length says the same.
+    let edge_lines = &graph_file[pos..];
     let records = zeroed_u32s(nodes * RECORD);
     // Neighbour + 1 fits `bits`, and a graph past 2^21 nodes keeps two neighbours instead of three,
     // which only makes the numbering a little worse. A field can straddle the two words, so each
     // word gets its part of it.
     let bits = usize::BITS - nodes.leading_zeros();
     let fields = (64 / bits.max(1)).min(3);
-    for_each_batch(graph, edge_lines, threads, |batch| {
+    for_each_batch(edge_lines, threads, |batch| {
         for &(tail, _, _) in batch {
             prefetch(&records[tail as usize * RECORD]);
         }
@@ -355,7 +342,7 @@ fn build_graph(graph: &File, threads: usize) -> (Graph, Words) {
     drop(records);
     let mut forward = Graph::from_counts(out_counts);
 
-    for_each_batch(graph, edge_lines, threads, |batch| {
+    for_each_batch(edge_lines, threads, |batch| {
         let number = |node: u32| numbers[node as usize].load(Relaxed);
         let (mut renumbered, mut slots) = ([(0, 0, 0); BATCH], [0; BATCH]);
         for &(tail, head, _) in batch {
@@ -833,15 +820,12 @@ fn main() -> io::Result<()> {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let threads = if asked > 0 { asked } else { allowed };
-    let graph = File::open(format!("{data_dir}/graph.txt"))?;
-    let (mut forward, numbers) = build_graph(&graph, threads);
+    let (mut forward, numbers) = build_graph(map_file(&format!("{data_dir}/graph.txt"))?, threads);
 
-    let mut query_lines = std::fs::read(format!("{data_dir}/queries.txt"))?;
-    let lines = query_lines.len();
-    query_lines.resize(lines + PADDING, 0);
+    let query_lines = map_file(&format!("{data_dir}/queries.txt"))?;
     let (mut queries, mut pos) = (Vec::new(), 0);
-    while pos < lines {
-        let mut end = || numbers[next_number(&query_lines, &mut pos) as usize].load(Relaxed);
+    while pos < query_lines.len() {
+        let mut end = || numbers[next_number(query_lines, &mut pos) as usize].load(Relaxed);
         queries.push((end(), end(), AtomicU64::new(0)));
     }
     drop(numbers);

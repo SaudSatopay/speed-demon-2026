@@ -45,6 +45,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 23 | simplify's tier loop walks only candidate nodes, and `within` stops at the first qualifying hop | 82% of the 6.1M stack pops copied a 64-byte Local only to skip it, and the skip branch mispredicted 6%. Region pass 21.3 -> 15.8 ms local (11 runs each), 19.2 -> 15.9 alternating; counts.sh sample 1113.1 -> 1068.5 instructions per edge, mispredicts 5.91 -> 5.96; quick 45/45, threads 240/240; S +6 | pending | — | — | — |
 | 24 | Seventy fewer lines: single-use helpers folded into their callers, the three claim loops through one `next_chunk`, the numbers parsed through one closure, a `Side` pair started per query, tuple assignments | S 718 -> 648, about +1.6% K. counts.sh sample 1068.4 -> 1064.9 instructions and 5.96 -> 6.24 mispredicts per edge (layout noise in the tier loop, worth a quarter of the gain); quick 45/45, threads 240/240 | pending | — | — | — |
 | 25 | exp: read the graph file in 32 KiB pieces instead of mapping it | On C and A this beat the mapping on the box by 10% or more: page faults on a mapped file cost far more there than here. D reads the file twice, so it gets twice the copies but also no faults | pending | — | — | — |
+| 26 | Map the graph file again | Reading it in pieces gave T 0.1501 against about 0.151, for 18 more lines: D's parse is too small a part of its run | pending | — | — | — |
 
 ## Decision log
 
@@ -98,6 +99,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D23. Cut lines without touching the design. Context: S was our largest loss (718 against the best rival's 441), and rustfmt's chain and call widths decide what a one-liner can hold, so each cut was checked with cargo fmt and scc. Chose: fold helpers, one claim helper for the three atomic-cursor loops, one closure for the three numbers of an edge line, a pair of sides started per query, and tuple lets; nothing in the hot loops changed its instructions. Cost: mispredicts +0.28 per edge from code placement, which counts can see and timing can't. What would change our minds: T up on the board over two runs.
 
 **D24. Test on the box: local cycles -4%, S +11.
+
+**D25. Mapping stays.
 
 ## What didn't work
 

@@ -552,7 +552,7 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
     let (pages, lines, segments) = (Jobs::default(), Jobs::default(), Jobs::default());
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
     let cuts = |file: &[u8], parts: usize, at, terminator| {
-        let size = (file.len() / parts).max(1);
+        let size = file.len().div_ceil(parts).max(1);
         let end = |at: usize| next_boundary(file, (at * size).min(file.len()), terminator);
         (end(at), end(at + 1))
     };
@@ -561,12 +561,12 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
         pages.run_all(page_count, |page| {
             names.words[page * PAGE_WORDS].store(0, Relaxed)
         });
-        lines.run_all(threads * 4 + 1, |at| {
+        lines.run_all(threads * 4, |at| {
             let (pos, end) = cuts(lookup, threads * 4, at, b"\n".as_slice());
             names.parse_regions(lookup, pos, end);
         });
         let mut rows = Box::new([EMPTY_ROW; 256]);
-        segments.run(threads * SEGMENTS + 1, |at| {
+        segments.run(threads * SEGMENTS, |at| {
             // The first boundary in the file ends the header, which always ends in CRLF (spec
             // section 2.2), so the first segment starts just after it.
             let (pos, end) = cuts(file, threads * SEGMENTS, at, b"\r\n".as_slice());

@@ -41,6 +41,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 19 | MADV_POPULATE_READ on each claimed segment | A sample of the 12-thread run showed about 14% in the kernel, mostly mapping file pages a fault at a time | pending | — | — | — |
 | 20 | Slots, tags and the join table in one 2 MiB aligned mapping | The four huge pages under the slots were charged in full with 1.3 MB spare, while the join table and tags sat elsewhere on small pages | pending | — | — | — |
 | 21 | Back to separate slots, tags and join table, and threads share the setup: first touches, then region chunks, through one job counter | The shared mapping lost on the box (T flat, M 11.6 -> 12.0: the old layout's last huge page was never whole, so nothing was being wasted). Setup is the only serial part left, about 2 of 16 ms locally | pending | — | — | — |
+| 22 | Segment sizes round up, so that no tail is lost at many threads on a tiny file | aede9f8 lost the end of a tiny file at 64 threads (the 12-thread full run was never affected); a chained script of mine pushed it past the failed sweep | pending | — | — | — |
 
 ## Decision log
 
@@ -86,6 +87,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D20. One mapping for all three. Options: leave them apart, or grow the slots to fill the pages. Chose this: paired local -9%, 2 more names' worth of spare slots, S +15. What would change our minds: M or T worse on the box.
 
 **D21. Parallel setup, no arena. Options: keep the arena, or parse regions on one thread. Chose this: paired local -6.5% against the populate build, S 400 -> 436. What would change our minds: K below 36.22 on the box.
+
+**D22. Fix the rounding. The push script now refuses without a passed check on the exact tree.
 
 ## What didn't work
 

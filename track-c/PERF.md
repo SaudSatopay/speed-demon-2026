@@ -50,6 +50,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 28 | LOCK BTS instead of a compare-exchange loop for a country's bit | The bit's word and mask took 10 instructions per record, and the atomic left a load and a loop; BTS with a register offset finds the word itself | pending | — | — | — |
 | 29 | A key padded with ones and compared whole, with no header; shorter setup and record code | A header needed its own load, shift and compare, and a length check on top; a padded key can't equal a free or half-written slot, so one vector compare answers everything | pending | — | — | — |
 | 30 | exp: 16 KiB pieces instead of 32 | A smaller buffer fits L1 even with two hyper-threads sharing it, at twice the reads; local timing can't weigh that for the box | pending | — | — | — |
+| 31 | Read 128 KiB pieces, 12 region chunks fewer per thread, the file length once | 16 KiB pieces cost T 0.0236 -> 0.0290 on the box: about 10 us per read there, so 32 KiB pieces still spent about 5 ms of T in syscalls | pending | — | — | — |
 
 ## Decision log
 
@@ -113,6 +114,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D29. Padded keys. Instructions 299 -> 292 per record, S 511 -> 499, local flat. Also: Option::then_some in mark cost 15 instructions per record, so it stays an if. What would change our minds: a wrong answer in any stress run (0 of 300 on seeds 2 and 3).
 
 **D30. Test: local +3%, M -0.2 MB. Keep only if K beats 40.23 over samples.
+
+**D31. Weigh T^0.5 against M^0.2: 64 KiB +5.2% K, 128 KiB +7%, 256 KiB +6% by the model. Start at 128 KiB. Each thread's stack grows by 96 KB. What would change our minds: K below 40.23.
 
 ## What didn't work
 

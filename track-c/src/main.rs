@@ -43,10 +43,10 @@ unsafe extern "C" {
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
 const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
-const PIECE: usize = 1 << 14;
+const PIECE: usize = 1 << 17;
 
 /// An input file, read in parts.
-struct Input(File);
+struct Input(File, usize);
 
 impl Input {
     /// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
@@ -66,9 +66,8 @@ impl Input {
 
     /// Where part `at` of `parts` starts and ends. The first boundary in a file ends its header.
     fn part(&self, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
-        let len = self.0.metadata().unwrap().len() as usize;
-        let size = len.div_ceil(parts).max(1);
-        let cut = |at: usize| self.boundary((at * size).min(len), terminator);
+        let size = self.1.div_ceil(parts).max(1);
+        let cut = |at: usize| self.boundary((at * size).min(self.1), terminator);
         (cut(at), cut(at + 1))
     }
 
@@ -142,7 +141,7 @@ const REGION_IDS: usize = 1 << 20;
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 52 << 10;
+const STACK: usize = 164 << 10;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
 /// Slots per group. A name's home is a group, and it may sit there or in the next one.
@@ -636,8 +635,8 @@ fn aggregate(
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
     let work = || {
         let mut room = [0u8; PIECE + PADDING];
-        lines.run(threads * 16, true, |at| {
-            let (pos, end) = lookup.part(threads * 16, at, b"\n");
+        lines.run(threads * 4, true, |at| {
+            let (pos, end) = lookup.part(threads * 4, at, b"\n");
             names.parse_regions(lookup.read(pos, end - pos, &mut room), end - pos);
         });
         let mut rows = [EMPTY_ROW; 256];
@@ -675,8 +674,12 @@ fn main() -> io::Result<()> {
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let lookup = Input(File::open(format!("{data_dir}/regions.csv"))?);
-    let records = Input(File::open(format!("{data_dir}/records.csv"))?);
+    let open = |name| {
+        let file = File::open(format!("{data_dir}/{name}.csv"))?;
+        let len = file.metadata()?.len() as usize;
+        io::Result::Ok(Input(file, len))
+    };
+    let (lookup, records) = (open("regions")?, open("records")?);
     let (keys, totals) = aggregate(&records, &lookup, threads, INITIAL_SLOTS);
 
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are

@@ -17,7 +17,7 @@ use std::arch::x86_64::*;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Mutex};
-use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path, thread};
+use std::{fs::File, io::Write, mem::replace, os::unix::fs::FileExt, path::Path, thread};
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
 const HOURS: usize = 72;
@@ -89,46 +89,46 @@ fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
 }
 
 /// Mixes an endpoint's length with its first and last 8 bytes, which tell nearly all templated paths
-/// apart, with one multiply, whose high bits depend on every input bit. A test build swaps it for a
-/// constant, so that every key collides and any logic that trusts a hash without comparing the key
-/// shows up as a wrong answer.
+/// apart, with one multiply, whose high bits depend on every input bit. Short keys hash by their length
+/// alone: a load would hold more than the key, and there are very few of them. A test build swaps the
+/// mix for a constant, so that every key collides and any logic that trusts a hash without comparing
+/// the key shows up as a wrong answer.
 fn hash(first: u64, last: u64, len: usize) -> u64 {
-    let hash = (first ^ last.rotate_left(29) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    if cfg!(sd_const_hash) { 0 } else { hash }
+    let mix = (first ^ last.rotate_left(29)) * u64::from(len >= 8) ^ len as u64;
+    (if cfg!(sd_const_hash) { 0 } else { mix }).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// The id of `key`, which ends in its closing space, from slot `index` on, adding it if it's new: the
-/// path for the lines that `parse` can't settle in one compare. `through` marks the key's bytes among
-/// the first 64. A key is always compared in full, because templated paths share prefixes, suffixes and
+/// path for the lines that `parse` can't settle in one compare. `mask` marks the key's bytes among the
+/// first 64. A key is always compared in full, because templated paths share prefixes, suffixes and
 /// lengths.
 #[cold]
-fn id_of((slots, used, lines, _): &Table, key: &[u8], through: u64, mut index: usize) -> u32 {
+fn id_of((slots, used, lines, _): &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
     // SAFETY: `key` is inside a buffer, whose padding covers the loads.
     let (block, second) = unsafe { (load(key, 0), load(key, 64)) };
     // The key's bytes in the second block: at most 62, as it has at most 126 with its space.
     let rest = (1u64 << key.len().saturating_sub(64)) - 1;
     // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes were stored
-    // before it was published. Only a key with a second line gets its second line read here.
+    // before it was published. The line after a key's last is another key's, or unused, and its
+    // compare counts for nothing when the key has no second line.
     let read = |at: usize| unsafe { lines.as_ptr().add(at).cast::<[__m256i; 2]>().read() };
+    let differ = |at: usize, b, m: u64| !equal_bytes(read(at), b) & m;
     loop {
         index &= SLOTS - 1;
         let slot = &slots[index];
         let mut line = slot.load(Acquire) as usize;
         if line == 0 {
-            let count = key.len().div_ceil(64);
-            let at = used.fetch_add(count, Relaxed);
-            assert!(at + count <= IDS);
-            let cells = lines[at..at + count].as_flattened().iter();
+            // A key takes at most 2 lines.
+            let at = used.fetch_add(key.len().div_ceil(64), Relaxed);
+            assert!(at + 2 <= IDS);
+            let cells = lines[at..].as_flattened().iter();
             cells.zip(key).for_each(|(c, &b)| c.store(b, Relaxed));
-            // If another thread's key took the slot first, the lines reserved here stay unused.
-            match slot.compare_exchange(0, at as u16, Release, Acquire) {
-                Ok(_) => return at as u32,
-                Err(now) => line = now as usize,
-            }
+            // If another thread's key took the slot first, the lines reserved here stay unused, and
+            // the compare below tells whose key is in the slot.
+            let swap = slot.compare_exchange(0, at as u16, Release, Acquire);
+            line = swap.err().map_or(at, |now| now as usize);
         }
-        if !equal_bytes(read(line), block) & through == 0
-            && (rest == 0 || !equal_bytes(read(line + 1), second) & rest == 0)
-        {
+        if differ(line, block, mask) | differ(line + 1, second, rest) == 0 {
             return line as u32;
         }
         index += 1;
@@ -144,8 +144,7 @@ fn order_ids((slots, _, lines, _): &Table) -> (Vec<&'static [u8]>, Vec<usize>) {
     let key_of = |line: usize| text[line * 64..].split(|&b| b == b' ').next().unwrap();
     let line = |slot: &AtomicU16| slot.load(Acquire) as usize;
     let ids = slots.iter().map(line).filter(|&line| line > 0);
-    let mut ids: Vec<(&[u8], usize)> = ids.map(|line| (key_of(line), line)).collect();
-    ids.push((&[], 0));
+    let mut ids: Vec<(&[u8], usize)> = ids.map(|l| (key_of(l), l)).chain([(&[][..], 0)]).collect();
     ids.sort_unstable();
     ids.into_iter().unzip()
 }
@@ -199,91 +198,82 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// timestamp is always 27 bytes. A thread keeps its own unfilled blocks of each hour, so the hot path
 /// reads and writes no line that other threads write, and allocates nothing.
 fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Option<[usize; 2]>) {
-    let (slots, _, lines, state) = table;
     let mut room = [0u8; PIECE + PADDING];
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
-    let mut bigs = blocks;
     // The last line's hour: its index and its place in a block, and in a segment, its bytes. An aligned
     // place means the block is used up, and hours change only between chunks of the log.
-    let (mut hour, mut place) = (0, blocks[0]);
+    let (mut bigs, mut hour, mut place) = (blocks, 0, blocks[0]);
     // SAFETY: the build targets x86-64-v3, which has AVX2.
-    let space = unsafe { _mm256_set1_epi8(b' ' as i8) };
+    let gap = unsafe { [_mm256_set1_epi8(b' ' as i8); 2] };
     while let Some([start, end]) = go() {
-        let (mut pos, mut bytes) = (start, 0);
-        // A line belongs to the segment holding its first byte, so skip the one already started. The
-        // log ends in LF, and a line is much shorter than this, so there's an LF to find.
-        if start > 0 {
-            let got = log.read_at(&mut room[..512], start as u64 - 1).unwrap();
-            pos += room[..got].iter().position(|&b| b == b'\n').unwrap();
-        }
+        // A line belongs to the segment holding its first byte, so a segment after the first starts a
+        // byte early, and its first piece skips the line already started. The log ends in LF, and a
+        // line is much shorter than a piece, so there's an LF to find.
+        let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
             let got = log.read_at(&mut room[..PIECE], pos as u64).unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
             let whole = room[..got].iter().rposition(|&b| b == b'\n').unwrap() + 1;
-            let (stop, mut line, text) = (whole.min(end - pos), 0, &room[..]);
+            let (stop, text, skip) = (whole.min(end - pos), &room[..], usize::from(pos < start));
+            let mut line = skip * (text.iter().position(|&b| b == b'\n').unwrap() + 1);
             while line < stop {
                 // Reads at a fixed distance from `line` need no check, since `line` is inside the piece
                 // and the padding is longer than any such distance, and whatever they read is safe.
-                // SAFETY: both loads end at most 39 bytes after `line`.
-                let (now, method): (u64, u64) =
-                    unsafe { (load(text, line + 6), load(text, line + 31)) };
+                // The hour's bytes of the timestamp, and the method's 4th byte, whose low nibble picks
+                // its length.
+                // SAFETY: both loads end at most 32 bytes after `line`.
+                let (now, m): (u64, u8) = unsafe { (load(text, line + 6), load(text, line + 31)) };
                 if now != bytes {
                     blocks[hour] = place;
                     (bytes, hour) = (now, hour_index(now));
                     place = blocks[hour];
                     // Before any claim of this hour, this shows the claimer that this segment holds it
-                    // up, as its position is at or past the low mark. After one, it's too late.
-                    let mut state = state.lock().unwrap();
+                    // up, as its position is at or past the low mark. After one, it's too late, which
+                    // ends the round.
+                    let mut state = table.3.lock().unwrap();
                     state.1[hour] = state.1[hour].max(pos + line + 1);
                     if hour < state.0 {
-                        state.0 = usize::MAX;
-                        return;
+                        return state.0 = usize::MAX;
                     }
                 }
-                let at = line + 29 + (METHOD_LENS >> 4 * (method & 15) & 15) as usize;
+                let at = line + 29 + (METHOD_LENS >> 4 * (m & 15) & 15) as usize;
                 // SAFETY: the method's length is at most 15, so this ends within 108 bytes of `line`.
                 let key = unsafe { load(text, at) };
-                let spaces = equal_bytes(key, [space; 2]);
+                let spaces = equal_bytes(key, gap);
+                // Endpoints average 34 bytes, and 94% of them end within 64, so the second block is
+                // read only when the first has no space: there, the first's trailing zeros are 64.
                 // SAFETY: the padding covers it.
-                let second = || unsafe { equal_bytes(load(text, at + 64), [space; 2]) };
-                let len = match spaces {
-                    // Endpoints average 34 bytes, and 94% of them end within 64.
-                    0 => 64 + second().trailing_zeros() as usize,
-                    _ => spaces.trailing_zeros() as usize,
-                };
-                // Either way `key_end` is at most 108 bytes after `line`, or inside the piece, so the
-                // next two loads end at most 13 bytes later.
-                let key_end = at + len;
+                let far = || unsafe { equal_bytes(load(text, at + 64), gap) }.trailing_zeros();
+                let more = if spaces == 0 { far() } else { 0 };
+                let len = (spaces.trailing_zeros() + more) as usize;
+                // Either way the closing space, `close`, is at most 108 bytes after `line`, or inside
+                // the piece, so the next two loads end at most 13 bytes later.
+                let close = at + len;
                 // Statuses are 100 to 599.
                 // SAFETY: as above.
-                let is_error = u32::from(unsafe { load::<u8>(text, key_end + 1) } == b'5');
+                let is_error = u32::from(unsafe { load::<u8>(text, close + 1) } == b'5');
                 // Three status digits sit between two spaces, so the latency starts 5 bytes on.
                 // SAFETY: as above.
-                let (latency, digits) = unsafe { parse_latency(text, key_end + 5) };
-                // Short keys hash by their length alone: a load would hold more than the key, and there
-                // are very few of them.
+                let (latency, digits) = unsafe { parse_latency(text, close + 5) };
                 // SAFETY: both start inside the piece, as `at` is at least 29.
-                let (first, last) = unsafe { (load(text, at), load(text, key_end - 8)) };
-                let (first, last) = if len < 8 { (0, 0) } else { (first, last) };
+                let (first, last) = unsafe { (load(text, at), load(text, close - 8)) };
                 let index = (hash(first, last, len) >> 50) as usize;
                 // One compare of a whole line of the table, through the closing space, settles nearly
                 // every line of the log, with no branch on the length. An empty slot holds 0, and line 0
                 // is all zeros, so it can't match.
-                let kept = slots[index].load(Acquire) as usize;
-                // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes
-                // were stored before it was published.
-                let seen = unsafe { lines.as_ptr().add(kept).cast::<[__m256i; 2]>().read() };
-                let through = spaces ^ spaces.wrapping_sub(1);
-                let id = if !equal_bytes(seen, key) & through == 0 && spaces != 0 {
-                    kept as u32
-                } else {
-                    id_of(table, &text[at..=key_end], through, index)
-                };
+                let kept = table.0[index].load(Acquire) as usize;
+                // SAFETY: a slot holds a line inside the table's lines, aligned as they all are, and its
+                // bytes were stored before it was published.
+                let seen = unsafe { table.2.as_ptr().add(kept).cast::<[__m256i; 2]>().read() };
+                let mask = spaces ^ spaces.wrapping_sub(1);
+                let miss = || id_of(table, &text[at..=close], mask, index);
+                let hit = !equal_bytes(seen, key) & mask == 0 && spaces != 0;
+                let id = if hit { kept as u32 } else { miss() };
                 if latency >= BIG_LATENCY {
+                    // A fresh block of big latencies, from the back of the hour's array.
                     if bigs[hour] as usize % (BIG_BLOCK * 4) == 0 {
-                        let (slots, [_, taken, _]) = &hours[hour];
-                        let taken = taken.fetch_add(BIG_BLOCK, Relaxed) + BIG_BLOCK;
-                        bigs[hour] = slots[slots.len() - taken..][..BIG_BLOCK].as_ptr();
+                        let taken = hours[hour].1[1].fetch_add(BIG_BLOCK, Relaxed) + BIG_BLOCK;
+                        bigs[hour] = hours[hour].0[hours[hour].0.len() - taken..].as_ptr();
                     }
                     let big = u64::from(id) << 32 | u64::from(latency);
                     // SAFETY: as for `place` below. The array is page-aligned, and blocks hold even
@@ -291,15 +281,15 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
                     unsafe { (*bigs[hour].cast::<AtomicU64>()).store(big, Relaxed) };
                     bigs[hour] = bigs[hour].wrapping_add(2);
                 }
+                // A fresh block of records, from the front.
                 if place as usize % (BLOCK * 4) == 0 {
-                    let (slots, [next, ..]) = &hours[hour];
-                    place = slots[next.fetch_add(BLOCK, Relaxed)..][..BLOCK].as_ptr();
+                    place = hours[hour].0[hours[hour].1[0].fetch_add(BLOCK, Relaxed)..].as_ptr();
                 }
                 let record = id << ID_SHIFT | latency.min(BIG_LATENCY) << 1 | is_error;
                 // SAFETY: `place` is inside a block this thread reserved, until it's aligned again.
                 unsafe { (*place).store(record, Relaxed) };
                 place = place.wrapping_add(1);
-                line = key_end + 6 + digits;
+                line = close + 6 + digits;
             }
             pos += line;
         }
@@ -320,8 +310,7 @@ fn eight_digits(value: u64) -> u64 {
 /// Appends a number in decimal, with no loop or mispredicted branch for values below 10^8.
 fn push_decimal(out: &mut Vec<u8>, value: u64) {
     if value >= 100_000_000 {
-        write!(out, "{value}").unwrap();
-        return;
+        return write!(out, "{value}").unwrap();
     }
     let digits = eight_digits(value);
     let leading_zeros = (digits.trailing_zeros() as usize / 8).min(7);
@@ -331,12 +320,10 @@ fn push_decimal(out: &mut Vec<u8>, value: u64) {
 }
 
 /// One stable pass of an LSD radix sort. `at` holds each digit's count, `order` lists the digits that
-/// can occur, in the order they should come out, and `d` is a record's digit.
+/// can occur, in the order they should come out, and `d` is a record's digit. The counts become the
+/// digits' starting places, then each record goes to its digit's next place.
 fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl Fn(u32) -> usize) {
-    let mut total = 0;
-    for &digit in order {
-        total += std::mem::replace(&mut at[digit], total);
-    }
+    order.iter().fold(0, |t, &d| t + replace(&mut at[d], t));
     for &record in from {
         let place = &mut at[d(record)];
         // SAFETY: the counts are of these same records, each digit is in `order`, and `to` is as long
@@ -349,16 +336,15 @@ fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl F
 /// Appends one hour's output lines, given its records sorted by endpoint and then latency, where each
 /// id's group ends, its big latencies sorted by id and then latency, and the endpoints and ids in order.
 fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, out: &mut Vec<u8>) {
-    let clock = h + 18;
-    let stamp = format!("{}T{:02}:00:00Z ", DATES[clock / 24], clock % 24);
+    let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24);
+    // Each group starts where the one before it ends, and id 0's holds the unused ends of blocks.
     let mut start = ends[0] as usize;
     for (key, &id) in order.0.iter().zip(order.1).skip(1) {
-        let group = &recs[start..ends[id] as usize];
+        let group = &recs[replace(&mut start, ends[id] as usize)..ends[id] as usize];
         let Some(_) = group.first() else { continue };
         let n = group.len();
-        start += n;
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
-        let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
+        let (count, errors): (u64, u64) = (n as u64, group.iter().map(|r| u64::from(r & 1)).sum());
         let is_big = |&&r: &&u32| latency(r) == BIG_LATENCY;
         let big_count = group.iter().rev().take_while(is_big).count();
         let pct = |p: usize| {
@@ -369,10 +355,10 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, 
             }
         };
         let (p50, p99) = (pct(50), pct(99));
+        // Below 20 records, p95 and p99 are the same record.
         let p95 = if n <= 19 { p99 } else { pct(95) };
         out.extend_from_slice(stamp.as_bytes());
         out.extend_from_slice(key);
-        let count = n as u64;
         for value in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
             out.push(b' ');
             push_decimal(out, value);
@@ -406,24 +392,22 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
     let table = (slots, AtomicUsize::new(1), lines, state);
     let order = Mutex::new(Arc::new(order_ids(&table)));
     let all: Vec<usize> = (0..1024).collect();
-    let (cursor, written) = (AtomicUsize::new(0), Mutex::new(0));
+    let (cursor, put) = (AtomicUsize::new(0), Mutex::new(0));
     // A lower bound on the log position of any line each thread may yet read.
     let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
     // Tying the size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
     // smaller than a line on tiny inputs.
     let size = (end / (threads * 64)).max(1);
-    let write_hour = |hour: usize, scratch: &mut Vec<u8>| {
+    let write_hour = |hour: usize, tmp: &mut Vec<u32>| {
         let (array, [next, taken, ready]) = &hours[hour];
         // SAFETY: the hour is claimed, so no thread writes to its array any more, and what they wrote
         // is visible, as they had moved past it in `reached` by then.
         let slots = unsafe { from_raw_parts_mut(array.as_ptr() as *mut u32, array.len()) };
         let (recs, big) = slots.split_at_mut(slots.len() - taken.load(Relaxed));
         let recs = &mut recs[..next.load(Relaxed)];
-        // Three stable passes sort by latency first and endpoint last.
-        scratch.resize(recs.len() * 4 + 3, 0);
-        // SAFETY: any bytes make a valid `u32`. Three spare bytes cover the alignment prefix, so
-        // the slice holds exactly one word per record.
-        let (_, tmp, _) = unsafe { scratch.align_to_mut::<u32>() };
+        // Three stable passes sort by latency first and endpoint last, through one word of scratch per
+        // record.
+        tmp.resize(recs.len(), 0);
         let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
         for &record in recs.iter() {
             low[(record >> 1 & 511) as usize] += 1;
@@ -450,35 +434,39 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
         format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
         ready.store(text.leak().len() + 1, Release);
     };
-    // Appends the ready hours, in order, and frees them. A thread that finds this busy leaves its hour
-    // to the thread in here, or to the next to finish one, or in the end to this round itself.
-    let append = || -> Option<()> {
-        loop {
-            let mut next = written.try_lock().ok()?;
-            let (array, [.., len]) = hours.get(*next).filter(|h| h.1[2].load(Acquire) > 0)?;
+    // Appends the ready hours, in order, and frees them: `put` counts the hours out. A thread that
+    // finds this busy leaves its hour to the thread in here, or to the next to finish one, or in the
+    // end to this round itself.
+    let append = || {
+        let Ok(mut at) = put.try_lock() else { return };
+        while let Some((array, [.., n])) = hours.get(*at).filter(|h| h.1[2].load(Acquire) > 0) {
             // SAFETY: the text is whole, as its length is out, and nothing else refers to it.
-            let text = unsafe { from_raw_parts(array.as_ptr().cast(), len.load(Relaxed) - 1) };
+            let text = unsafe { from_raw_parts(array.as_ptr().cast(), n.load(Relaxed) - 1) };
             // `panic = "abort"`: a failed write ends the process.
             (&file).write_all(text).expect("writing the summary");
             // SAFETY: nothing else refers to these whole pages, and nothing reads them again.
             unsafe { madvise(text.as_ptr().cast_mut(), array.len() * 4, 4) }; // MADV_DONTNEED.
-            *next += 1;
+            *at += 1;
         }
     };
     // The first few threads also finish hours: enough to keep up with the rest, and few, since each
     // one's scratch stays as large as the largest hour it has seen.
     let work = &|me: usize| {
-        let mut scratch = Vec::with_capacity(usize::from(me < 4) << 20);
+        let mut scratch = Vec::with_capacity(usize::from(me < 4) << 18);
         let go = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
             let head = cursor.load(Relaxed);
             reached[me].store(head, Release);
             let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
             // An hour with no line yet has 0, and it's due only when all reading is done.
-            let due = |&seen: &usize| low >= end || seen > 0 && seen + end / share < low;
+            let due = |seen: usize| low >= end || seen > 0 && seen + end / share < low;
             let mut state = table.3.lock().unwrap();
-            let hour = state.0;
-            if me < 4 && state.1.get(hour).is_some_and(due) {
+            let (hour, seen) = (state.0, state.1.get(state.0).copied());
+            // Nothing waits for a thread that fell behind: on a shared machine, the others would then
+            // sit out its whole turn off the core, and that happens all the time, so a wait here turned
+            // a busy box into a 4 times slower run. Its records pile up meanwhile, which costs memory
+            // only while the box is busy.
+            if me < 4 && seen.is_some_and(due) {
                 state.0 += 1;
                 drop(state);
                 // While it writes, this thread holds no hour back.
@@ -487,16 +475,15 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
                 append();
                 continue;
             }
-            // Records pile up fast behind a stalled writer, so readers wait for it past a point.
-            let held = |&s: &usize| s > 0 && s + 6 * (end / share) < head;
-            if !state.1.get(hour).is_some_and(held) {
-                let start = cursor.fetch_add(size, Relaxed);
-                // At the end, once more with the mark at the end, which lets go of the last hours.
-                if start < end || head >= end && (me >= 4 || hour >= HOURS) {
-                    return (start < end).then_some([start, (start + size).min(end)]);
-                }
+            let start = cursor.fetch_add(size, Relaxed);
+            // At the end, once more with the mark at the end, which lets go of the last hours.
+            if start < end || head >= end && (me >= 4 || hour >= HOURS) {
+                return (start < end).then_some([start, (start + size).min(end)]);
             }
-            std::hint::spin_loop();
+            // The wait gives up its core, and the lock first: a spinning thread would keep the one
+            // it waits for off a shared core, and one put off while spinning here would keep the lock.
+            drop(state);
+            thread::yield_now();
         };
         parse(log, &table, &hours, go);
     };

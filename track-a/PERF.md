@@ -65,6 +65,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 43 | exp: each line's end found first, from a block at its 38th byte | The chain between lines runs through loads of each line's fields, about 35 cycles a line per thread, and the parse proper is about 11 ms of T on the box | pending | — | — | — |
 | 44 | exp: the mapped log with prefetch, on the early-finish build | Line ends first alone read T 0.0220 against 0.0193, so it goes; the mapped input is the other half of that idea | pending | — | — | — |
 | 45 | Back to the early-finish build on pread | Neither line ends first nor the mapped input beat it on the board | pending | — | — | — |
+| 46 | Readers no longer hold back for a slow thread, and 30 fewer lines | One local score read T 0.077 while other programs ran: readers stopped claiming when 1/8 of the log past the next hour, so one preempted reader held up the other 11 | pending | — | — | — |
 
 ## Decision log
 
@@ -154,6 +155,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D37. Experiment, against T 0.0193 at S 339, and the last one of this idea. If it doesn't beat that clearly, A stays on pread with the early-finish build, at S 339.
 
 **D38. Decided by the board, for S 339. A's parse keeps reading pieces, and its lines go through the old chain: shortening it gained locally on one thread, and nothing at 12 threads on the box.
+
+**D39. Remove the hold. The slow mode came from the `held` wait, as a thread preempted by anything else on the box stalled all the others for its scheduler turn. Yielding alone didn't help (75 ms against 65), removing the hold did (37 ms). Under 12 busy processes: T 55-60 -> 37-39 ms, old design about 120. Idle: cycles 297.6M -> 293.5M, wall flat at 12.2 ms, M flat at 16.2 to 17.8, though under load M rises about 2 MB, as readers can run further ahead. The cost: at worst K -2.5% if the box is busy, for T 1.5 times better in that case. S 339 -> 309. Grid 44/44, threads 234/234, const-hash 44/44, stress 0 wrong in 300, late logs pass.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

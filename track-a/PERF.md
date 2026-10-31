@@ -67,6 +67,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 45 | Back to the early-finish build on pread | Neither line ends first nor the mapped input beat it on the board | pending | — | — | — |
 | 46 | Readers no longer hold back for a slow thread, and 30 fewer lines | One local score read T 0.077 while other programs ran: readers stopped claiming when 1/8 of the log past the next hour, so one preempted reader held up the other 11 | pending | — | — | — |
 | 47 | exp: every piece read twice | Where the time goes on the box | pending | — | — | — |
+| 48 | exp: each hour finished twice | Where the time goes on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -160,6 +161,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D39. Remove the hold. The slow mode came from the `held` wait, as a thread preempted by anything else on the box stalled all the others for its scheduler turn. Yielding alone didn't help (75 ms against 65), removing the hold did (37 ms). Under 12 busy processes: T 55-60 -> 37-39 ms, old design about 120. Idle: cycles 297.6M -> 293.5M, wall flat at 12.2 ms, M flat at 16.2 to 17.8, though under load M rises about 2 MB, as readers can run further ahead. The cost: at worst K -2.5% if the box is busy, for T 1.5 times better in that case. S 339 -> 309. Grid 44/44, threads 234/234, const-hash 44/44, stress 0 wrong in 300, late logs pass.
 
 **D40. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D41. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

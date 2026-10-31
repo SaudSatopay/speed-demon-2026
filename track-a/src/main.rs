@@ -206,15 +206,11 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
     // SAFETY: the build targets x86-64-v3, which has AVX2.
     let gap = unsafe { [_mm256_set1_epi8(b' ' as i8); 2] };
     while let Some([start, end]) = go() {
-        let total = log.metadata().unwrap().len() as usize;
         // A line belongs to the segment holding its first byte, so a segment after the first starts a
         // byte early, and its first piece skips the line already started. The log ends in LF, and a
         // line is much shorter than a piece, so there's an LF to find.
         let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
-            // exp: a throwaway read of a far piece first, so the copy runs twice.
-            let far_pos = (pos + total / 2) % total;
-            log.read_at(&mut room[..PIECE], far_pos as u64).unwrap();
             let got = log.read_at(&mut room[..PIECE], pos as u64).unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
             let whole = room[..got].iter().rposition(|&b| b == b'\n').unwrap() + 1;
@@ -412,31 +408,40 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
         // Three stable passes sort by latency first and endpoint last, through one word of scratch per
         // record.
         tmp.resize(recs.len(), 0);
-        let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
-        for &record in recs.iter() {
-            low[(record >> 1 & 511) as usize] += 1;
-            high[(record >> 10 & 1023) as usize] += 1;
-            groups[(record >> ID_SHIFT) as usize] += 1;
+        for i in 0..2 {
+            let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
+            for &record in recs.iter() {
+                low[(record >> 1 & 511) as usize] += 1;
+                high[(record >> 10 & 1023) as usize] += 1;
+                groups[(record >> ID_SHIFT) as usize] += 1;
+            }
+            // An endpoint that's new since the order was made means a new order.
+            let mut now = order.lock().unwrap();
+            if now.1.iter().map(|&id| groups[id] as usize).sum::<usize>() != recs.len() {
+                *now = Arc::new(order_ids(&table));
+            }
+            let order = now.clone();
+            drop(now);
+            pass(recs, tmp, &mut low, &all, |r| (r >> 1 & 511) as usize);
+            pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
+            pass(recs, tmp, &mut groups, &order.1, |r| r as usize >> ID_SHIFT);
+            // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
+            // ones are zero, which sorts before id 1.
+            let big = unsafe { from_raw_parts_mut(big.as_mut_ptr().cast::<u64>(), big.len() / 2) };
+            big.sort_unstable();
+            // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
+            // this vector never reallocates, and it's leaked rather than dropped.
+            // exp: the first time through, the text goes to a throwaway vector.
+            let mut text = if i == 0 {
+                Vec::with_capacity(1 << 20)
+            } else {
+                unsafe { Vec::from_raw_parts(recs.as_mut_ptr().cast(), 0, array.len() * 4) }
+            };
+            format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
+            if i == 1 {
+                ready.store(text.leak().len() + 1, Release);
+            }
         }
-        // An endpoint that's new since the order was made means a new order.
-        let mut now = order.lock().unwrap();
-        if now.1.iter().map(|&id| groups[id] as usize).sum::<usize>() != recs.len() {
-            *now = Arc::new(order_ids(&table));
-        }
-        let order = now.clone();
-        drop(now);
-        pass(recs, tmp, &mut low, &all, |r| (r >> 1 & 511) as usize);
-        pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
-        pass(recs, tmp, &mut groups, &order.1, |r| r as usize >> ID_SHIFT);
-        // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
-        // ones are zero, which sorts before id 1.
-        let big = unsafe { from_raw_parts_mut(big.as_mut_ptr().cast::<u64>(), big.len() / 2) };
-        big.sort_unstable();
-        // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
-        // this vector never reallocates, and it's leaked rather than dropped.
-        let mut text = unsafe { Vec::from_raw_parts(recs.as_mut_ptr().cast(), 0, array.len() * 4) };
-        format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
-        ready.store(text.leak().len() + 1, Release);
     };
     // Appends the ready hours, in order, and frees them: `put` counts the hours out. A thread that
     // finds this busy leaves its hour to the thread in here, or to the next to finish one, or in the

@@ -44,6 +44,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 22 | exp: the packed neighbours written with a plain read, or and write of both words instead of two locked ORs | Board T rose 0.151 -> 0.162 (run-ffded32fab0f) with step 20: a locked update on a shared line costs far more on the box than here. A link lost to two threads writing one word at the same instant costs locality only: the count is exact, and a node the walks miss becomes a seed. counts.sh sample 1113.1 instructions, 5.91 mispredicts per edge; quick 45/45, threads 240/240; S +2 | pending | — | — | — |
 | 23 | simplify's tier loop walks only candidate nodes, and `within` stops at the first qualifying hop | 82% of the 6.1M stack pops copied a 64-byte Local only to skip it, and the skip branch mispredicted 6%. Region pass 21.3 -> 15.8 ms local (11 runs each), 19.2 -> 15.9 alternating; counts.sh sample 1113.1 -> 1068.5 instructions per edge, mispredicts 5.91 -> 5.96; quick 45/45, threads 240/240; S +6 | pending | — | — | — |
 | 24 | Seventy fewer lines: single-use helpers folded into their callers, the three claim loops through one `next_chunk`, the numbers parsed through one closure, a `Side` pair started per query, tuple assignments | S 718 -> 648, about +1.6% K. counts.sh sample 1068.4 -> 1064.9 instructions and 5.96 -> 6.24 mispredicts per edge (layout noise in the tier loop, worth a quarter of the gain); quick 45/45, threads 240/240 | pending | — | — | — |
+| 25 | exp: read the graph file in 32 KiB pieces instead of mapping it | On C and A this beat the mapping on the box by 10% or more: page faults on a mapped file cost far more there than here. D reads the file twice, so it gets twice the copies but also no faults | pending | — | — | — |
 
 ## Decision log
 
@@ -95,6 +96,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D22. Make simplify's tier loop visit candidates only. Context: a stamped build put the region pass at 18 to 21 ms of a 122 ms local run, and counters showed the tier loop at 58% of it, with 5M of its 6.1M pops skipped after a 64-byte copy. Chose: a stack of candidates (not staying, 1 to tier neighbours), a `within` that returns at the first hop that qualifies, and the second hop taken from the neighbour's own list. Evidence: region pass -17% to -26% local, instructions -3.9% on the sample, the simplified graph in the baseline's own run-to-run band. What would change our minds: no gain on the board over two runs.
 
 **D23. Cut lines without touching the design. Context: S was our largest loss (718 against the best rival's 441), and rustfmt's chain and call widths decide what a one-liner can hold, so each cut was checked with cargo fmt and scc. Chose: fold helpers, one claim helper for the three atomic-cursor loops, one closure for the three numbers of an edge line, a pair of sides started per query, and tuple lets; nothing in the hot loops changed its instructions. Cost: mispredicts +0.28 per edge from code placement, which counts can see and timing can't. What would change our minds: T up on the board over two runs.
+
+**D24. Test on the box: local cycles -4%, S +11.
 
 ## What didn't work
 

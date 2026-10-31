@@ -438,13 +438,26 @@ fn anchors(steps: &[Step], sample_df: &[u32], out: &mut Vec<u32>) {
 }
 
 /// A BOOL query's check at one of its anchors. The anchor is present, so the bits of a document's
-/// holding each of the query's other terms make a number from 0 to 31, and that bit of `truth` says
-/// whether the document counts here: whether it matches, and holds none of the query's earlier
-/// anchors, where it has already counted.
+/// holding each of the query's other terms make a number, and that bit of `truth` says whether the
+/// document counts here: whether it matches, and holds none of the query's earlier anchors, where it
+/// has already counted. Most queries have few terms, and need a smaller check.
 #[derive(Clone, Copy)]
-struct Packed {
+struct Check<const TERMS: usize> {
     truth: u32,
-    terms: [u32; 5],
+    terms: [u32; TERMS],
+}
+
+impl<const TERMS: usize> Check<TERMS> {
+    /// 1 if a document holding the terms marked in `present` counts here, else 0.
+    fn counts(&self, present: &[u64]) -> u64 {
+        let mut holds = 0;
+        for (slot, &term) in self.terms.iter().enumerate() {
+            // SAFETY: `present` has a bit for every term.
+            let word = unsafe { *present.get_unchecked(term as usize / 64) };
+            holds |= (word >> (term % 64) & 1) << slot;
+        }
+        u64::from(self.truth >> holds & 1)
+    }
 }
 
 /// For each of a word's 6 index bits, the positions in the word that have it set.
@@ -460,7 +473,7 @@ const INDEX_BIT_MASKS: [u64; 6] = [
 /// The check of a query with these steps at the given anchor, after the `earlier` ones. Each term's set
 /// is a mask over the 64 possible documents, so the steps give the truth table directly, and its top half
 /// is what's left with the last term, the anchor, present.
-fn pack(steps: &[Step], anchor: u32, earlier: &[u32]) -> Packed {
+fn pack(steps: &[Step], anchor: u32, earlier: &[u32]) -> Check<5> {
     let (mut truth, mut blocked, mut terms, mut others) = (0, 0, [ABSENT; 5], 0);
     for step in steps {
         let mut holds = INDEX_BIT_MASKS[5];
@@ -478,7 +491,7 @@ fn pack(steps: &[Step], anchor: u32, earlier: &[u32]) -> Packed {
             blocked |= holds;
         }
     }
-    Packed {
+    Check {
         truth: ((truth & !blocked) >> 32) as u32,
         terms,
     }
@@ -491,18 +504,28 @@ fn sum_sizes(sizes: &mut [u32]) {
     }
 }
 
+/// Where a term's BOOL checks start, in each list of them, and where its own count is. A term's checks
+/// end where the next term's start. Counts are in the order of the short checks, the long checks, then
+/// the terms'.
+#[derive(Clone, Copy)]
+struct AnchorLists {
+    short_from: u32,
+    long_from: u32,
+    shared: u32,
+}
+
 /// What the sample decided: how each term is stored, and what to check at each term's occurrences.
 struct Plan {
     bitmap_count: usize,
     list_count: usize,
     phrase_start: Vec<u32>, // A term's phrases are `phrases[phrase_start[t]..phrase_start[t + 1]]`...
     phrases: Vec<u32>, // ...each its query, the anchor's position in it, its length, its terms.
-    bool_start: Vec<u32>, // Likewise the BOOL checks anchored on a term...
-    bools: Vec<Packed>,
-    shared_of: Vec<u32>, // ...and where a term's own count sits, after the checks' counts.
+    anchor_lists: Vec<AnchorLists>,
+    short_checks: Vec<Check<3>>,
+    long_checks: Vec<Check<5>>,
     count_query: Vec<u32>, // Which query or term count each count belongs to.
     posting_queries: Vec<u32>, // The queries anchored on a common term.
-    count_slots: usize,  // Those, then one count for each term with one, then a spare.
+    count_slots: usize,    // Those, then one count for each term with one, then a spare.
 }
 
 /// How many documents hold each term, among pieces of the corpus as big as `SAMPLE_BYTES` in all, and
@@ -513,7 +536,8 @@ fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, u3
     let piece = SAMPLE_BYTES.min(docs.len()) / threads;
     on_threads(threads, || {
         let start = next_piece.fetch_add(1, Relaxed) * (docs.len() / threads);
-        let mut seen_in = vec![NONE; df.len()];
+        // The low byte of the last document holding each term. A rare mistake only skews the guess.
+        let mut seen_in = vec![0u8; df.len()];
         for_each_doc(
             docs,
             (start, start + piece),
@@ -525,8 +549,8 @@ fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, u3
                     let short = short_key(docs, start, end - start);
                     let index = home(terms.sets.len(), hash(short));
                     let term = terms.find(docs, start, end, short, index) as usize;
-                    if seen_in[term] != doc {
-                        seen_in[term] = doc;
+                    if seen_in[term] != doc as u8 {
+                        seen_in[term] = doc as u8;
                         df[term].fetch_add(1, Relaxed);
                     }
                 }
@@ -541,11 +565,11 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
     let term_count = queries.terms.keys.len();
     let (mut sample_df, sampled_docs) = sample_terms(docs, &queries.terms, threads);
 
-    // A query anchored on a common term, with df above about N/48, is answered from postings: bitmaps
+    // A query anchored on a common term, with df above about N/24, is answered from postings: bitmaps
     // for its common terms and chains for the others. On memory alone, a bitmap (N/8 bytes) and a
     // chain (about 3.3 bytes per posting) cross near df = N/26, but setting a bit is cheaper than
-    // extending a chain, and measuring put the best K near N/48. Any choice gives the same answers.
-    let common = |term: u32| sample_df[term as usize] * 32 >= sampled_docs;
+    // extending a chain, and measuring keeps M under the cap at N/24. Any choice gives the same answers.
+    let common = |term: u32| sample_df[term as usize] * 24 >= sampled_docs;
     const BITMAP: u32 = 1 << 31;
     let mut store_of = vec![NONE; term_count];
     let (mut bitmap_count, mut list_count, mut scan_count) = (0, 0, 0);
@@ -626,11 +650,15 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
         step.term = new_number[step.term as usize];
     }
 
-    let (mut phrase_start, mut bool_start) =
+    let mut phrase_start = vec![0u32; term_count + 1];
+    let (mut short_start, mut long_start) =
         (vec![0u32; term_count + 1], vec![0u32; term_count + 1]);
     let mut shared_of = vec![NONE; term_count];
     let mut shared_count = 0;
     let mut at_anchor = 0;
+    // A check holds the query's other terms, of which there are at most this many.
+    let is_short = |steps: &[Step]| steps.len() <= 4;
+    let steps_of = |query: &Query| &steps[query.start as usize..query.end as usize];
     for query in list.iter_mut().filter(|query| !query.is_phrase) {
         let these = &mut query_anchors[at_anchor..];
         if query.shared != NONE {
@@ -645,7 +673,12 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
         while these[count] != NONE {
             these[count] = new_number[these[count] as usize];
             if count > 0 || query.shared == NONE {
-                bool_start[these[count] as usize + 1] += 1;
+                let starts = if is_short(steps_of(query)) {
+                    &mut short_start
+                } else {
+                    &mut long_start
+                };
+                starts[these[count] as usize + 1] += 1;
             }
             count += 1;
         }
@@ -663,21 +696,33 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
         phrase_start[term + 1] += 3 + query.end - query.start;
     }
     sum_sizes(&mut phrase_start);
-    sum_sizes(&mut bool_start);
+    sum_sizes(&mut short_start);
+    sum_sizes(&mut long_start);
     let mut phrases = vec![0u32; phrase_start[term_count] as usize];
-    let filler = Packed {
-        truth: 0,
-        terms: [ABSENT; 5],
-    };
-    let check_count = bool_start[term_count];
-    let mut bools = vec![filler; check_count as usize];
+    let (short_count, long_count) = (short_start[term_count], long_start[term_count]);
+    let mut short_checks = vec![
+        Check {
+            truth: 0,
+            terms: [ABSENT; 3]
+        };
+        short_count as usize
+    ];
+    let mut long_checks = vec![
+        Check {
+            truth: 0,
+            terms: [ABSENT; 5]
+        };
+        long_count as usize
+    ];
+    let check_count = short_count + long_count;
     let mut count_query = vec![0u32; (check_count + shared_count + 1) as usize];
     let scan_slots = scan_count + shared_count;
     count_query[check_count as usize..]
         .iter_mut()
         .enumerate()
         .for_each(|(at, slot)| *slot = scan_count + at as u32);
-    let (mut next_phrase, mut next_bool) = (phrase_start.clone(), bool_start.clone());
+    let mut next_phrase = phrase_start.clone();
+    let (mut next_short, mut next_long) = (short_start.clone(), long_start.clone());
     let mut at_anchor = 0;
     for (index, query) in list.iter().enumerate() {
         let steps = &steps[query.start as usize..query.end as usize];
@@ -695,19 +740,37 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
             let count = these.iter().position(|&term| term == NONE).unwrap_or(0);
             let unchecked = usize::from(query.shared != NONE);
             for (k, &term) in these[..count].iter().enumerate().skip(unchecked) {
-                let at = &mut next_bool[term as usize];
-                bools[*at as usize] = pack(steps, term, &these[..k]);
-                count_query[*at as usize] = query.slot;
-                *at += 1;
+                let check = pack(steps, term, &these[..k]);
+                if is_short(steps) {
+                    let at = &mut next_short[term as usize];
+                    short_checks[*at as usize] = Check {
+                        truth: check.truth,
+                        terms: [check.terms[0], check.terms[1], check.terms[2]],
+                    };
+                    count_query[*at as usize] = query.slot;
+                    *at += 1;
+                } else {
+                    let at = &mut next_long[term as usize];
+                    long_checks[*at as usize] = check;
+                    count_query[short_count as usize + *at as usize] = query.slot;
+                    *at += 1;
+                }
             }
             at_anchor += count + 1;
         }
     }
     let starts = |start: &[u32], term: usize| start[term] != start[term + 1];
     // Each term's count, or the spare count for a term without one, which nothing reads.
-    for shared in shared_of.iter_mut() {
-        *shared = check_count + (*shared).min(shared_count);
-    }
+    let anchor_lists: Vec<AnchorLists> = (0..=term_count)
+        .map(|term| AnchorLists {
+            short_from: short_start[term],
+            long_from: long_start[term],
+            shared: check_count
+                + shared_of
+                    .get(term)
+                    .map_or(shared_count, |&at| at.min(shared_count)),
+        })
+        .collect();
     let mut hot_df = vec![[0u32; 4]; HOT_SETS];
     for set in terms.sets.iter_mut() {
         for way in (0..4).filter(|&way| set.short_keys[way] != 0) {
@@ -716,7 +779,9 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
             let word = term as u32
                 | u32::from(starts(&phrase_start, term)) * PHRASE_ANCHOR
                 | u32::from(
-                    starts(&bool_start, term) || shared_of[term] != check_count + shared_count,
+                    starts(&short_start, term)
+                        || starts(&long_start, term)
+                        || shared_of[term] != NONE,
                 ) * BOOL_ANCHOR
                 | u32::from(chained) * CHAINED;
             set.words[way] = word;
@@ -738,9 +803,9 @@ fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
         list_count: list_count as usize,
         phrase_start,
         phrases,
-        bool_start,
-        bools,
-        shared_of,
+        anchor_lists,
+        short_checks,
+        long_checks,
         count_query,
         posting_queries,
         count_slots: (scan_slots + 1) as usize,
@@ -765,10 +830,42 @@ struct ListState {
     fill: u32,
 }
 
+/// How many blocks are allocated at a time. Growing one Vec would hold twice the memory for a while.
+const CHUNK_BLOCKS: usize = 1 << 12;
+
+/// A thread's blocks, numbered from 1, in chunks that never move.
+#[derive(Default)]
+struct Blocks {
+    chunks: Vec<Vec<Block>>,
+    count: u32,
+}
+
+impl Blocks {
+    fn get(&self, number: u32) -> &Block {
+        let at = number as usize - 1;
+        &self.chunks[at / CHUNK_BLOCKS][at % CHUNK_BLOCKS]
+    }
+
+    fn get_mut(&mut self, number: u32) -> &mut Block {
+        let at = number as usize - 1;
+        &mut self.chunks[at / CHUNK_BLOCKS][at % CHUNK_BLOCKS]
+    }
+
+    /// Adds a block, and returns its number.
+    fn add(&mut self, block: Block) -> u32 {
+        if self.count as usize % CHUNK_BLOCKS == 0 {
+            self.chunks.push(Vec::with_capacity(CHUNK_BLOCKS));
+        }
+        self.chunks[self.count as usize / CHUNK_BLOCKS].push(block);
+        self.count += 1;
+        self.count
+    }
+}
+
 /// One thread's results. A thread claims ranges in document order, so its hits ascend, though a list
 /// of them still has to be merged with other threads'.
 struct ScanResult {
-    blocks: Vec<Block>,
+    blocks: Blocks,
     lists: Vec<ListState>,
     hits: Vec<u64>, // For each count, how many documents went into it, then the sum of their ids.
     phrase_hits: Vec<(u32, u32)>, // (query, doc)
@@ -836,7 +933,7 @@ fn scan_ranges(
 ) -> ScanResult {
     let terms = &queries.terms;
     let mut result = ScanResult {
-        blocks: Vec::new(),
+        blocks: Blocks::default(),
         lists: vec![ListState { tail: 0, fill: 0 }; plan.list_count],
         hits: vec![0; plan.count_query.len()],
         phrase_hits: Vec::new(),
@@ -931,21 +1028,19 @@ fn scan_ranges(
                 }
                 for &term in &chain_terms[..chains] {
                     let list = &mut result.lists[(term - chain_from) as usize];
-                    // A tail of 0 gets a new block too: then `fill` is 0, and there's no block 0 to read.
+                    // A tail of 0 gets a new block too: then `fill` is 0, and there's no block 0.
                     let full = list.tail == 0
                         || list.fill as usize == BLOCK_POSTINGS
-                        || doc - result.blocks[list.tail as usize - 1].first_doc
-                            > u32::from(u16::MAX);
+                        || doc - result.blocks.get(list.tail).first_doc > u32::from(u16::MAX);
                     if full {
-                        result.blocks.push(Block {
+                        list.tail = result.blocks.add(Block {
                             previous: list.tail,
                             first_doc: doc,
                             postings: [0; BLOCK_POSTINGS],
                         });
-                        list.tail = result.blocks.len() as u32;
                         list.fill = 0;
                     }
-                    let block = &mut result.blocks[list.tail as usize - 1];
+                    let block = result.blocks.get_mut(list.tail);
                     block.postings[list.fill as usize] = (doc - block.first_doc) as u16;
                     list.fill += 1;
                 }
@@ -974,30 +1069,31 @@ fn scan_ranges(
                 }
                 let this_doc = (1 << SUM_BITS) + u64::from(doc);
                 for &term in &bool_terms[..bools] {
-                    let term = term as usize;
-                    let shared = plan.shared_of[term] as usize;
+                    let lists = &plan.anchor_lists[term as usize..=term as usize + 1];
+                    let shared = lists[0].shared as usize;
                     result.hits[shared] += this_doc;
                     // A thread's hits ascend, so only its first ten can be among the smallest.
                     if result.hits[shared] >> SUM_BITS <= SMALLEST as u64 {
                         answers.add_smallest(plan.count_query[shared] as usize, doc);
                     }
-                    let (from, to) = (
-                        plan.bool_start[term] as usize,
-                        plan.bool_start[term + 1] as usize,
-                    );
-                    let checks = plan.bools[from..to].iter().zip(&mut result.hits[from..to]);
-                    for (at, (packed, hits)) in checks.enumerate() {
-                        let mut holds = 0;
-                        for (slot, &term) in packed.terms.iter().enumerate() {
-                            // SAFETY: `present` has a bit for every term.
-                            let word = unsafe { *present.get_unchecked(term as usize / 64) };
-                            holds |= (word >> (term % 64) & 1) << slot;
+                    let (from, to) = (lists[0].short_from as usize, lists[1].short_from as usize);
+                    let long_from = plan.short_checks.len() + lists[0].long_from as usize;
+                    let long_to = plan.short_checks.len() + lists[1].long_from as usize;
+                    let counted = |checks: u64, at: usize, hits: &mut u64| {
+                        *hits += checks * this_doc;
+                        if checks != 0 && *hits >> SUM_BITS <= SMALLEST as u64 {
+                            answers.add_smallest(plan.count_query[at] as usize, doc);
                         }
-                        let counts = u64::from(packed.truth >> holds & 1);
-                        *hits += counts * this_doc;
-                        if counts != 0 && *hits >> SUM_BITS <= SMALLEST as u64 {
-                            answers.add_smallest(plan.count_query[from + at] as usize, doc);
-                        }
+                    };
+                    let hits = &mut result.hits;
+                    for at in from..to {
+                        let counts = plan.short_checks[at].counts(&present);
+                        counted(counts, at, &mut hits[at]);
+                    }
+                    for at in long_from..long_to {
+                        let counts =
+                            plan.long_checks[at - plan.short_checks.len()].counts(&present);
+                        counted(counts, at, &mut hits[at]);
                     }
                 }
                 for &word in in_doc {
@@ -1025,7 +1121,7 @@ impl Index<'_> {
         for scan in self.scans {
             let (mut tail, mut fill) = (scan.lists[list].tail, scan.lists[list].fill as usize);
             while tail != 0 {
-                let block = &scan.blocks[tail as usize - 1];
+                let block = scan.blocks.get(tail);
                 for &offset in &block.postings[..fill] {
                     let doc = block.first_doc + u32::from(offset);
                     bits[doc as usize / 64] |= 1 << (doc % 64);

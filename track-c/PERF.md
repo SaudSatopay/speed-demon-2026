@@ -69,6 +69,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | pending | — | — | — |
 | 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | pending | — | — | — |
 | 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | pending | — | — | — |
+| 50 | Read a long name's pointer only after its slot says it's complete | A Fable review found it: the pointer and length were loaded before the Acquire, so a reader could compare against a null pointer while a writer was part way through. 2 crashes in 1,900 runs on a spec-legal stress input; the generator almost never writes such a name (over 32 bytes: about 1 seed in 100,000) | pending | — | — | — |
 
 ## Decision log
 
@@ -170,6 +171,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D48. A Fable agent's work on the name table. Local: L1 misses from L2 2.24 -> 1.24, from L3 0.30 -> 0.13, load waits -9 cycles, instructions +14, cycles about -1%, S +11. Keep only if T clearly beats 0.0232.
 
 **D49. Keep the design. S 541 -> 485, instructions +0.4 per record, cycles flat, stack use unchanged. A barrier between the phases cost 2% wall locally, so threads wait on a count of finished region jobs instead. What would change our minds: T up on the box.
+
+**D50. Acquire first. 0 crashes in 2,100 runs on the same input, hot path untouched, S +2. The same review found no wrong output in about 940 comparisons against the reference and 7,300 repeat runs.
 
 ## What didn't work
 

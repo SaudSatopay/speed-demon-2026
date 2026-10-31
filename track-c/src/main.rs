@@ -293,9 +293,13 @@ impl<'a> NameTable<'a> {
         unsafe {
             let stored = self.words.as_ptr().add(base);
             if len > INLINE_BYTES {
+                // The pointer and length may only be read once `LONG` shows they are in place.
+                if (*stored.add(3)).load(Acquire) != LONG {
+                    return false;
+                }
                 let (at, long) = ((*stored).load(Relaxed), (*stored.add(1)).load(Relaxed));
                 let name = std::slice::from_raw_parts(at as *const u8, long as usize);
-                return (*stored.add(3)).load(Acquire) == LONG && name == &text[start..start + len];
+                return name == &text[start..start + len];
             }
             let key = Self::key(text, start, len);
             let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));

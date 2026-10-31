@@ -431,7 +431,7 @@ type Found = [[u32; 4]; LISTED / 5];
 /// Segments per thread.
 const SEGMENTS: usize = 8;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
-const BLOCKS: usize = 16;
+const BLOCKS: usize = 8;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 
@@ -532,15 +532,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let region = (region as usize).min(REGION_IDS - 1);
             _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast());
             let raw = (note_at - name_at - 1).saturating_sub(2);
-            // The tags are too many for the first-level cache, so a batch gets them ready too.
-            let hash = NameTable::hash(text, name_at + 1, raw);
-            _mm_prefetch::<_MM_HINT_T0>(names.tags.as_ptr().add(names.home(hash) * GROUP).cast());
-            let fields = [hash as usize, region, id as usize, cents as usize];
-            *found.get_unchecked_mut(record) = fields.map(|field| field as u32);
+            let guess = names.guess_slot(NameTable::hash(text, name_at + 1, raw));
+            *found.get_unchecked_mut(record) =
+                [guess, region, id as usize, cents as usize].map(|v| v as u32);
         }
-    }
-    for entry in &mut found[..records] {
-        entry[0] = names.guess_slot(entry[0]) as u32;
     }
     for record in 0..records {
         let [_, name_at, note_at, region_at, ..] = separators(record);

@@ -55,6 +55,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 33 | Back to 32 KiB pieces, keeping fewer region chunks and one length query per file | Box, T and M: 16 KiB 0.0290 and 9.9, 32 KiB 0.0236 and 10.2, 64 KiB 0.0235 and 12.2, 128 KiB 0.0256 and 11.5. A piece that fits L1 matters as much as the number of reads | pending | — | — | — |
 | 34 | exp: 48 KiB pieces | A fit of T against piece size: about 18.2 ms plus 173/P ms for reads (10 us each here), plus a penalty only above 32 KiB, where the piece leaves L1. 48 KiB should halve the difference | pending | — | — | — |
 | 35 | exp: prefetch the tag window a stage before reading it, with 32 KiB pieces again | The tag load was the top stall in the samples (8%); 48 KiB pieces gave T 0.0233 M 10.7, no better than 32 KiB | pending | — | — | — |
+| 36 | exp: chunks of 8 blocks instead of 16, without the tag prefetch | Tag prefetch gave T 0.0241, no gain. Fewer records between a prefetch and its use could keep more of them in L1 | pending | — | — | — |
 
 ## Decision log
 
@@ -128,6 +129,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D34. Test the middle.
 
 **D35. Test on the box, where L2 hits cost more cycles than locally: local -1.8%, S +5.
+
+**D36. Test on the box; local is flat.
 
 ## What didn't work
 

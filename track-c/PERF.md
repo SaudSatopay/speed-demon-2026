@@ -47,6 +47,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 25 | No page faults or heap on the worker threads: one mapping holds the table, tags, join table and thread stacks, touched by the main thread while pinned to one CPU; raw pthreads on those stacks; country keys and long-name compares without the heap | A kernel trace showed memory.peak includes each CPU's unused charge batch, up to 252 KB per CPU that ever charges anything; workers still charged through stack faults and malloc arenas, and main wandered between CPUs | pending | — | — | — |
 | 26 | A shorter build of the same design: 32 bytes of key in the slot, with a header in the bitmap's spare bits; no file offset or spare buffer | S 576 cost 6% of K against the leader. With 32 inline bytes no generated name goes to the slow path, so the table no longer needs the file | pending | — | — | — |
 | 27 | No huge page past the last whole one, and smaller stacks | The mapping's tail sometimes covered a whole fifth 2 MiB extent, depending on the address, which added 1.4 MB: the difference between the two last board runs, M 10.55 and 11.98 | pending | — | — | — |
+| 28 | LOCK BTS instead of a compare-exchange loop for a country's bit | The bit's word and mask took 10 instructions per record, and the atomic left a load and a loop; BTS with a register offset finds the word itself | pending | — | — | — |
 
 ## Decision log
 
@@ -104,6 +105,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D26. Compact rewrite. S 576 -> 503, paired local -3.8%, M the same, all grids pass. What would change our minds: K below 38.69 over three samples.
 
 **D27. Mark the tail no-huge. Local peak over 40 runs, worst 11.32 -> 10.19, median 9.85 unchanged. Stacks 80 -> 68 KB (61.6 KB seen in use) and none for the main thread. What would change our minds: M still above 11 on the box.
+
+**D28. One instruction. Instructions 309 -> 299 per record, paired local -2.5%. Also tried and dropped: reusing the first stage's quote masks (more instructions), PGO (flat, code is nearly straight-line), a third loop for the locked writes (+1.7%), spawning during the first touches (+3.5%), row alignment, piece and chunk sizes (all flat locally). What would change our minds: T up on the box, where BTS m,r is microcoded.
 
 ## What didn't work
 

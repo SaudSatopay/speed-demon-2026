@@ -419,11 +419,13 @@ impl<'a> NameTable<'a> {
                 self.find(text, start, len)
             };
             let Some(base) = found else { return false };
-            let word = self.words.get_unchecked(base + 4 + country / 64);
-            let bit = 1u64 << (country % 64);
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
-            // OR, and the prefetch has already asked to own the line.
-            word.fetch_or(bit, Relaxed) & bit == 0
+            // write, and the prefetch has already asked to own the line. BTS finds the word itself.
+            let is_set: u8;
+            let bits = self.words.as_ptr().add(base + 4);
+            std::arch::asm!("lock bts qword ptr [{bits}], {bit}", "setc {is_set}", bits = in(reg) bits,
+                bit = in(reg) country, is_set = out(reg_byte) is_set, options(nostack));
+            is_set == 0
         }
     }
 }

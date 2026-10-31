@@ -60,6 +60,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 38 | One shared file again | One file per thread gave T 0.0236, no gain over 0.0235, for 12 more lines | pending | — | — | — |
 | 39 | Each row on its own cache line | Hardware counters (perf stat works in WSL now): 165 thread cycles per record, 108 not retiring, 45 of those waiting on loads, 2.9 first-level misses per record. A row straddling two lines is one of them | pending | — | — | — |
 | 40 | exp: map the file, populate a segment at a time, and copy pieces in user space | Piece sizes on the box suggest about 5 ms of T goes to the reads themselves, and that the copy into an L1-sized buffer is what helps. This keeps the copy with about 100 system calls instead of 6,100 | pending | — | — | — |
+| 41 | Reads again | Mapping, populating and copying gave T 0.0287 on the box against 0.0237, though it was 1.5% faster locally: mapping pages costs far more there | pending | — | — | — |
 
 ## Decision log
 
@@ -143,6 +144,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D39. Align rows. Cycles 164.7 -> 160.6 per record, misses 2.93 -> 2.21, both steady over repeats. A 40-byte row gave the same, for more code. 8, 4 and 32-block chunks, 24 KiB pieces and a tag prefetch all land at 160 to 164. What would change our minds: K below 40.3 over samples.
 
 **D40. Test on the box: local -1.5%, M +0.5 MB, S +18.
+
+**D41. Reads in 32 KiB pieces stay. Local timing can't rank kernel paths: only the box can.
 
 ## What didn't work
 

@@ -179,9 +179,12 @@ struct NameTable<'a> {
 
 impl<'a> NameTable<'a> {
     fn new(file: &'a [u8], slots: usize) -> Self {
-        // An untouched allocation stays out of the memory peak until a thread writes to it.
+        // Prime the table's huge-page extents on this thread before parallel writes begin.
         let zeroed = vec![0u64; slots * SLOT_WORDS + 8];
         let words: Vec<AtomicU64> = zeroed.into_iter().map(AtomicU64::new).collect();
+        for word in words.iter().step_by(1 << 18) {
+            word.store(0, Relaxed);
+        }
         NameTable {
             file,
             first: words.as_ptr().align_offset(64),

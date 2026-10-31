@@ -42,6 +42,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 19 | The same design in 130 fewer lines | S 1060 cost 3.8% of K against Cause Of Death's 818, whose T of 0.108 is close behind ours | pending | — | — | — |
 | 20 | exp: the scan twice | Where B's time goes on the box | pending | — | — | — |
 | 21 | exp: plain faults, no populate | Where B's time goes on the box | pending | — | — | — |
+| 22 | exp: parse and plan twice | Where B's time goes on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -88,6 +89,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D21. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **D22. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D23. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 ## What didn't work
 

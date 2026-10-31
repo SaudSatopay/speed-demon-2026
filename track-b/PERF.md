@@ -27,6 +27,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 4 | Bitmaps for more terms, at df >= N/48 instead of N/18 | Setting a bit is cheaper than extending a chain, and memory barely moved | run-5908f2d87a23 | 0.273 | 72.9 | 65.5 |
 | 5 | Answer BOOL queries during the scan, from term stamps, and store postings only for queries anchored on a common term | Chains held most of the memory, and nine queries in ten have a rare term in every match | run-d962e8c4f494 | 0.332 | 39.6 | 65.7 |
 | 6 | A lookup with one exit branch, and plain bitmap stores in ranges of whole bitmap words | The scan took 2.2 mispredicts per token, and `find` was 60% of the instructions | run-7b57f5310a53 | 0.308 | 40.5 | 66.4 |
+| 7 | Scan a document in stages: token edges, a small hot table with prefetched misses, a bit per term held, truth-table BOOL checks | Local phases showed BOOL evaluation at 42% and lookup at 28% of the scan, with stamps, packed queries and hits all missing cache | pending | — | — | — |
 
 ## Decision log
 
@@ -43,6 +44,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D6. Answer most BOOL queries in the scan.** Context: M was 73 MB, with the cap at 44 MB, and chains took most of it. Options: compress the chains, or not store them. Chose the second. Every document matching a BOOL query contains an anchor: the rarest AND of its last run, or else each OR term. So at an anchor's first occurrence in a document, each term's stamp (the last document holding it) gives the whole formula in six compares with no branch. Counts and sums accumulate per part of the corpus, and the ten smallest sit behind a lock per query. Evidence: on seed 1, 28,346 of 31,000 BOOL queries are answered this way, in 13.6M evaluations, and 71K terms store nothing. Local M 73 -> 41 MB, T flat, and S 832 -> 790, because the reordering and list modes went too. What would change our minds: a board T above 0.30 s, since this adds to the scan.
 
 **D7. Take the branches out of the lookup.** Context: T rose to 0.33 s with step 5, because every anchor now evaluates formulas during the scan, and counts showed 318 mispredicts per document. Chose: `find` always returns a slot, where a miss lands on an empty slot whose term is one no query uses, and its compares are joined into one exit test. A one-multiply hash takes the top bits. Thread ranges are rounded to 64 documents, so no two threads share a bitmap word, and every token that needs no chain does one plain `load | bit | store`, with stamp-only terms hitting a spare word. Evidence: mispredicts 318 -> 198 per document, instructions +8%, and local T -5.9% (noise 7.1%). What would change our minds: no gain on the board, since this clock favours fewer instructions.
+
+**D8. Replace the token-at-a-time scan. Context: one thread took 1120 ms to scan: BOOL 470, lookup 320, phrases 110. Chose stages per document with one branch each: edges from 64-byte masks, a 1024-slot table for hot terms whose misses are prefetched and resolved in a batch, a bit per term instead of a stamp, and a 64-bit truth table per query anchor so a check has no branch. Cost: S 799 -> about 950. Evidence: 12-thread local T 194 -> 140 ms, 43/43, 228/228, const-hash 38/38. What would change our minds: the board's T falling by less than S costs.
 
 ## What didn't work
 

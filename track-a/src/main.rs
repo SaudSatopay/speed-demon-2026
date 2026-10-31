@@ -206,11 +206,15 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
     // SAFETY: the build targets x86-64-v3, which has AVX2.
     let gap = unsafe { [_mm256_set1_epi8(b' ' as i8); 2] };
     while let Some([start, end]) = go() {
+        let total = log.metadata().unwrap().len() as usize;
         // A line belongs to the segment holding its first byte, so a segment after the first starts a
         // byte early, and its first piece skips the line already started. The log ends in LF, and a
         // line is much shorter than a piece, so there's an LF to find.
         let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
+            // exp: a throwaway read of a far piece first, so the copy runs twice.
+            let far_pos = (pos + total / 2) % total;
+            log.read_at(&mut room[..PIECE], far_pos as u64).unwrap();
             let got = log.read_at(&mut room[..PIECE], pos as u64).unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
             let whole = room[..got].iter().rposition(|&b| b == b'\n').unwrap() + 1;

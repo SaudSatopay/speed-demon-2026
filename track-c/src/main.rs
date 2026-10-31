@@ -126,10 +126,8 @@ fn parse_three(words: [u64; 3]) -> [u64; 3] {
         let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
         let packed = _mm256_packus_epi32(quads, quads);
         let eights = _mm256_madd_epi16(packed, _mm256_set1_epi32(0x0001_2710));
-        let (low, high) = (
-            _mm256_extract_epi64::<0>(eights) as u64,
-            _mm256_extract_epi32::<4>(eights),
-        );
+        let low = _mm256_extract_epi64::<0>(eights) as u64;
+        let high = _mm256_extract_epi32::<4>(eights);
         [low & 0xFFFF_FFFF, low >> 32, high as u32 as u64]
     }
 }
@@ -183,7 +181,7 @@ impl<'a> NameTable<'a> {
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
-        let (read_write, private_anonymous, huge) = (3, 0x22, 1 << 21);
+        let (read_write, private_anon, huge) = (3, 0x22, 1 << 21);
         let (mut allowed, mut here) = ([0u64; 16], [0u64; 16]);
         // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
         // so the parts don't overlap, and zero is a valid value of each atomic. The CPU sets are the
@@ -193,14 +191,7 @@ impl<'a> NameTable<'a> {
             let cpu = sched_getcpu().max(0) as usize;
             here[cpu / 64 % 16] = 1 << (cpu % 64);
             sched_setaffinity(0, 128, &here);
-            let at = mmap(
-                null_mut(),
-                bytes + huge,
-                read_write,
-                private_anonymous,
-                -1,
-                0,
-            );
+            let at = mmap(null_mut(), bytes + huge, read_write, private_anon, -1, 0);
             assert!(at as isize != -1);
             let base = at.add(at.align_offset(huge));
             // No huge page past the last whole one: whether one fits there depends on the address.
@@ -328,10 +319,8 @@ impl<'a> NameTable<'a> {
                 let name = std::slice::from_raw_parts(at as *const u8, long as usize);
                 return (*stored.add(3)).load(Acquire) == LONG && name == &text[start..start + len];
             }
-            let differ = _mm256_xor_si256(
-                Self::key(text, start, len),
-                _mm256_loadu_si256(stored.cast()),
-            );
+            let key = Self::key(text, start, len);
+            let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));
             _mm256_testz_si256(differ, differ) == 1
         }
     }
@@ -621,17 +610,15 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: *mut u8) {
     }
 }
 
+/// Every country's key and its row, in the same order.
+type Totals = (Vec<String>, Vec<Row>);
+
 /// Parses the whole file on `threads` threads and merges their rows, returning them with their keys.
 /// The threads share the regions too. Eight segments per thread balances the load. Tying the sizes to
 /// the thread count also makes the SD_THREADS test sweep move every cut. The spec's pool of names is a
 /// distribution, not a promise: if a file holds more names than the table, the pass is thrown away and
 /// redone with a bigger table.
-fn aggregate(
-    records: &Input,
-    lookup: &Input,
-    threads: usize,
-    slots: usize,
-) -> (Vec<String>, Vec<Row>) {
+fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> Totals {
     let names = NameTable::new(records, slots, threads);
     let (lines, segments) = (Jobs::default(), Jobs::default());
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
@@ -659,14 +646,14 @@ fn aggregate(
     if names.full.load(Relaxed) {
         return aggregate(records, lookup, threads, slots * 4);
     }
-    let keys = names.keys.into_inner().unwrap();
-    let keys = keys
-        .iter()
-        .map(|key| String::from_utf8_lossy(key).into_owned());
-    (
-        std::iter::once("_UNMATCHED".into()).chain(keys).collect(),
-        totals.into_inner().unwrap(),
-    )
+    let mut keys = vec!["_UNMATCHED".to_string()];
+    let codes = names.keys.into_inner().unwrap();
+    keys.extend(
+        codes
+            .iter()
+            .map(|code| String::from_utf8_lossy(code).into_owned()),
+    );
+    (keys, totals.into_inner().unwrap())
 }
 
 fn main() -> io::Result<()> {

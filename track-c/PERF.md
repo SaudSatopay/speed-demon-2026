@@ -61,6 +61,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 39 | Each row on its own cache line | Hardware counters (perf stat works in WSL now): 165 thread cycles per record, 108 not retiring, 45 of those waiting on loads, 2.9 first-level misses per record. A row straddling two lines is one of them | pending | — | — | — |
 | 40 | exp: map the file, populate a segment at a time, and copy pieces in user space | Piece sizes on the box suggest about 5 ms of T goes to the reads themselves, and that the copy into an L1-sized buffer is what helps. This keeps the copy with about 100 system calls instead of 6,100 | pending | — | — | — |
 | 41 | Reads again | Mapping, populating and copying gave T 0.0287 on the box against 0.0237, though it was 1.5% faster locally: mapping pages costs far more there | pending | — | — | — |
+| 42 | Sixteen fewer lines, same code | S costs K too | pending | — | — | — |
 
 ## Decision log
 
@@ -146,6 +147,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D40. Test on the box: local -1.5%, M +0.5 MB, S +18.
 
 **D41. Reads in 32 KiB pieces stay. Local timing can't rank kernel paths: only the box can.
+
+**D42. Shorter names where rustfmt was breaking calls over several lines. Counters unchanged.
 
 ## What didn't work
 

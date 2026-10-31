@@ -42,6 +42,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 20 | Slots, tags and the join table in one 2 MiB aligned mapping | The four huge pages under the slots were charged in full with 1.3 MB spare, while the join table and tags sat elsewhere on small pages | pending | — | — | — |
 | 21 | Back to separate slots, tags and join table, and threads share the setup: first touches, then region chunks, through one job counter | The shared mapping lost on the box (T flat, M 11.6 -> 12.0: the old layout's last huge page was never whole, so nothing was being wasted). Setup is the only serial part left, about 2 of 16 ms locally | pending | — | — | — |
 | 22 | Segment sizes round up, so that no tail is lost at many threads on a tiny file | aede9f8 lost the end of a tiny file at 64 threads (the 12-thread full run was never affected); a chained script of mine pushed it past the failed sweep | pending | — | — | — |
+| 23 | exp: two-stage parse: fixed blocks list the separators, then records read their fields from the list | Parse IPC stuck at 2.1 matches the 75-cycle chain through pos: each field's position depends on loading the one before. One-thread time held with far more instructions, so the chain was the limit | pending | — | — | — |
 
 ## Decision log
 
@@ -89,6 +90,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D21. Parallel setup, no arena. Options: keep the arena, or parse regions on one thread. Chose this: paired local -6.5% against the populate build, S 400 -> 436. What would change our minds: K below 36.22 on the box.
 
 **D22. Fix the rounding. The push script now refuses without a passed check on the exact tree.
+
+**D23. Test on the box. Options: tune the single-pass parser, or break the chain. Local: 1 thread -8%, 12 threads +8%, 307 instructions per record against 265, no fallback parser. The local 12-thread run is dominated by Hyper-V's lock waits, so only the box can decide.
 
 ## What didn't work
 

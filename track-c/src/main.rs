@@ -382,7 +382,7 @@ impl<'a> NameTable<'a> {
         None
     }
 
-    /// Marks this name as seen in `country`, and returns whether that's new for the country.
+    /// Marks this name as seen in `country`, and returns whether it had been already.
     ///
     /// # Safety
     /// `guess` must be where a slot's words start, and `country` below 256.
@@ -396,23 +396,24 @@ impl<'a> NameTable<'a> {
             } else {
                 self.find(text, start, len)
             };
-            let Some(base) = found else { return false };
+            let Some(base) = found else { return true };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself.
             let is_set: u8;
             let bits = self.words.as_ptr().add(base + 4);
             asm!("lock bts [{}], {}", "setc {}", in(reg) bits, in(reg) country, out(reg_byte) is_set);
-            is_set == 0
+            is_set != 0
         }
     }
 }
 
-/// A country's totals, in output order: count, id sum, amount sum, lowest amount, highest amount,
-/// distinct names, name bytes and note bytes.
+/// A country's totals: its count with, above bit 32, how many of its records repeat a name; id sum;
+/// amount sum; lowest amount; highest amount; and name bytes with, above bit 32, note bytes. All the
+/// packed columns fit 32 bits (spec section 3), and one add does the work of two.
 #[repr(align(64))]
 #[derive(Clone, Copy)]
-struct Row([i64; 8]);
-const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0]);
+struct Row([i64; 6]);
+const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
@@ -544,22 +545,22 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             (count(name_at, name), count(name_at, both))
         };
         // SAFETY: the first pass kept `region` inside the table, and `guess` came from `guess_slot`.
-        let (country, is_new) = unsafe {
+        let (country, repeat) = unsafe {
             let country = usize::from(names.regions.get_unchecked(region as usize).load(Relaxed));
             let key = (name_at + 1, name.saturating_sub(2));
             (country, names.mark(guess as usize, text, key, country))
         };
         let cents = i64::from(cents as i32);
         let row = &mut rows[country].0;
-        row[0] += 1;
+        row[0] += 1 + (i64::from(repeat) << 32);
         row[1] += i64::from(id);
         row[2] += cents;
         (row[3], row[4]) = (row[3].min(cents), row[4].max(cents));
-        row[5] += i64::from(is_new);
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
-        row[6] += (name - name_quotes / 2).saturating_sub(1) as i64;
-        row[7] += (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
+        let name_bytes = (name - name_quotes / 2).saturating_sub(1) as i64;
+        let note_bytes = (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
+        row[5] += name_bytes + (note_bytes << 32);
     }
 }
 
@@ -637,9 +638,10 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
         });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
             let (total, row) = (&mut total.0, &row.0);
-            let (low, high) = (total[3].min(row[3]), total[4].max(row[4]));
-            (0..8).for_each(|i| total[i] = total[i].wrapping_add(row[i]));
-            (total[3], total[4]) = (low, high);
+            for i in [0, 1, 2, 5] {
+                total[i] += row[i];
+            }
+            (total[3], total[4]) = (total[3].min(row[3]), total[4].max(row[4]));
         }
     };
     run_threads(&work, threads, names.stacks);
@@ -677,15 +679,17 @@ fn main() -> io::Result<()> {
     let mut lines: Vec<_> = keys.iter().zip(&totals).collect();
     lines.sort_by_key(|&(key, _)| key);
     let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt"))?);
-    for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] > 0) {
-        write!(out, "{key} {} {}", row[0], row[1])?;
+    for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
+        let count = row[0] & 0xFFFF_FFFF;
+        write!(out, "{key} {count} {}", row[1])?;
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
         // which would lose the sign of -0.75. Zero never gets a sign.
         for cents in &row[2..5] {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
             write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
         }
-        writeln!(out, " {} {} {}", row[5], row[6], row[7])?;
+        let (new, name_bytes) = (count - (row[0] >> 32), row[5] & 0xFFFF_FFFF);
+        writeln!(out, " {new} {name_bytes} {}", row[5] >> 32)?;
     }
     out.flush()
 }

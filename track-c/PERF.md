@@ -62,6 +62,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 40 | exp: map the file, populate a segment at a time, and copy pieces in user space | Piece sizes on the box suggest about 5 ms of T goes to the reads themselves, and that the copy into an L1-sized buffer is what helps. This keeps the copy with about 100 system calls instead of 6,100 | pending | — | — | — |
 | 41 | Reads again | Mapping, populating and copying gave T 0.0287 on the box against 0.0237, though it was 1.5% faster locally: mapping pages costs far more there | pending | — | — | — |
 | 42 | Sixteen fewer lines, same code | S costs K too | pending | — | — | — |
+| 43 | Count with repeats in one word, name bytes with note bytes in another | The compiler vectorised pairs of adjacent adds into four instructions each, and turning a set bit into a new-name flag took four more | pending | — | — | — |
 
 ## Decision log
 
@@ -149,6 +150,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D41. Reads in 32 KiB pieces stay. Local timing can't rank kernel paths: only the box can.
 
 **D42. Shorter names where rustfmt was breaking calls over several lines. Counters unchanged.
+
+**D43. Pack them: all fit 32 bits per spec section 3. Cycles 159.7 -> 158.0, instructions 300 -> 297, S +3.
 
 ## What didn't work
 

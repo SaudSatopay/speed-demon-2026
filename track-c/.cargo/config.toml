@@ -1,6 +1,7 @@
-# Never also set RUSTFLAGS, which replaces these flags entirely.
+# Never also set RUSTFLAGS, which replaces these flags entirely. `+crt-static` links glibc in, so the
+# timed run skips the dynamic loader's work: T counts from exec.
 [build]
 # x86-64-v3 is AVX2, BMI2, POPCNT and friends, and no AVX-512, like the scoring box. The box also has
 # carry-less multiply and PREFETCHW, which x86-64-v3 leaves out. The quote masks here don't need the
 # multiply. PREFETCHW lets the name table ask for a slot's line with intent to write.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+prfchw"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+prfchw,+crt-static"]

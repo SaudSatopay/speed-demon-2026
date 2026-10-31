@@ -47,6 +47,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 25 | Table slots are cache lines with the key's first 60 bytes and its position | Counters put id_of at 31% of cycles, most of it stalled on two loads: the slot, and the key in the log on a different page each time | pending | — | — | — |
 | 26 | A slot's key bytes written without touching its position | The 64-byte store of step 25 ran over the position, which other threads read while a slot fills | pending | — | — | — |
 | 27 | The fix itself: a slot's key bytes copied, exactly 60 of them | The commit before this one carried only its PERF.md row, as the patch failed on formatted source and nothing stopped the script | pending | — | — | — |
+| 28 | Back to slots of one position: cache-line slots gained nothing on the board | Steps 25 to 27 gave T 0.0287 and 0.0294 at S 289, against T 0.0284 at S 264 for the old slots | pending | — | — | — |
 
 ## Decision log
 
@@ -100,6 +101,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D19. Fix a race before anything else. Step 25 wrote a whole block into a slot's 60 bytes, so for a moment the position held 4 bytes of text. A reader could take that for a published slot, compare half-written bytes, move on and give the same key a second id. Nothing caught it: the grid passed, as this needs two threads on a new key at the same instant. Now exactly 60 bytes are copied, and the position is written only by the exchange and the publishing store. Stress: repeated runs on seed 2's sample at 2 to 14 threads, all right.
 
 **D20. The code of step 26. A slot's bytes are now copied with no store past them, so the position changes only by the exchange and the publishing store. Stress: 400 runs on seed 2's sample at 2 to 14 threads, none wrong. The scripts now stop when a patch fails.
+
+**D21. Revert. Local cycles fell 6%, and the board's T didn't: K 42.66 -> 41.37. The box has 1.5 times our L1 and larger L2, so the key compare that stalled here may not stall there. Lesson: a local cycle count ranks instruction cuts, not cache layouts, and cache layouts need the board.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

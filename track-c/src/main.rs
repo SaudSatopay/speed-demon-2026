@@ -111,10 +111,10 @@ const REGION_IDS: usize = 1 << 20;
 /// Returns the join table, country indices by region id, and each index's key. Index 0 is
 /// `_UNMATCHED`, and the codes take the next indices as they first appear, so the output is sorted
 /// when it's written.
-fn parse_regions(file: &[u8]) -> (Vec<u8>, Vec<String>) {
+fn parse_regions(file: &[u8], country_of: &[AtomicU8]) -> Vec<String> {
     let mut pos = b"region_id,country\n".len(); // The header never varies (spec section 2.3).
     // `index_of` takes every code in `[A-Z]{3}`.
-    let (mut country_of, mut index_of) = (vec![0u8; REGION_IDS], vec![0u8; 26 * 26 * 26]);
+    let mut index_of = vec![0u8; 26 * 26 * 26];
     let mut keys = vec!["_UNMATCHED".to_string()];
     while pos < file.len() {
         // SAFETY: `pos` is inside the file, and the padding covers the load.
@@ -127,14 +127,16 @@ fn parse_regions(file: &[u8]) -> (Vec<u8>, Vec<String>) {
             keys.push(String::from_utf8_lossy(&file[pos..pos + 3]).into_owned());
         }
         pos += 4; // The three letters and the LF.
-        country_of[id as usize] = index_of[code];
+        country_of[id as usize].store(index_of[code], Relaxed);
     }
-    (country_of, keys)
+    keys
 }
 
 /// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
-const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
+const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 112_000 };
+/// On the box, the kernel backs a mapping aligned to this with huge pages, and charges them in full.
+const HUGE_PAGE: usize = 1 << 21;
 /// Words per slot, which is one cache line: three words of key, a header, and 256 country bits.
 const SLOT_WORDS: usize = 8;
 /// Most names fit in the slot itself: on seed 1, 99.99% of them.
@@ -154,30 +156,47 @@ static KEY_MASKS: [u64; 7] = [!0, !0, !0, 0, 0, 0, 0];
 /// sees the header may read them as plain memory.
 struct NameTable<'a> {
     file: &'a [u8],
-    words: Vec<AtomicU64>,
-    tags: Vec<AtomicU8>,
+    words: &'static [AtomicU64],
+    tags: &'static [AtomicU8],
+    regions: &'static [AtomicU8], // The join table, country indices by region id.
     groups: usize, // Homes. The tags and slots have one more group, for the last home's window.
-    first: usize,  // The word where the first slot starts, on a cache line boundary.
     full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
+    /// Maps the slots, tags and join table together, so that at the initial size they just fill four
+    /// huge pages: the memory charged for them anyway, and very few TLB entries to walk for.
     fn new(file: &'a [u8], slots: usize) -> Self {
-        // Prime the table's huge-page extents on this thread before parallel writes begin.
-        let groups = slots / GROUP;
-        let zeroed = vec![0u64; (groups + 1) * GROUP * SLOT_WORDS + 8];
-        let words: Vec<AtomicU64> = zeroed.into_iter().map(AtomicU64::new).collect();
-        let extents = words.iter().step_by(1 << 18);
-        extents.for_each(|word| word.store(0, Relaxed));
-        NameTable {
-            file,
-            first: words.as_ptr().align_offset(64),
-            words,
-            tags: (0..(groups + 1) * GROUP)
-                .map(|_| AtomicU8::new(0))
-                .collect(),
-            groups,
-            full: AtomicBool::new(false),
+        let tags = (slots / GROUP + 1) * GROUP;
+        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
+        let bytes = regions_at + REGION_IDS;
+        let (read_write, private_anonymous, hugepage) = (3, 0x22, 14);
+        // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
+        // so the three parts don't overlap, and zero is a valid value of each atomic. Touching each
+        // huge page here, before parallel writes begin, keeps two threads from each getting one.
+        unsafe {
+            let at = mmap(
+                null_mut(),
+                bytes + HUGE_PAGE,
+                read_write,
+                private_anonymous,
+                -1,
+                0,
+            );
+            assert!(at as isize != -1);
+            let base = at.add(at.align_offset(HUGE_PAGE));
+            madvise(base, bytes, hugepage);
+            (0..bytes)
+                .step_by(HUGE_PAGE)
+                .for_each(|at| base.add(at).write_volatile(0));
+            NameTable {
+                file,
+                words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),
+                tags: std::slice::from_raw_parts(base.add(tags_at).cast(), tags),
+                regions: std::slice::from_raw_parts(base.add(regions_at).cast(), REGION_IDS),
+                groups: slots / GROUP,
+                full: AtomicBool::new(false),
+            }
         }
     }
 
@@ -208,7 +227,7 @@ impl<'a> NameTable<'a> {
 
     /// Where a slot's words start.
     fn base(&self, group: usize, slot: u32) -> usize {
-        self.first + (group * GROUP + slot as usize) * SLOT_WORDS
+        (group * GROUP + slot as usize) * SLOT_WORDS
     }
 
     /// The tags of the two groups at `group`, which must be a home.
@@ -437,13 +456,13 @@ const BATCH: usize = 8;
 const SEGMENTS: usize = 8;
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, rows: &mut Rows) {
+fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows) {
     let file = names.file;
     let (mut batch, mut count) = ([Pending::default(); BATCH], 0);
     while pos < end {
         // SAFETY: `pos` starts inside the file, and a field whose mask comes back empty is checked
         // below. In one pass over a record, the numbers and the mask reach at most about 100 bytes
-        // past that, all inside the padding. `regions` has `REGION_IDS` entries.
+        // past that, all inside the padding.
         let (id, region, cents, name, note) = unsafe {
             let mut word = load_u64(file, pos);
             // A byte order mark can only start a record here, and no record otherwise starts with it.
@@ -481,23 +500,24 @@ fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, 
         };
         let region = region.min(REGION_IDS - 1);
         // SAFETY: prefetching has no effect on memory, and `region` is inside the table anyway.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(regions.as_ptr().add(region).cast()) };
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast()) };
         let guess = names.guess_slot(names.hash(name.0, name.1));
         let fields = [guess, name.0, name.1, name.2, note.2, region, id, cents];
         batch[count] = fields.map(|field| field as u32);
         count += 1;
         if count == BATCH {
-            add_records(&batch, regions, names, rows);
+            add_records(&batch, names, rows);
             count = 0;
         }
     }
-    add_records(&batch[..count], regions, names, rows);
+    add_records(&batch[..count], names, rows);
 }
 
-fn add_records(batch: &[Pending], regions: &[u8], names: &NameTable, rows: &mut Rows) {
+fn add_records(batch: &[Pending], names: &NameTable, rows: &mut Rows) {
     for &[guess, start, len, name_bytes, note_bytes, region, id, cents] in batch {
         // SAFETY: `parse_records` kept `region` inside the table, which has `REGION_IDS` entries.
-        let country = usize::from(unsafe { *regions.get_unchecked(region as usize) });
+        let country = unsafe { names.regions.get_unchecked(region as usize) };
+        let country = usize::from(country.load(Relaxed));
         let cents = i64::from(cents as i32);
         let row = &mut rows[country];
         row[0] += 1;
@@ -523,7 +543,7 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
     let segment = (file.len() / (threads * SEGMENTS)).max(1);
     let (cursor, totals) = (AtomicUsize::new(0), Mutex::new(vec![EMPTY_ROW; 256]));
     let work = || {
-        let (regions, _, names): &(Vec<u8>, Vec<String>, NameTable) = setup.wait();
+        let (_, names): &(Vec<String>, NameTable) = setup.wait();
         let mut rows = Box::new([EMPTY_ROW; 256]);
         let claim = || Some(cursor.fetch_add(segment, Relaxed)).filter(|&s| s < file.len());
         while let Some(start) = claim().filter(|_| !names.full.load(Relaxed)) {
@@ -535,7 +555,7 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
             let at = (file.as_ptr() as usize + start) & !4095;
             // SAFETY: the advice only reads pages in. A range past the mapping is refused.
             unsafe { madvise(at as *mut u8, segment + 4096, 22) };
-            parse_records(next_boundary(file, start), last, regions, names, &mut rows);
+            parse_records(next_boundary(file, start), last, names, &mut rows);
         }
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
             merge(total, row);
@@ -549,15 +569,15 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
                 work();
             });
         }
-        let (regions, keys) = parse_regions(lookup);
+        let names = NameTable::new(file, slots);
         assert!(
             setup
-                .set((regions, keys, NameTable::new(file, slots)))
+                .set((parse_regions(lookup, names.regions), names))
                 .is_ok()
         );
         work();
     });
-    let (_, keys, names) = setup.into_inner().unwrap();
+    let (keys, names) = setup.into_inner().unwrap();
     if names.full.load(Relaxed) {
         return aggregate(file, lookup, threads, slots * 4);
     }

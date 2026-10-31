@@ -39,6 +39,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 17 | A tight per-record path: one quote mask and carry-less multiply per record, slot guess kept from the prefetch, vector key compare, 32-byte batch entries, batch of 8 | Stubbing showed parse 55% and name table 40% of the run, with locked ORs near nothing (racy store: -2%); at 12 threads memory waits on the region table and the tags stood out, and instructions were 467 per record against a hand budget near 200 | pending | — | — | — |
 | 18 | Threads start before the join table, tags as one vector per two groups (no spill branch), three numbers in one vector, name hash from its first 8 bytes, no bounds checks in the apply step | Traces show 88% of the run is parallel with every thread busy, so instructions still rule; a sample of the disassembly showed the spill branch, three digit parsers and repeated checks | pending | — | — | — |
 | 19 | MADV_POPULATE_READ on each claimed segment | A sample of the 12-thread run showed about 14% in the kernel, mostly mapping file pages a fault at a time | pending | — | — | — |
+| 20 | Slots, tags and the join table in one 2 MiB aligned mapping | The four huge pages under the slots were charged in full with 1.3 MB spare, while the join table and tags sat elsewhere on small pages | pending | — | — | — |
 
 ## Decision log
 
@@ -80,6 +81,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D18. Same design, fewer instructions. Options: per-thread rings (no gain measured), or more of the same cuts. Chose the cuts: one-thread instructions 331 -> about 289 per record, local 12-thread 18.9 -> about 17.5 ms. The byte-wise tag exchange first allowed two slots for one name (3 wrong in 600 stress runs, caught by the grid); one load now answers both the hit and the free question (0 wrong in 600). What would change our minds: a wrong answer in any stress run, or no T gain on the box.
 
 **D19. Map each segment's pages in one call. Context: page faults cost about a tenth of the CPU. Options: read() into buffers, which costs memory and a copy, or this. Chose this: local scorer T up 434x -> 502x, paired -3.6%, 3 lines. What would change our minds: no T gain on the box, where faults may cost less.
+
+**D20. One mapping for all three. Options: leave them apart, or grow the slots to fill the pages. Chose this: paired local -9%, 2 more names' worth of spare slots, S +15. What would change our minds: M or T worse on the box.
 
 ## What didn't work
 

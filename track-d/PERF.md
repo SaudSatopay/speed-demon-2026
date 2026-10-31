@@ -37,6 +37,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 15 | Prefetching a node's offsets when it's pushed | Its arcs are read from those offsets soon after, on a dependent miss | run-… | 0.128 *local* | 69.5 *local* | 69.4 *local* |
 | 16 | Coarse radix queue, k=7 | Skip sorting keys within a block; occasionally re-expand improved labels | run-a94ddb39f2f8 / run-6722fbed4b6d | 0.166 / 0.166 | 70.7 / 70.1 | 69.6 / 69.6 |
 | 17 | u16 directory entries with a page-count guard | Halves the directory footprint while rejecting out-of-range page ids | run-f10dee4d919e | 0.166 | 67.9 | 69.7 |
+| 18 | Remove low-degree nodes that no query starts or ends at, joining their neighbours by shortcuts (`simplify`) | Smaller graphs should cut search time and both graphs' memory. `counts.sh` sample: 1275.8 -> 1159.6 instructions/edge, 6.17 -> 6.10 mispredicts/edge. Scored locally under THP always, 4 paired rounds: T 85.7 -> 83.2 ms, per-run M 68.9 -> 53 MB, S 428 -> 690. | pending | — | — | — |
 
 ## Decision log
 
@@ -74,6 +75,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D15. A larger `INF`.** Context: the output loop only tested for `INF` to print -1, and `u64::MAX as i64` is -1. Nothing adds to `INF`, and the spec puts every real distance below 2^63, so two of them add without wrapping. Cost: S -5. Evidence: `counts.sh` instructions 1,186.4 -> 1,186.3 per record, mispredicts 7.26 -> 7.27, so this is a line saving only.
 
 **D16. Prefetch offsets at push.** Context: a pop's first read is the node's offsets, a dependent miss. Chose: one prefetch at push, kept because it costs one line, though it's unproven: `ab.sh` over 31 runs gave -2.9% at 20.6% noise, the review's own run -3.5% at 20%, and query-phase medians over two rounds of 15 were 67.8 and 68.9 ms without it, 68.3 and 68.1 ms with it. `counts.sh`: instructions 1,186.4 -> 1,202.4 per record, mispredicts 7.27 -> 7.32. What would change our minds: a lower K on the board, or a need for this one line.
+
+**D17. Try simplify on the board as an experiment.** Local K is about flat (29.40 -> 29.47), and the box's slower memory could move T either way, so only a board run can settle it. Keep it only if the board's K beats 24.81.
 
 ## What didn't work
 

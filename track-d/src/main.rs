@@ -3,19 +3,22 @@
 //! Threads parse the mapped graph twice, in batches with prefetching. The first pass counts each
 //! node's edges and keeps a few neighbours, enough to renumber the nodes so that neighbours sit close
 //! in memory. The second places the edges into a compressed adjacency array, so no temporary edge
-//! list is ever held. Sweeping that array, where neighbours are close, then fills the reverse array
-//! with hardly a cache miss. Threads then claim queries from an atomic counter, each
+//! list is ever held. The queries come next, and with them known, low-degree nodes that none of them
+//! starts or ends at are removed, joining their neighbours by shortcuts. Sweeping the smaller array,
+//! where neighbours are close, then fills the reverse array with hardly a cache miss. Threads then claim queries from an atomic counter, each
 //! with its own search state, and run a two-ended Dijkstra that gives both sides equal work. Answers
 //! go into a slot per query, so the output order doesn't depend on scheduling.
 
-use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
+use std::arch::x86_64::{
+    __m128i, _MM_HINT_T1, _mm_cmpeq_epi16, _mm_movemask_epi8, _mm_prefetch, _mm_set1_epi16,
+};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::Not;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 /// Above any real distance, which the spec puts below 2^63, so two of them add without wrapping. It
@@ -150,36 +153,43 @@ fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
 
 /// Seeds and new numbers a thread takes at a time when numbering.
 const SEED_BLOCK: usize = 1 << 12;
-const NUMBER_BLOCK: u32 = 1 << 10;
 /// A node's entry while counting: its out-degree, then up to three out-neighbours + 1 for numbering.
 /// Nodes average 2.9, so this sees most edges, and it fits one cache line, unlike two arrays.
 const RECORD: usize = 4;
 
 /// Numbers the nodes so that neighbours sit close in memory, because the input's ids are random, which
-/// makes every hop a cache miss. Each thread grows clusters breadth first, about the size of a label
-/// page, giving each node it reaches first its next number, from a block of its own. A cluster's
-/// unexpanded nodes stay on a stack, and the newest starts the next cluster, so nearby clusters get
-/// nearby numbers. Nodes the walks miss become seeds themselves, so all of them get a number. Any
-/// numbering gives the same answers, and numbers needn't be dense: a thread's last block has a few
-/// unused, and so does number 0, which means no number yet.
-/// Returns the numbers, and how many entries an array indexed by number needs, plus one.
-fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<AtomicU32>, usize) {
+/// makes every hop a cache miss. Each thread takes a block of numbers, a region, and fills it with one
+/// round patch of the graph: clusters about the size of a label page, grown breadth first, each from
+/// the patch's oldest unexpanded node. A round patch has few nodes on its edge, and those are what
+/// `simplify` must keep. When the block runs out, the patch's edge goes on a stack, and the newest of
+/// those starts the next patch, so nearby patches get nearby numbers. Nodes the walks miss become seeds
+/// themselves, so all of them get a number. Any numbering gives the same answers, and numbers needn't
+/// be dense: a thread's last block has a few unused, and so does number 0, which means no number yet.
+/// Returns the numbers and each number's out-degree, read from the record as its node expands.
+fn local_numbering(
+    records: &[AtomicU32],
+    nodes: usize,
+    threads: usize,
+) -> (Vec<AtomicU32>, Vec<AtomicU32>) {
     let numbers = zeroed_u32s(nodes);
-    let (next_seed, next_number) = (AtomicUsize::new(0), AtomicU32::new(1));
+    let mut out_counts = zeroed_u32s(nodes + (threads + 1) * REGION as usize + 2);
+    let (next_seed, next_number) = (AtomicUsize::new(0), AtomicU32::new(0));
     on_threads(threads, || {
-        let (mut number, mut numbers_end, mut stack) = (0, 0, Vec::new());
+        let (mut number, mut numbers_end) = (0, 0);
         // Most claims fail, and a plain read costs far less than a locked update.
         let mut claim = |node: usize| {
             if number == numbers_end {
-                number = next_number.fetch_add(NUMBER_BLOCK, Relaxed);
-                numbers_end = number + NUMBER_BLOCK;
+                let start = next_number.fetch_add(REGION as u32, Relaxed);
+                number = start.max(1);
+                numbers_end = start + REGION as u32;
             }
             let slot = &numbers[node];
             let won = slot.load(Relaxed) == 0
                 && slot.compare_exchange(0, number, Relaxed, Relaxed).is_ok();
             number += u32::from(won);
-            won
+            won.then_some((node as u32, number - 1))
         };
+        let (mut older, mut queue, mut head, mut given) = (Vec::new(), Vec::new(), 0, 0);
         loop {
             // Seeds come in blocks, because near the end nearly all are taken, and one shared counter
             // hit per node would make the threads queue.
@@ -188,28 +198,47 @@ fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<
                 return;
             }
             for seed in block..(block + SEED_BLOCK).min(nodes) {
-                if claim(seed) {
-                    stack.push(seed);
+                if let Some(claimed) = claim(seed) {
+                    older.push(claimed);
+                    given += 1;
                 }
-                while !stack.is_empty() {
-                    let first = stack.len() - 1;
+                while head < queue.len() || !older.is_empty() {
+                    if head == queue.len() {
+                        queue.clear();
+                        head = 0;
+                        queue.extend(older.pop());
+                    }
+                    let first = queue.len();
+                    queue.push(queue[head]);
+                    head += 1;
                     let mut next = first;
-                    while next < stack.len() && stack.len() - first < PAGE {
-                        for link in &records[stack[next] * RECORD + 1..][..RECORD - 1] {
+                    while next < queue.len() && queue.len() - first < PAGE {
+                        let (node, own) = queue[next];
+                        let record = &records[node as usize * RECORD..][..RECORD];
+                        out_counts[own as usize].store(record[0].load(Relaxed), Relaxed);
+                        for link in &record[1..] {
                             let neighbour = link.load(Relaxed) as usize;
-                            if neighbour != 0 && claim(neighbour - 1) {
-                                stack.push(neighbour - 1);
+                            if neighbour != 0
+                                && let Some(claimed) = claim(neighbour - 1)
+                            {
+                                queue.push(claimed);
                                 prefetch(&records[(neighbour - 1) * RECORD]);
                             }
                         }
                         next += 1;
                     }
-                    stack.drain(first..next);
+                    given += queue.len() - first - 1;
+                    queue.drain(first..next);
+                    if given >= REGION {
+                        given -= REGION;
+                        older.extend(queue.drain(head..));
+                    }
                 }
             }
         }
     });
-    (numbers, next_number.into_inner() as usize + 1)
+    out_counts.truncate(next_number.into_inner() as usize + 1);
+    (numbers, out_counts)
 }
 
 /// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
@@ -217,11 +246,12 @@ fn local_numbering(records: &[AtomicU32], nodes: usize, threads: usize) -> (Vec<
 /// leaves. The highest value means the weight is in `heavy`, sorted by arc number once the graph is
 /// built. Atomics let threads fill it without locks or `unsafe`; relaxed atomic loads and stores
 /// compile to plain moves on x86.
+static SPILLED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
 struct Graph {
     offsets: Vec<AtomicU32>,
     arcs: Vec<AtomicU32>,
     weight_bits: u32,
-    spilled: Mutex<Vec<(u32, u32)>>,
     heavy: Vec<(u32, u32)>,
 }
 
@@ -240,7 +270,6 @@ impl Graph {
             offsets,
             arcs: zeroed_u32s(total as usize),
             weight_bits: nodes.leading_zeros(),
-            spilled: Mutex::new(Vec::new()),
             heavy: Vec::new(),
         }
     }
@@ -253,14 +282,14 @@ impl Graph {
     fn store(&self, slot: usize, neighbour: u32, weight: u32) {
         let heavy = (1 << self.weight_bits) - 1;
         if weight >= heavy {
-            self.spilled.lock().unwrap().push((slot as u32, weight));
+            SPILLED.lock().unwrap().push((slot as u32, weight));
         }
         self.arcs[slot].store(neighbour << self.weight_bits | weight.min(heavy), Relaxed);
     }
 
     /// Sorts the heavy weights, once every thread has finished.
     fn seal(&mut self) {
-        self.heavy = std::mem::take(self.spilled.get_mut().unwrap());
+        self.heavy = std::mem::take(&mut *SPILLED.lock().unwrap());
         self.heavy.sort_unstable();
     }
 
@@ -317,15 +346,7 @@ fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Vec<AtomicU32>) {
             }
         }
     });
-    let (numbers, entries) = local_numbering(&records, nodes, threads);
-
-    let out_counts = zeroed_u32s(entries);
-    for_ranges(nodes, threads, |start, end| {
-        for node in start..end {
-            let new = numbers[node].load(Relaxed) as usize;
-            out_counts[new].store(records[node * RECORD].load(Relaxed), Relaxed);
-        }
-    });
+    let (numbers, out_counts) = local_numbering(&records, nodes, threads);
     drop(records);
     let mut forward = Graph::from_counts(out_counts);
 
@@ -367,6 +388,278 @@ fn reverse(forward: &Graph, threads: usize) -> Graph {
     });
     backward.seal();
     backward
+}
+
+/// Nodes per region, a block of node numbers that one thread simplifies on its own.
+const REGION: usize = 1 << 13;
+/// A node with more neighbours than this stays. With at most 3, joining its neighbours adds no arcs.
+const MAX_DEGREE: usize = 3;
+/// A node's neighbours in its region, at most, while simplifying.
+const WIDTH: usize = 8;
+const NO_ARC: u16 = u16::MAX;
+const REMOVED: u16 = u16::MAX;
+
+/// A node while its region is simplified: its neighbours, and the weights of its arcs to them and from
+/// them. From position `len` on, the weights are all `NO_ARC`, which makes a failed `find` read as "no
+/// arc", with no branch. Neighbours number at most 8, so a node fits one cache line.
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct Local {
+    ids: [u16; WIDTH],
+    arcs: [[u16; WIDTH + 1]; 2],
+    len: u8,
+    stays: bool,
+}
+
+impl Local {
+    /// The position of neighbour `id`, or `len` if it isn't one. One vector compare does it, with no
+    /// loop to mispredict.
+    fn find(&self, id: u16) -> usize {
+        // SAFETY: an array of eight u16s is a plain 16-byte value, and x86-64 always has SSE2.
+        let same = unsafe {
+            let ids: __m128i = std::mem::transmute(self.ids);
+            _mm_movemask_epi8(_mm_cmpeq_epi16(ids, _mm_set1_epi16(id as i16))) as u32
+        };
+        let end = 1u32 << (2 * self.len);
+        ((same & (end - 1)) | end).trailing_zeros() as usize / 2
+    }
+
+    /// Lowers the weights of the arcs to and from neighbour `id`, making it a neighbour if it's new.
+    fn join(&mut self, id: u16, to: u16, from: u16) {
+        let at = self.find(id);
+        self.ids[at] = id;
+        self.len += u8::from(at == self.len as usize);
+        self.arcs[0][at] = self.arcs[0][at].min(to);
+        self.arcs[1][at] = self.arcs[1][at].min(from);
+    }
+
+    fn remove(&mut self, id: u16) {
+        let at = self.find(id);
+        self.len -= 1;
+        let last = self.len as usize;
+        self.ids[at] = self.ids[last];
+        for weights in &mut self.arcs {
+            weights[at] = weights[last];
+            weights[last] = NO_ARC;
+        }
+    }
+}
+
+/// The weight of two arcs in a row, or `NO_ARC` if either is absent.
+fn through(first: u16, then: u16) -> u16 {
+    (u32::from(first) + u32::from(then)).min(u32::from(NO_ARC)) as u16
+}
+
+/// The length of the shortest path of at most two arcs from `a` to `b`.
+fn two_hops(locals: &[Local], a: u16, b: u16) -> u32 {
+    let start = &locals[a as usize];
+    let direct = u32::from(start.arcs[0][start.find(b)]);
+    let via = start.ids[..start.len as usize]
+        .iter()
+        .zip(&start.arcs[0])
+        .map(|(&x, &to_x)| {
+            let then = &locals[x as usize];
+            u32::from(to_x) + u32::from(then.arcs[0][then.find(b)])
+        });
+    via.min().map_or(direct, |shortest| shortest.min(direct))
+}
+
+/// Shrinks the graph to what the queries can use. Queries are known by now, so any node that no query
+/// starts or ends at can go, as long as distances between the rest stay the same: a removed node's
+/// neighbours get a shortcut for each path through it, and a node with one neighbour simply goes. A thread
+/// works alone on a region, which needs no locks, and a node with an arc to or from another region
+/// stays. Each region writes its arcs back over its own, in no more space. Then the remaining nodes
+/// get dense numbers and the arrays close up, so the graph takes less memory and searches do less work.
+fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads: usize) {
+    let nodes = forward.offsets.len() - 1;
+    let regions = nodes.div_ceil(REGION);
+    // Until a region is done, non-zero means its node must stay. After that, the node's rank in the region.
+    let ranks: Vec<AtomicU16> = vec![0u16; nodes].into_iter().map(AtomicU16::new).collect();
+    let stay = |node: u32| ranks[node as usize].store(1, Relaxed);
+    forward.for_each_arc(threads, |tail, head, _| {
+        if (tail ^ head) as usize >= REGION {
+            stay(tail);
+            stay(head);
+        }
+    });
+    for (from, to, _) in queries.iter() {
+        stay(*from);
+        stay(*to);
+    }
+    let (live, ends) = (zeroed_u32s(regions), zeroed_u32s(regions));
+    let next_region = AtomicUsize::new(0);
+    on_threads(threads, || {
+        let empty = Local {
+            ids: [0; WIDTH],
+            arcs: [[NO_ARC; WIDTH + 1]; 2],
+            len: 0,
+            stays: false,
+        };
+        let mut locals = vec![empty; REGION];
+        let (mut kept, mut stack) = (Vec::new(), Vec::new());
+        while let Some(region) = Some(next_region.fetch_add(1, Relaxed)).filter(|&r| r < regions) {
+            let start = region * REGION;
+            let size = REGION.min(nodes - start);
+            for (index, local) in locals[..size].iter_mut().enumerate() {
+                *local = Local {
+                    stays: ranks[start + index].load(Relaxed) != 0,
+                    ..empty
+                };
+            }
+            for v in 0..size {
+                let (first, arcs) = forward.arcs_of((start + v) as u32);
+                for (index, arc) in arcs.iter().enumerate() {
+                    let (head, weight) = forward.unpack(first + index, arc.load(Relaxed));
+                    let other = (head as usize).wrapping_sub(start);
+                    if other == v {
+                        continue; // A self-loop never shortens a path.
+                    }
+                    if other < size
+                        && weight < 1 << 15
+                        && (locals[v].len as usize) < WIDTH
+                        && (locals[other].len as usize) < WIDTH
+                    {
+                        locals[v].join(other as u16, weight as u16, NO_ARC);
+                        locals[other].join(v as u16, NO_ARC, weight as u16);
+                    } else {
+                        locals[v].stays = true;
+                        if other < size {
+                            locals[other].stays = true;
+                        }
+                        kept.push((v as u32, head, weight as u32));
+                    }
+                }
+            }
+            for tier in 2..=MAX_DEGREE {
+                stack.extend(0..size as u16);
+                while let Some(v) = stack.pop() {
+                    let node = locals[v as usize];
+                    let (len, [to, from]) = (node.len as usize, &node.arcs);
+                    if node.stays || len == 0 || len > tier {
+                        continue;
+                    }
+                    // Weights of at most 2^15 keep every shortcut below NO_ARC, and only a very long
+                    // chain gets there. Absent arcs wrap around to 0 here.
+                    let heaviest = to[..len]
+                        .iter()
+                        .chain(&from[..len])
+                        .map(|w| w.wrapping_add(1))
+                        .max();
+                    let neighbours = &node.ids[..len];
+                    let full = |&x: &u16| locals[x as usize].len as usize + len > WIDTH + 2;
+                    if heaviest > Some(1 << 15) || neighbours.iter().any(full) {
+                        continue;
+                    }
+                    locals[v as usize].len = 0;
+                    for &x in neighbours {
+                        locals[x as usize].remove(v);
+                        stack.push(x);
+                    }
+                    for (i, &a) in neighbours.iter().enumerate() {
+                        for (j, &b) in neighbours[..i].iter().enumerate() {
+                            let (a_to_b, b_to_a) =
+                                (through(from[i], to[j]), through(from[j], to[i]));
+                            let a_to_b = if tier >= 3 && two_hops(&locals, a, b) <= a_to_b.into() {
+                                NO_ARC
+                            } else {
+                                a_to_b
+                            };
+                            let b_to_a = if tier >= 3 && two_hops(&locals, b, a) <= b_to_a.into() {
+                                NO_ARC
+                            } else {
+                                b_to_a
+                            };
+                            if a_to_b.min(b_to_a) != NO_ARC {
+                                locals[a as usize].join(b, a_to_b, b_to_a);
+                                locals[b as usize].join(a, b_to_a, a_to_b);
+                            }
+                        }
+                    }
+                }
+            }
+            let first = forward.offsets[start].load(Relaxed) as usize;
+            let (mut slot, mut alive) = (first, 0);
+            let mut rest = kept.drain(..).peekable();
+            for (v, node) in locals[..size].iter().enumerate() {
+                forward.offsets[start + v].store(slot as u32, Relaxed);
+                for (&id, &weight) in node.ids[..node.len as usize].iter().zip(&node.arcs[0]) {
+                    if weight != NO_ARC {
+                        forward.store(slot, (start + id as usize) as u32, weight.into());
+                        slot += 1;
+                    }
+                }
+                while let Some((_, head, weight)) = rest.next_if(|k| k.0 == v as u32) {
+                    forward.store(slot, head, weight);
+                    slot += 1;
+                }
+                let stays = node.stays || node.len > 0;
+                ranks[start + v].store(if stays { alive } else { REMOVED }, Relaxed);
+                alive += u16::from(stays);
+            }
+            live[region].store(alive.into(), Relaxed);
+            ends[region].store((slot - first) as u32, Relaxed);
+        }
+    });
+    forward.seal();
+    // Where each region's nodes and arcs start in the dense arrays, and where its arcs start now.
+    let (mut nodes_so_far, mut arcs_so_far) = (0, 0);
+    let bases: Vec<(u32, u32, u32)> = (0..regions)
+        .map(|region| {
+            let base = (
+                nodes_so_far,
+                arcs_so_far,
+                forward.offsets[region * REGION].load(Relaxed),
+            );
+            nodes_so_far += live[region].load(Relaxed);
+            arcs_so_far += ends[region].load(Relaxed);
+            base
+        })
+        .collect();
+    let dense =
+        |node: u32| bases[node as usize / REGION].0 + u32::from(ranks[node as usize].load(Relaxed));
+    let bits = forward.weight_bits;
+    for_ranges(regions, threads, |from, to| {
+        for region in from..to {
+            let start = region * REGION;
+            let (_, arc_base, first) = bases[region];
+            for node in start..(start + REGION).min(nodes) {
+                let rank = ranks[node].load(Relaxed);
+                if rank != REMOVED {
+                    let offset = forward.offsets[node].load(Relaxed) - first + arc_base;
+                    forward.offsets[start + rank as usize].store(offset, Relaxed);
+                }
+            }
+            for arc in &forward.arcs[first as usize..][..ends[region].load(Relaxed) as usize] {
+                let value = arc.load(Relaxed);
+                arc.store(
+                    dense(value >> bits) << bits | value & ((1 << bits) - 1),
+                    Relaxed,
+                );
+            }
+        }
+    });
+    for (region, &(node_base, arc_base, first)) in bases.iter().enumerate() {
+        for rank in 0..live[region].load(Relaxed) as usize {
+            let offset = forward.offsets[region * REGION + rank].load(Relaxed);
+            forward.offsets[node_base as usize + rank].store(offset, Relaxed);
+        }
+        for index in 0..ends[region].load(Relaxed) as usize {
+            let arc = forward.arcs[first as usize + index].load(Relaxed);
+            forward.arcs[arc_base as usize + index].store(arc, Relaxed);
+        }
+    }
+    forward.offsets[nodes_so_far as usize].store(arcs_so_far, Relaxed);
+    for entry in &mut forward.heavy {
+        let base = bases[bases.partition_point(|base| base.2 <= entry.0) - 1];
+        entry.0 = entry.0 - base.2 + base.1;
+    }
+    for query in queries.iter_mut() {
+        (query.0, query.1) = (dense(query.0), dense(query.1));
+    }
+    forward.offsets.truncate(nodes_so_far as usize + 1);
+    forward.offsets.shrink_to_fit();
+    forward.arcs.truncate(arcs_so_far as usize);
+    forward.arcs.shrink_to_fit();
 }
 
 /// Nodes per page of the label store, and the entries a side's lists keep between queries.
@@ -534,8 +827,7 @@ fn main() -> io::Result<()> {
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let data_dir = Path::new(&data_dir);
     let threads = thread_count();
-    let (forward, numbers) = build_graph(map_file(&data_dir.join("graph.txt"))?, threads);
-    let entries = forward.offsets.len();
+    let (mut forward, numbers) = build_graph(map_file(&data_dir.join("graph.txt"))?, threads);
 
     let query_lines = map_file(&data_dir.join("queries.txt"))?;
     let number = |id: u64| numbers[id as usize].load(Relaxed);
@@ -547,6 +839,8 @@ fn main() -> io::Result<()> {
         queries.push((source, target, AtomicU64::new(0)));
     }
     drop(numbers);
+    simplify(&mut forward, &mut queries, threads);
+    let entries = forward.offsets.len();
     let backward = reverse(&forward, threads);
     let graphs = [forward, backward];
 

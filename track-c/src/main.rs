@@ -14,7 +14,7 @@ use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
 
 /// Number of possible country codes, `[A-Z]{3}` (spec section 2.3).
@@ -149,31 +149,32 @@ fn hash(key_words: &[u64; 3], len: usize) -> u64 {
     if cfg!(sd_const_hash) { 0 } else { hash }
 }
 
-/// Slots to start with: 2^17 for the generator's pool of 100,000 names. A test build starts tiny, to
-/// exercise the restart that a larger pool would need.
-const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 4 } else { 1 << 17 };
+/// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
+/// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
+const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 4 } else { 110_000 };
 /// Words per slot, which is one cache line: a header, three words of key, and 256 country bits.
 const SLOT_WORDS: usize = 8;
 /// Most names fit in the slot itself: on seed 1, 99.99% of them.
 const INLINE_BYTES: usize = 24;
-const EMPTY: u64 = 0;
-const BUSY: u64 = 1;
+/// Slots per word of tags. A slot's tag is a byte: zero while it's free, then 7 bits of the hash of
+/// its name with the top bit set.
+const GROUP: usize = 8;
+const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 
 /// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
 /// header, the name's first 24 bytes (or its file offset if it's longer), and one bit per country
-/// that has seen this name. So a lookup costs one cache miss, with no second memory access to compare
-/// the key. Names are compared in full, and never unescaped: the raw bytes encode the value one to
-/// one. The slots are insert-only, so a published slot never changes its key.
-/// Give the shared insertion counter its own cache line, away from the table fields read by every worker.
-#[repr(align(64))]
-struct AlignedUsed(AtomicUsize);
-
+/// that has seen this name. The tags, one word per group of slots, say which slot to open, so a
+/// lookup costs one cache miss, with no probing through other names' lines and no second memory
+/// access to compare the key. A full group spills into the next. Names are compared in full, and
+/// never unescaped: the raw bytes encode the value one to one. The slots are insert-only, so a
+/// published slot never changes its key.
 struct NameTable<'a> {
     file: &'a [u8],
     words: Vec<AtomicU64>,
+    tags: Vec<AtomicU64>,
     first: usize, // The word where the first slot starts, on a cache line boundary.
-    mask: usize,
-    used: AlignedUsed,
+    full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
@@ -185,58 +186,94 @@ impl<'a> NameTable<'a> {
             file,
             first: words.as_ptr().align_offset(64),
             words,
-            mask: slots - 1,
-            used: AlignedUsed(AtomicUsize::new(0)),
+            tags: (0..slots / GROUP).map(|_| AtomicU64::new(0)).collect(),
+            full: AtomicBool::new(false),
         }
     }
 
-    fn is_full(&self) -> bool {
-        self.used.0.load(Relaxed) * 8 >= (self.mask + 1) * 7
+    fn home(&self, hash: u64) -> usize {
+        (u64::from(hash as u32) * self.tags.len() as u64 >> 32) as usize
     }
 
-    /// Marks this name as seen in `country`, and returns whether that's new for the country. When the
-    /// table is full it gives up, and `aggregate` throws the whole pass away.
+    /// The bytes of `tags` that hold this hash's tag. A neighbour above a match can show up too, which
+    /// does no harm: the key decides.
+    fn matches(tags: u64, hash: u64) -> u64 {
+        let differ = tags ^ (hash >> 56 | 0x80) * LOW_BITS;
+        differ.wrapping_sub(LOW_BITS) & !differ & HIGH_BITS
+    }
+
+    /// Asks for the line of the slot the tags point to, looking one group past a home without a match.
+    fn prefetch_slot(&self, hash: u64) {
+        let mut group = self.home(hash);
+        let mut hits = Self::matches(self.tags[group].load(Relaxed), hash);
+        if hits == 0 {
+            group = (group + 1) * usize::from(group + 1 < self.tags.len());
+            hits = Self::matches(self.tags[group].load(Relaxed), hash);
+        }
+        let slot = group * GROUP + (hits.trailing_zeros() as usize / 8 & 7);
+        prefetch(&self.words[self.first + slot * SLOT_WORDS]);
+    }
+
+    /// Whether this taken slot holds the name. Its writer may not have finished with it yet.
+    fn holds(&self, base: usize, key: &[u8], key_words: &[u64; 3]) -> bool {
+        let (header, stored) = (&self.words[base], &self.words[base + 1..base + 4]);
+        while header.load(Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        header.load(Relaxed) == key.len() as u64 + 1
+            && if key.len() <= INLINE_BYTES {
+                (0..3).all(|i| stored[i].load(Relaxed) == key_words[i])
+            } else {
+                let offset = stored[0].load(Relaxed) as usize;
+                &self.file[offset..offset + key.len()] == key
+            }
+    }
+
+    /// Marks this name as seen in `country`, and returns whether that's new for the country. When
+    /// every slot is taken it gives up, and `aggregate` throws the whole pass away.
     fn mark(&self, key: &[u8], key_words: &[u64; 3], hash: u64, country: usize) -> bool {
-        // The top half of the hash and the length, plus 2 to stay clear of EMPTY and BUSY.
-        let published = (hash & 0xFFFF_FFFF_0000_0000) | (key.len() as u64 + 2);
-        let mut slot = hash as usize & self.mask;
-        let base = loop {
-            let base = self.first + slot * SLOT_WORDS;
-            let (header, stored) = (&self.words[base], &self.words[base + 1..base + 4]);
-            if header.load(Acquire) == EMPTY {
-                if self.is_full() {
-                    return false;
+        let mut group = self.home(hash);
+        let base = 'search: {
+            for _ in 0..self.tags.len() {
+                let tags = self.tags[group].load(Relaxed);
+                let mut hits = Self::matches(tags, hash);
+                while hits != 0 {
+                    let slot = group * GROUP + hits.trailing_zeros() as usize / 8;
+                    let base = self.first + slot * SLOT_WORDS;
+                    if self.holds(base, key, key_words) {
+                        break 'search base;
+                    }
+                    hits &= hits - 1;
                 }
-                if header
-                    .compare_exchange(EMPTY, BUSY, Acquire, Acquire)
+                let free = !tags & HIGH_BITS;
+                if free == 0 {
+                    if self.full.load(Relaxed) {
+                        return false;
+                    }
+                    group = (group + 1) * usize::from(group + 1 < self.tags.len());
+                    continue;
+                }
+                let at = free.trailing_zeros() as usize / 8;
+                let taken = tags | (hash >> 56 | 0x80) << (8 * at);
+                // Losing this race just means another look at the same group.
+                if self.tags[group]
+                    .compare_exchange(tags, taken, Relaxed, Relaxed)
                     .is_ok()
                 {
-                    self.used.0.fetch_add(1, Relaxed);
+                    let base = self.first + (group * GROUP + at) * SLOT_WORDS;
+                    let stored = &self.words[base + 1..base + 4];
                     if key.len() <= INLINE_BYTES {
                         (0..3).for_each(|i| stored[i].store(key_words[i], Relaxed));
                     } else {
                         let offset = key.as_ptr() as usize - self.file.as_ptr() as usize;
                         stored[0].store(offset as u64, Relaxed);
                     }
-                    header.store(published, Release);
-                    break base;
+                    self.words[base].store(key.len() as u64 + 1, Release);
+                    break 'search base;
                 }
             }
-            while header.load(Acquire) == BUSY {
-                std::hint::spin_loop();
-            }
-            if header.load(Acquire) == published {
-                let found = if key.len() <= INLINE_BYTES {
-                    (0..3).all(|i| stored[i].load(Relaxed) == key_words[i])
-                } else {
-                    let offset = stored[0].load(Relaxed) as usize;
-                    &self.file[offset..offset + key.len()] == key
-                };
-                if found {
-                    break base;
-                }
-            }
-            slot = (slot + 1) & self.mask;
+            self.full.store(true, Relaxed);
+            return false;
         };
         let word = &self.words[base + 4 + country / 64];
         let bit = 1u64 << (country % 64);
@@ -343,7 +380,7 @@ fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, 
             *key_word = unsafe { _bzhi_u64(load_u64(file, name.0 + 8 * word), 8 * bytes) };
         }
         let hash = hash(&key_words, name.1);
-        prefetch(&names.words[names.first + (hash as usize & names.mask) * SLOT_WORDS]);
+        names.prefetch_slot(hash);
         prefetch(&regions[region]);
         batch[count] = (id, cents, region, name, note.2, key_words, hash);
         count += 1;
@@ -380,7 +417,7 @@ fn aggregate(file: &[u8], regions: &[u8], groups: usize, threads: usize, slots: 
     let work = || {
         let mut rows = vec![EMPTY_ROW; groups];
         let claim = || Some(cursor.fetch_add(segment, Relaxed)).filter(|&s| s < file.len());
-        while let Some(start) = claim() {
+        while let Some(start) = claim().filter(|_| !names.full.load(Relaxed)) {
             let first = (start > 0).then(|| next_boundary(file, start)).unwrap_or(0);
             let last = next_boundary(file, (start + segment).min(file.len()));
             parse_records(first, last, regions, &names, &mut rows);
@@ -394,7 +431,7 @@ fn aggregate(file: &[u8], regions: &[u8], groups: usize, threads: usize, slots: 
             scope.spawn(&work);
         }
     });
-    if names.is_full() {
+    if names.full.load(Relaxed) {
         return aggregate(file, regions, groups, threads, slots * 4);
     }
     totals.into_inner().unwrap()

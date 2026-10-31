@@ -28,6 +28,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 6 | Regions parsed in one pass, and the output sorted once, when it's written | The temporary list, the `seen` table and the output loop's destructuring were all lines with no job at run time | run-… | 0.0304 *local* | 23.5 *local* | 68.8 *local* |
 | 7 | BZHI masks the key words, in place of a `u128` shift | Three 128-bit shifts per record were about 5% of all instructions, and the box is limited by its clock | run-… | 0.0314 *local* | 21.1 *local* | 69.0 *local* |
 | 8 | Parser and thread-helper line cuts | Twenty-four fewer counted lines; parser semantics rely only on spec 2.2 guarantees | run-30c0ac031f43 / run-424808ccefdc | 0.050 / 0.051 | 12.9 / 13.6 | 72.5 / 72.1 |
+| 9 | One tag byte per slot picks the slot, no shared insert counter, 110,000 slots to start | Local paired T -10.2% median, 40 of 41 wins on seed 1 and -9.7%, 21 of 21 on seed 7; lines per lookup 2.53 -> about 1; M 13.37 -> 11.79 MB; 393.2 -> 427.6 instructions and 1.53 -> 1.32 mispredicts per record; S +28 | pending | — | — | — |
 
 ## Decision log
 
@@ -49,6 +50,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D7. Give out country indices as codes appear, and sort at the end.** Context: byte-order indices needed every code before the first index could be given out, so regions took a temporary list and a second pass. Options: keep that, or give out indices on first sight and sort the 241 output lines once. Chose: the latter, with index 0 as `_UNMATCHED`, and `country_of` grown in doubling steps, so its last entry still lies past every id. Cost: none; the sort is 241 short strings. Evidence: S 356 -> 339, counts.sh 415.0 -> 414.5 instructions and 1.53 -> 1.54 mispredicts per record, K 23.27 -> 23.81 (local, with T and M inside their noise). Outcome: kept.
 
 **D8. BZHI for the key mask.** Context: masking a name's three key words used a `u128` shift each, to cope with a full 8-byte word. Options: keep it, a branch on the length, or BZHI, which x86-64-v3 has. Chose: BZHI. It reads only the low 8 bits of its count, so a name of 32 bytes or more can lose a word from its hash, which is harmless because those names are compared in full. Cost: none in lines. Evidence: counts.sh 414.5 -> 393.1 instructions per record (-5.2%), though the simulated mispredicts move 1.54 -> 1.70, an estimated 3 cycles against about 12 saved. ab.sh 15 runs: -1.9%, inside 16% noise, so T is unproven locally, and the case rests on the box being bound by its clock. Outcome: kept; the board decides.
+
+**D9. Tags instead of probing. Context: linear probing at this load touched 2.53 slot lines per lookup, and every insert updated a shared counter. Chose a word of 8 tag bytes per group, so a lookup goes straight to the slot's line and a full group spills into the next. No counter: a pass gives up only when a search has seen every group full. The table starts at 110,000 slots for the spec's pool of 100,000 names, and more names than slots still restart with a bigger table.
 
 ## What didn't work
 

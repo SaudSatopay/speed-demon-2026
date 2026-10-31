@@ -32,6 +32,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 9 | A set-based main table, one heap, a parallel sample, postings queries answered before any printing | The main table's probes mispredicted on every collision, page faults cost 15% of the serial phases, the sample ran on one thread, and bitmap queries made batches wait on each other | pending | — | — | — |
 | 10 | Chain blocks in chunks that never move, short checks for short queries, the common-term line moved to N/24 | One heap put M at 52 MB, 8 over the cap: growing Vecs of blocks held twice their size, and bitmaps took 11 MB; three slots cover nine checks in ten | pending | — | — | — |
 | 11 | One prefetched term table instead of two levels, no coin-toss branches in lookups or checks, BOOL checks listed and prefetched before they run | Hardware counters showed lookup at 35% of cycles and 43% of mispredicts: half the tokens went through the second level, and the compiler had turned a select into a branch | pending | — | — | — |
+| 12 | Query terms prefetched before they're added, a word per term written to the table with no branch, shorter numbering | Serial phases are now the largest cheap target: 12 of 95 ms before the scan | pending | — | — | — |
 
 ## Decision log
 
@@ -58,6 +59,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D11. Bring M back under the cap at the same T. Context: the one-heap build cost M 44 -> 52 MB. Measured in a fresh cgroup under THP always: block Vecs doubled to 13.7 MB for 7.3 MB of blocks, and the sample's temporary arrays left 7 MB of holes. Chose: chunks of 4096 blocks; a byte per term in the sample; bitmaps only at df above N/24, where local T was flat from N/12 to N/48 within noise and M fell 44-46 -> 42-43 MB; checks of three terms in 16 bytes for queries of up to four terms. What would change our minds: T rising on the board with the threshold.
 
 **D12. Follow the counters. perf stat works in WSL now, and thread cycles repeat to about 1%, where wall time is noisy here. Chose: one table of four-way sets, every token's set prefetched, then keys compared; tokens over 8 bytes, or reaching a full set, get a second look. A coin-toss select the compiler kept as a branch is arithmetic now. BOOL checks: prefetch lists, list short checks, then run them in one loop. Evidence on seed 1, 12 threads: cycles 4.63G -> 3.91G, instructions 7.82G -> 7.50G, mispredicts 26.5M -> 12.4M; 43/43, 228/228. Removing any of short checks, shared counts, the limit, or commonest-first numbering costs 2.5 to 9% of cycles, so they stay despite S.
+
+**D13. Keep cutting what runs on one thread. Chose: terms of the queries wait in a short list with their sets prefetched (parse 5.3 -> 3.7 ms); the table's words change in one pass with no branch on which ways are in use (1.45 -> 0.48 ms); term numbers come from one counting pass over classes. Evidence: local serial phases 12 -> 9 ms, hash unchanged, grids pass.
 
 ## What didn't work
 

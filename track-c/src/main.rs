@@ -163,7 +163,7 @@ static PADS: [u64; 8] = [0, 0, 0, 0, !0, !0, !0, !0];
 /// value one to one. The slots are insert-only: a key's words go from zero to their final value once,
 /// and a key has no zero bytes, so a slot that compares equal is complete.
 struct NameTable<'a> {
-    records: &'a Input,
+    records: &'a [Input],
     words: &'static [AtomicU64],
     tags: &'static [AtomicU8],
     regions: &'static [AtomicU8], // The join table, country indices by region id.
@@ -178,7 +178,7 @@ struct NameTable<'a> {
 unsafe impl Sync for NameTable<'_> {}
 
 impl<'a> NameTable<'a> {
-    fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
+    fn new(records: &'a [Input], slots: usize, threads: usize) -> Self {
         let tags = (slots / GROUP + 1) * GROUP;
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
@@ -431,19 +431,26 @@ type Found = [[u32; 4]; LISTED / 5];
 /// Segments per thread.
 const SEGMENTS: usize = 8;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
-const BLOCKS: usize = 8;
+const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
+fn parse_records(
+    file: &Input,
+    mut pos: usize,
+    end: usize,
+    names: &NameTable,
+    rows: &mut Rows,
+    room: &mut [u8],
+) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
     let (mut listed, mut found) = ([0u32; LISTED], [[0u32; 4]; LISTED / 5]);
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
-        let text = names.records.read(pos, len, room);
+        let text = file.read(pos, len, room);
         // A piece starts at a record's start, so outside quotes.
         let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
         listed[0] = 0;
@@ -625,7 +632,7 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: *mut u8) {
 /// distribution, not a promise: if a file holds more names than the table, the pass is thrown away and
 /// redone with a bigger table.
 fn aggregate(
-    records: &Input,
+    records: &[Input],
     lookup: &Input,
     threads: usize,
     slots: usize,
@@ -633,7 +640,9 @@ fn aggregate(
     let names = NameTable::new(records, slots, threads);
     let (lines, segments) = (Jobs::default(), Jobs::default());
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
+    let ids = AtomicUsize::new(0);
     let work = || {
+        let own = &records[ids.fetch_add(1, Relaxed) % records.len()];
         let mut room = [0u8; PIECE + PADDING];
         lines.run(threads * 8, true, |at| {
             let (pos, end) = lookup.part(threads * 8, at, b"\n");
@@ -641,9 +650,9 @@ fn aggregate(
         });
         let mut rows = [EMPTY_ROW; 256];
         segments.run(threads * SEGMENTS, false, |at| {
-            let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
+            let (pos, end) = own.part(threads * SEGMENTS, at, b"\r\n");
             if !names.full.load(Relaxed) {
-                parse_records(pos, end, &names, &mut rows, &mut room);
+                parse_records(own, pos, end, &names, &mut rows, &mut room);
             }
         });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
@@ -679,7 +688,10 @@ fn main() -> io::Result<()> {
         let len = file.metadata()?.len() as usize;
         io::Result::Ok(Input(file, len))
     };
-    let (lookup, records) = (open("regions")?, open("records")?);
+    let lookup = open("regions")?;
+    let records = (0..threads)
+        .map(|_| open("records"))
+        .collect::<io::Result<Vec<_>>>()?;
     let (keys, totals) = aggregate(&records, &lookup, threads, INITIAL_SLOTS);
 
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are

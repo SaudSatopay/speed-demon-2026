@@ -56,6 +56,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 34 | exp: 48 KiB pieces | A fit of T against piece size: about 18.2 ms plus 173/P ms for reads (10 us each here), plus a penalty only above 32 KiB, where the piece leaves L1. 48 KiB should halve the difference | pending | — | — | — |
 | 35 | exp: prefetch the tag window a stage before reading it, with 32 KiB pieces again | The tag load was the top stall in the samples (8%); 48 KiB pieces gave T 0.0233 M 10.7, no better than 32 KiB | pending | — | — | — |
 | 36 | exp: chunks of 8 blocks instead of 16, without the tag prefetch | Tag prefetch gave T 0.0241, no gain. Fewer records between a prefetch and its use could keep more of them in L1 | pending | — | — | — |
+| 37 | One open file per thread, and chunks of 16 blocks again | Every read takes and drops a reference on the file, so a shared descriptor bounces that cache line between all the threads; 8-block chunks gave T 0.0238, no gain | pending | — | — | — |
 
 ## Decision log
 
@@ -131,6 +132,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D35. Test on the box, where L2 hits cost more cycles than locally: local -1.8%, S +5.
 
 **D36. Test on the box; local is flat.
+
+**D37. Local -1%, S +6. What would change our minds: K below 40.3 over samples.
 
 ## What didn't work
 

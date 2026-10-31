@@ -26,7 +26,7 @@ const BIG_LATENCY: u32 = (1 << 19) - 1;
 
 /// Words a thread reserves at a time from an hour's array, and writes without contention: records
 /// from the front, and big latencies, two words each, from the back.
-const BLOCK: usize = 256;
+const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
 /// Bytes per read: few enough to stay in the caches, enough that a read costs little per line.

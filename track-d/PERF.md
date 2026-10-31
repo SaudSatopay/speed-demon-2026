@@ -38,6 +38,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 16 | Coarse radix queue, k=7 | Skip sorting keys within a block; occasionally re-expand improved labels | run-a94ddb39f2f8 / run-6722fbed4b6d | 0.166 / 0.166 | 70.7 / 70.1 | 69.6 / 69.6 |
 | 17 | u16 directory entries with a page-count guard | Halves the directory footprint while rejecting out-of-range page ids | run-f10dee4d919e | 0.166 | 67.9 | 69.7 |
 | 18 | Remove low-degree nodes that no query starts or ends at, joining their neighbours by shortcuts (`simplify`) | Smaller graphs should cut search time and both graphs' memory. `counts.sh` sample: 1275.8 -> 1159.6 instructions/edge, 6.17 -> 6.10 mispredicts/edge. Scored locally under THP always, 4 paired rounds: T 85.7 -> 83.2 ms, per-run M 68.9 -> 53 MB, S 428 -> 690. | pending | — | — | — |
+| 19 | Touch one word per 2 MiB of every shared array on the main thread, `ranks` included, and raise the mmap threshold to 1 MiB so each thread's simplify buffer stays in its own arena | With simplify the peak moves to the build phase, where threads race for huge pages: board M 60.3 MB against a local floor of 45. Scored locally under THP always, 3 paired rounds: M 54.6-55.1 -> 50.6-52.7 MB, T flat. counts.sh sample:  instructions 580,538,803 1161.1 per record; mispredicts 3,048,949 6.10 per record (4.01% of branches); | pending | — | — | — |
 
 ## Decision log
 
@@ -77,6 +78,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D16. Prefetch offsets at push.** Context: a pop's first read is the node's offsets, a dependent miss. Chose: one prefetch at push, kept because it costs one line, though it's unproven: `ab.sh` over 31 runs gave -2.9% at 20.6% noise, the review's own run -3.5% at 20%, and query-phase medians over two rounds of 15 were 67.8 and 68.9 ms without it, 68.3 and 68.1 ms with it. `counts.sh`: instructions 1,186.4 -> 1,202.4 per record, mispredicts 7.27 -> 7.32. What would change our minds: a lower K on the board, or a need for this one line.
 
 **D17. Try simplify on the board as an experiment.** Local K is about flat (29.40 -> 29.47), and the box's slower memory could move T either way, so only a board run can settle it. Keep it only if the board's K beats 24.81.
+
+**D18. Stop threads racing for huge pages, on top of simplify.** Without simplify this can't help: the peak there is set in the search phase (about 68 MB), and touching the arrays leaves it unchanged. If the board's K still doesn't beat 24.81, revert both.
 
 ## What didn't work
 

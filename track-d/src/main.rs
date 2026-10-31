@@ -146,9 +146,15 @@ fn for_each_batch(edge_lines: &[u8], threads: usize, visit: impl Fn(&[Edge]) + S
     });
 }
 
-/// A zeroed array of atomics, whose pages stay untouched until a thread writes to them.
+/// A zeroed array of atomics. This thread touches one word per 2 MiB first: when threads race to
+/// touch a huge page, each clears its own, and the memory peak counts them all until the losers free
+/// theirs.
 fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
-    vec![0u32; len].into_iter().map(AtomicU32::new).collect()
+    let words: Vec<AtomicU32> = vec![0u32; len].into_iter().map(AtomicU32::new).collect();
+    for word in words.iter().step_by(1 << 19) {
+        word.store(0, Relaxed);
+    }
+    words
 }
 
 /// Seeds and new numbers a thread takes at a time when numbering.
@@ -475,6 +481,10 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
     let regions = nodes.div_ceil(REGION);
     // Until a region is done, non-zero means its node must stay. After that, the node's rank in the region.
     let ranks: Vec<AtomicU16> = vec![0u16; nodes].into_iter().map(AtomicU16::new).collect();
+    // Touched here for the same reason as in `zeroed_u32s`.
+    for rank in ranks.iter().step_by(1 << 20) {
+        rank.store(0, Relaxed);
+    }
     let stay = |node: u32| ranks[node as usize].store(1, Relaxed);
     forward.for_each_arc(threads, |tail, head, _| {
         if (tail ^ head) as usize >= REGION {
@@ -820,8 +830,9 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
 
 fn main() -> io::Result<()> {
     // SAFETY: M_MMAP_THRESHOLD only sets an option of our own process's allocator. It stops glibc
-    // from keeping freed blocks of any size it has seen freed.
-    unsafe { mallopt(-3, 1 << 17) };
+    // from keeping freed blocks of any size it has seen freed. At 1 MiB, each thread's buffers stay
+    // in its own arena, where threads can't race for a huge page.
+    unsafe { mallopt(-3, 1 << 20) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());

@@ -703,7 +703,7 @@ const KEPT_ENTRIES: usize = 1 << 15;
 /// so a key moves a few times in all, with no comparisons against other keys.
 struct Side<D> {
     directory: Vec<u16>,
-    pages: Vec<D>,
+    pages: Vec<[D; PAGE]>,
     used: Vec<u16>,
     buckets: Vec<Vec<(D, u32)>>,
     last: D,
@@ -716,7 +716,7 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
     fn new(entries: usize) -> Side<D> {
         Side {
             directory: vec![0; entries / PAGE + 1],
-            pages: vec![!D::default(); PAGE],
+            pages: vec![[!D::default(); PAGE]],
             used: Vec::new(),
             buckets: vec![Vec::new(); 65 - COARSE_BITS as usize],
             last: !D::default(),
@@ -728,8 +728,8 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
             self.directory[entry as usize] = 0;
         }
         // A rare huge search shouldn't leave every thread holding its memory for good.
-        self.pages.truncate(PAGE);
-        self.pages.shrink_to(KEPT_ENTRIES);
+        self.pages.truncate(1);
+        self.pages.shrink_to(KEPT_ENTRIES / PAGE);
         self.used.shrink_to(KEPT_ENTRIES);
         for bucket in &mut self.buckets {
             bucket.clear();
@@ -761,18 +761,24 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
     }
 
     fn label(&self, node: u32) -> D {
-        let page = self.directory[node as usize / PAGE] as usize;
-        self.pages[page * PAGE + node as usize % PAGE]
+        self.pages[self.directory[node as usize / PAGE] as usize][node as usize % PAGE]
+    }
+
+    /// Gives the directory entry a fresh page. Kept out of the hot path: the page's fill is wide
+    /// code, and with it in line the compiler left all of `set_label` out of line.
+    #[cold]
+    fn add_page(&mut self, entry: usize) {
+        self.directory[entry] = self.pages.len() as u16;
+        self.pages.push([!D::default(); PAGE]);
+        self.used.push(entry as u16);
     }
 
     fn set_label(&mut self, node: u32, dist: D) {
         let entry = node as usize / PAGE;
         if self.directory[entry] == 0 {
-            self.directory[entry] = (self.pages.len() / PAGE) as u16;
-            self.pages.resize(self.pages.len() + PAGE, !D::default());
-            self.used.push(entry as u16);
+            self.add_page(entry);
         }
-        self.pages[self.directory[entry] as usize * PAGE + node as usize % PAGE] = dist;
+        self.pages[self.directory[entry] as usize][node as usize % PAGE] = dist;
     }
 
     /// Two-ended Dijkstra, returning INF if there is no path, or None if a distance doesn't fit in D.
@@ -792,12 +798,11 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
         if from == to {
             return Some(0);
         }
-        let fit = |wide: u64| D::try_from(wide).ok().filter(|&dist| dist != !D::default());
         let unreached: u64 = (!D::default()).into();
         for (side, node) in sides.iter_mut().zip([from, to]) {
-            side.clear(fit(0)?);
-            side.set_label(node, fit(0)?);
-            side.push(fit(0)?, node);
+            side.clear(D::default());
+            side.set_label(node, D::default());
+            side.push(D::default(), node);
         }
         let mut best = INF;
         let mut work = [0u64; 2];
@@ -818,8 +823,8 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
             for (index, arc) in arcs.iter().enumerate() {
                 let (neighbour, weight) = graphs[side].unpack(first + index, arc.load(Relaxed));
                 let candidate = dist + weight;
-                let narrow = fit(candidate)?;
-                if narrow < sides[side].label(neighbour) {
+                let current: u64 = sides[side].label(neighbour).into();
+                if candidate < current {
                     let other: u64 = sides[1 - side].label(neighbour).into();
                     if other != unreached {
                         best = best.min(candidate + other);
@@ -829,11 +834,17 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
                     // at or past `best` by that bound needs no expanding, and no label either, since
                     // no path the other side finds through it later could beat `best`.
                     if candidate + other_top < best {
+                        // It fits: it's below a label, and a label is never the unreached value.
+                        let narrow = D::try_from(candidate).ok()?;
                         sides[side].set_label(neighbour, narrow);
                         sides[side].push(narrow, neighbour);
                         // Its arcs come next from this node's offsets, which can load meanwhile.
                         prefetch(&graphs[side].offsets[neighbour as usize]);
                     }
+                } else if current == unreached {
+                    // Only an unreached node leaves room for a candidate this large: it doesn't fit
+                    // in D, so the search gives up, and the wide one answers the query.
+                    return None;
                 }
             }
         }

@@ -49,6 +49,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 27 | No huge page past the last whole one, and smaller stacks | The mapping's tail sometimes covered a whole fifth 2 MiB extent, depending on the address, which added 1.4 MB: the difference between the two last board runs, M 10.55 and 11.98 | pending | — | — | — |
 | 28 | LOCK BTS instead of a compare-exchange loop for a country's bit | The bit's word and mask took 10 instructions per record, and the atomic left a load and a loop; BTS with a register offset finds the word itself | pending | — | — | — |
 | 29 | A key padded with ones and compared whole, with no header; shorter setup and record code | A header needed its own load, shift and compare, and a length check on top; a padded key can't equal a free or half-written slot, so one vector compare answers everything | pending | — | — | — |
+| 30 | exp: 16 KiB pieces instead of 32 | A smaller buffer fits L1 even with two hyper-threads sharing it, at twice the reads; local timing can't weigh that for the box | pending | — | — | — |
 
 ## Decision log
 
@@ -110,6 +111,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D28. One instruction. Instructions 309 -> 299 per record, paired local -2.5%. Also tried and dropped: reusing the first stage's quote masks (more instructions), PGO (flat, code is nearly straight-line), a third loop for the locked writes (+1.7%), spawning during the first touches (+3.5%), row alignment, piece and chunk sizes (all flat locally). What would change our minds: T up on the box, where BTS m,r is microcoded.
 
 **D29. Padded keys. Instructions 299 -> 292 per record, S 511 -> 499, local flat. Also: Option::then_some in mark cost 15 instructions per record, so it stays an if. What would change our minds: a wrong answer in any stress run (0 of 300 on seeds 2 and 3).
+
+**D30. Test: local +3%, M -0.2 MB. Keep only if K beats 40.23 over samples.
 
 ## What didn't work
 

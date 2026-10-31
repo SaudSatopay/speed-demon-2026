@@ -54,6 +54,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 32 | exp: 64 KiB pieces | 128 KiB gave T 0.0256 M 11.5, worse than 32 KiB's T 0.0236 M 10.2, so L1 fit matters as well as the number of reads | pending | — | — | — |
 | 33 | Back to 32 KiB pieces, keeping fewer region chunks and one length query per file | Box, T and M: 16 KiB 0.0290 and 9.9, 32 KiB 0.0236 and 10.2, 64 KiB 0.0235 and 12.2, 128 KiB 0.0256 and 11.5. A piece that fits L1 matters as much as the number of reads | pending | — | — | — |
 | 34 | exp: 48 KiB pieces | A fit of T against piece size: about 18.2 ms plus 173/P ms for reads (10 us each here), plus a penalty only above 32 KiB, where the piece leaves L1. 48 KiB should halve the difference | pending | — | — | — |
+| 35 | exp: prefetch the tag window a stage before reading it, with 32 KiB pieces again | The tag load was the top stall in the samples (8%); 48 KiB pieces gave T 0.0233 M 10.7, no better than 32 KiB | pending | — | — | — |
 
 ## Decision log
 
@@ -125,6 +126,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D33. 32 KiB: the best K of the four, with no T left to gain above it.
 
 **D34. Test the middle.
+
+**D35. Test on the box, where L2 hits cost more cycles than locally: local -1.8%, S +5.
 
 ## What didn't work
 

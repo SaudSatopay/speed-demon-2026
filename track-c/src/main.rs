@@ -37,10 +37,12 @@ fn map_file(path: &str) -> io::Result<&'static [u8]> {
     }
 }
 
-/// Loads 8 bytes, little-endian, which may run into the padding.
+/// Loads 8 bytes, little-endian, which may run into the padding. Every position here comes from
+/// stepping through the file, which indexes it first and panics past its end, so a load starts at
+/// most 16 bytes past the end, well inside the padding.
 fn load_u64(file: &[u8], pos: usize) -> u64 {
-    assert!(pos + 8 <= file.len() + PADDING);
-    // SAFETY: the assert keeps the load inside the mapping, and the load needs no alignment.
+    debug_assert!(pos + 8 <= file.len() + PADDING);
+    // SAFETY: the padding keeps the load inside the mapping (see above), and it needs no alignment.
     unsafe { file.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
@@ -62,6 +64,17 @@ fn quote_mask(file: &[u8], pos: usize) -> u64 {
         let mask = |at| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(at), quotes));
         let at = file.as_ptr().add(pos).cast::<__m256i>();
         u64::from(mask(at) as u32) | u64::from(mask(at.add(1)) as u32) << 32
+    }
+}
+
+/// The parity of the bits up to and including each bit, which is a carry-less multiplication by
+/// all ones.
+fn prefix_xor(bits: u64) -> u64 {
+    // SAFETY: PCLMULQDQ is on for every build (`.cargo/config.toml`), and these intrinsics only
+    // touch registers.
+    unsafe {
+        let (bits, ones) = (_mm_cvtsi64_si128(bits as i64), _mm_set1_epi64x(-1));
+        _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(bits, ones)) as u64
     }
 }
 
@@ -158,8 +171,10 @@ impl<'a> NameTable<'a> {
         }
     }
 
+    /// A hash's home group, which is never the last group: that one only takes spills, so the group
+    /// after any home needs no wrap.
     fn home(&self, hash: u64) -> usize {
-        (u64::from(hash as u32) * self.tags.len() as u64 >> 32) as usize
+        (u64::from(hash as u32) * (self.tags.len() - 1) as u64 >> 32) as usize
     }
 
     /// The bytes of `tags` that hold this hash's tag. A neighbour above a match can show up too, which
@@ -169,16 +184,20 @@ impl<'a> NameTable<'a> {
         differ.wrapping_sub(LOW_BITS) & !differ & HIGH_BITS
     }
 
-    /// Asks for the line of the slot the tags point to, looking one group past a home without a match.
-    fn prefetch_slot(&self, hash: u64) {
-        let mut group = self.home(hash);
-        let mut hits = Self::matches(self.tags[group].load(Relaxed), hash);
-        if hits == 0 {
-            group = (group + 1) * usize::from(group + 1 < self.tags.len());
-            hits = Self::matches(self.tags[group].load(Relaxed), hash);
-        }
-        let slot = group * GROUP + (hits.trailing_zeros() as usize / 8 & 7);
+    /// Asks for the line of the slot the tags point to: the lowest match in the home group, or in the
+    /// next group when the home has none. Both words are read whatever the home says, and the choice
+    /// is arithmetic, since a branch on it would mispredict on every spilled name. Returns the hash
+    /// with that slot packed into bits no lookup reads, as its place past the home group's first
+    /// slot (16 when nothing matched), so that `mark` can start there without reading the tags.
+    fn prefetch_slot(&self, hash: u64) -> u64 {
+        let home = self.home(hash);
+        let at_home = Self::matches(self.tags[home].load(Relaxed), hash);
+        let spill = 0u64.wrapping_sub(u64::from(at_home == 0));
+        let hits = at_home | Self::matches(self.tags[home + 1].load(Relaxed), hash) & spill;
+        let hint = hits.trailing_zeros() as usize / 8 + (spill as usize & GROUP);
+        let slot = home * GROUP + (hint & 2 * GROUP - 1);
         prefetch::<_MM_HINT_ET0, _>(&self.words[self.first + slot * SLOT_WORDS]);
+        hash & !(0xFF << 32) | (hint as u64) << 32
     }
 
     /// Whether this taken slot holds the name. Its writer may not have finished with it yet.
@@ -194,10 +213,20 @@ impl<'a> NameTable<'a> {
     }
 
     /// Marks this name as seen in `country`, and returns whether that's new for the country. When
-    /// every slot is taken it gives up, and `aggregate` throws the whole pass away.
+    /// every slot is taken it gives up, and `aggregate` throws the whole pass away. `hash` is what
+    /// `prefetch_slot` returned for the name.
     fn mark(&self, key: &[u8], key_words: &[u64; 3], hash: u64, country: usize) -> bool {
         let mut group = self.home(hash);
         let base = 'search: {
+            // Nearly every name sits in the slot the tags pointed to when the record was parsed, so
+            // that slot is checked without a loop. A taken slot stays taken, with the same tag, so
+            // it's still safe to read. The loop below sees the rest: new names, colliding tags, and
+            // names published after the prefetch.
+            let hint = (hash >> 32 & 0x1F) as usize;
+            let base = self.first + (group * GROUP + hint) * SLOT_WORDS;
+            if hint < 2 * GROUP && self.holds(base, key, key_words) {
+                break 'search base;
+            }
             for _ in 0..self.tags.len() {
                 let word = &self.tags[group];
                 let tags = word.load(Relaxed);
@@ -245,29 +274,36 @@ impl<'a> NameTable<'a> {
 /// encode the value one to one.
 type TextField = (usize, usize, usize);
 
-/// Parses the text field at `pos` and steps past the comma after it. A quoted field ends at the first
-/// `"` that isn't part of a `""` pair, and inside quotes every other byte is data, commas and LFs
-/// included. An unquoted name or note is always empty (spec section 2.2), and it gives the same empty
-/// raw bytes as `""`, so they are one value.
+/// Parses the text field at `pos` and steps past the comma after it. An unquoted name or note is
+/// always empty (spec section 2.2), and it gives the same empty raw bytes as `""`, so they are one
+/// value. In a quoted field, the parity of the quotes up to and including each byte is odd at the
+/// first quote of a `""` pair, at the closing quote and after it, so the closing quote is the first
+/// odd byte followed by another, with no branch per pair to mispredict. A window of 64 bytes holds
+/// nearly every field. The next window takes the parity over, and finds a closing quote at the last
+/// byte of the one before.
 fn text_field(file: &[u8], pos: &mut usize) -> TextField {
     let start = *pos;
     if file[start] != b'"' {
         *pos += 1;
         return (start, 0, 0);
     }
-    let (mut scan, mut pairs) = (start + 1, 0);
+    let (mut scan, mut quotes, mut carry) = (start + 1, 0, 0);
     loop {
-        let quotes = quote_mask(file, scan);
-        let at = scan + quotes.trailing_zeros() as usize;
-        if quotes == 0 {
-            scan += 64;
-        } else if file[at + 1] == b'"' {
-            pairs += 1;
-            scan = at + 2;
-        } else {
-            *pos = at + 2; // The closing quote and the comma.
-            return (start + 1, at - start - 1, at - start - 1 - pairs);
+        let mask = quote_mask(file, scan);
+        let parity = prefix_xor(mask) ^ carry;
+        let closing = parity & (parity << 1 | carry & 1); // Bit `i` means the quote before it.
+        let at = closing.trailing_zeros() as usize;
+        if closing != 0 {
+            let end = scan + at - 1;
+            quotes += (mask & ((1u64 << at) - 1) >> 1).count_ones();
+            *pos = end + 2; // The closing quote and the comma.
+            // The quotes before the closing one come in pairs, each one byte of value. The closing
+            // quote is counted too when it ended the window before, which the division drops.
+            let raw = end - start - 1;
+            return (start + 1, raw, raw - quotes as usize / 2);
         }
+        (quotes, carry) = (quotes + mask.count_ones(), (parity as i64 >> 63) as u64);
+        scan += 64;
     }
 }
 
@@ -300,7 +336,7 @@ fn merge(row: &mut Row, other: &Row) {
 }
 
 /// A parsed record, waiting for the cache lines its lookups need: id, cents, region, name, note
-/// bytes, the name's first 24 bytes, and their hash.
+/// bytes, the name's first 24 bytes, and their hash with the slot `prefetch_slot` chose packed in.
 type Pending = (i64, i64, usize, TextField, usize, [u64; 3], u64);
 
 /// Parses the records in `pos..end`, adding each to its country's row.
@@ -336,8 +372,7 @@ fn parse_records(mut pos: usize, end: usize, regions: &[u8], names: &NameTable, 
             let mixed = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             mixed ^ (mixed >> 29)
         });
-        let hash = if cfg!(sd_const_hash) { 0 } else { hash };
-        names.prefetch_slot(hash);
+        let hash = names.prefetch_slot(if cfg!(sd_const_hash) { 0 } else { hash });
         prefetch::<_MM_HINT_T0, _>(&regions[region]);
         batch[count] = (id, cents, region, name, note.2, key_words, hash);
         count += 1;

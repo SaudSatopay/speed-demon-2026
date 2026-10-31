@@ -66,6 +66,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 44 | MADV_POPULATE_WRITE on the mapping, in one call | Touching a page at a time took 150 page faults more, and the piece-size runs suggest small-page faults cost a lot on the box: each larger piece needed more stack pages | run-c4842a2cf4c2 | 0.0238 | 10.7 | 80.0 |
 | 45 | exp: 64 KiB pieces again, now that stack pages take no faults | 64 KiB pieces halve the reads but gained nothing before; if faults on the extra stack pages were the reason, this should show it | run-9969baf99d50 | 0.0249 | 11.1 | 79.3 |
 | 46 | 32 KiB pieces, to stay | 64 KiB gave T 0.0249 and M 11.1 even with no faults on the stack pages, so faults weren't why it gained nothing. Also tried and dropped, by hardware counters: listing only commas (cycles flat, S +9), counting long notes' quotes with masks (cycles +1%), prefetching rows (+1%) | superseded before it ran | — | — | — |
+| 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | pending | — | — | — |
 
 ## Decision log
 
@@ -161,6 +162,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D45. Test: compare with T 0.0238.
 
 **D46. 32 KiB is settled.
+
+**D47. A Fable agent's pipeline work. Local: instructions 296.7 -> 279.3, cycles about -3.5%, S 491 -> 530. Grid, sweep, constant-hash and 300 stress runs pass. What would change our minds: K below 40 over samples.
 
 ## What didn't work
 

@@ -96,11 +96,11 @@ unsafe fn load_u64(text: &[u8], pos: usize) -> u64 {
     unsafe { text.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
-/// One bit per byte of the 64 at `pos`, set where the byte is `first` or `second`.
+/// One bit per byte of the 64 at `at`, set where the byte is `first` or `second`.
 ///
 /// # Safety
-/// `pos + 64` must be inside `text`.
-unsafe fn byte_mask(text: &[u8], pos: usize, first: u8, second: u8) -> u64 {
+/// The 64 bytes at `at` must be inside a buffer.
+unsafe fn byte_mask(at: *const u8, first: u8, second: u8) -> u64 {
     // SAFETY: the caller keeps both loads inside the buffer, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
@@ -109,7 +109,7 @@ unsafe fn byte_mask(text: &[u8], pos: usize, first: u8, second: u8) -> u64 {
             let block = _mm256_loadu_si256(at);
             _mm256_movemask_epi8(_mm256_or_si256(is(block, first), is(block, second))) as u32
         };
-        let at = text.as_ptr().add(pos).cast::<__m256i>();
+        let at = at.cast::<__m256i>();
         u64::from(mask(at)) | u64::from(mask(at.add(1))) << 32
     }
 }
@@ -424,6 +424,73 @@ const SEGMENTS: usize = 8;
 const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
+/// Bit `k` of each of the 64 positions in a block, at that position.
+static PLANES: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
+
+/// Lists the positions just past the separators outside quotes in `blocks` blocks of `text` from
+/// `scan`, after `count` positions, given whether the first block starts inside quotes, and returns
+/// the count and that for the block after. A function of its own, so that its constants get the
+/// registers that the loops around it would otherwise hold.
+#[inline(never)]
+fn list_separators(
+    text: &[u8],
+    scan: usize,
+    blocks: usize,
+    listed: &mut [u32; LISTED],
+    count: usize,
+    mut odd_so_far: u64,
+) -> (usize, u64) {
+    // SAFETY: the blocks are inside the text, or the padding covers them. PCLMULQDQ is in the
+    // build's target features. The carry-less multiply by all ones gives each bit the parity of the
+    // quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels out. The
+    // positions stay below `LISTED - 8`, as a chunk has `BLOCKS` blocks.
+    unsafe {
+        let mut at = text.as_ptr().add(scan);
+        let end = at.add(blocks * 64);
+        let mut cursor = listed.as_mut_ptr().add(count);
+        let mut base = _mm256_set1_epi32(scan as i32 + 1);
+        // Read once here, since the compiler would otherwise rebuild them in every block.
+        let planes = std::hint::black_box(&PLANES);
+        while at < end {
+            let quotes = byte_mask(at, b'"', b'"');
+            let ones = _mm_set1_epi8(-1);
+            let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
+            let odd = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
+            odd_so_far = (odd as i64 >> 63) as u64;
+            let left = byte_mask(at, b',', b'\n') & !odd;
+            // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
+            // writes 8 whatever the number, and moves on by the right amount. The positions of the
+            // lowest 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every
+            // position at that position, PEXT gathers it for the set ones, and PDEP spreads those
+            // into bit `k` of each byte.
+            let packed = planes.iter().enumerate().fold(0, |packed, (k, &plane)| {
+                packed | _pdep_u64(_pext_u64(plane, left), 0x0101_0101_0101_0101) << k
+            });
+            let bytes = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(packed as i64));
+            _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
+            let total = left.count_ones() as usize;
+            if total > 8 {
+                let mut rest = _pdep_u64(!0 << 8, left);
+                for i in 8..total {
+                    *cursor.add(i) =
+                        at.offset_from(text.as_ptr()) as u32 + rest.trailing_zeros() + 1;
+                    rest &= rest.wrapping_sub(1);
+                }
+            }
+            cursor = cursor.add(total);
+            at = at.add(64);
+            base = _mm256_add_epi32(base, _mm256_set1_epi32(64));
+        }
+        (cursor.offset_from(listed.as_ptr()) as usize, odd_so_far)
+    }
+}
 
 /// Parses the records in `pos..end`, adding each to its country's row.
 fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
@@ -438,32 +505,10 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
         let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
         listed[0] = 0;
         while scan < len {
-            for _ in 0..BLOCKS.min((len - scan).div_ceil(64)) {
-                // SAFETY: `scan` is inside the text and the padding covers a block. PCLMULQDQ is in
-                // the build's target features. The carry-less multiply by all ones gives each bit the
-                // parity of the quotes up to it, and that's odd exactly inside quotes, since a `""`
-                // pair cancels out. `count` stays below `LISTED - 8`, as a chunk has `BLOCKS` blocks.
-                unsafe {
-                    let quotes = byte_mask(text, scan, b'"', b'"');
-                    let ones = _mm_set1_epi8(-1);
-                    let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
-                    let odd = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
-                    odd_so_far = (odd as i64 >> 63) as u64;
-                    let mut left = byte_mask(text, scan, b',', b'\n') & !odd;
-                    let total = left.count_ones() as usize;
-                    // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so
-                    // this writes 8 whatever the number, and moves on by the right amount.
-                    let mut list = |i| {
-                        *listed.as_mut_ptr().add(count + i) =
-                            scan as u32 + left.trailing_zeros() + 1;
-                        left &= left.wrapping_sub(1);
-                    };
-                    (0..8).for_each(&mut list);
-                    (8..total).for_each(&mut list);
-                    count += total;
-                }
-                scan += 64;
-            }
+            let blocks = BLOCKS.min((len - scan).div_ceil(64));
+            (count, odd_so_far) =
+                list_separators(text, scan, blocks, &mut listed, count, odd_so_far);
+            scan += blocks * 64;
             // The final record may have no terminator (spec section 2.1). This costs little to ask.
             if scan >= len && pos + len == end && count % 5 == 0 {
                 listed[count] = len as u32 + 1;
@@ -471,7 +516,13 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
             }
             let records = (count - 1) / 5;
             add_records(text, &listed[..=records * 5], &mut found, names, rows);
-            listed.copy_within(records * 5..count, 0);
+            // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
+            // copy moves them, where a call to copy just the right number would cost more.
+            // SAFETY: `count + 8` stays inside the list, see above.
+            unsafe {
+                let tail = _mm256_loadu_si256(listed.as_ptr().add(records * 5).cast());
+                _mm256_storeu_si256(listed.as_mut_ptr().cast(), tail);
+            }
             count -= records * 5;
         }
         // What's left is the start of a record the piece cut short. A record longer than a piece gets
@@ -498,7 +549,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         at.map(|position| position as usize)
     };
     for record in 0..records {
-        let [mut start, name_at, note_at, region_at, amount_at, next] = separators(record);
+        let [mut start, name_at, note_at, region_at, amount_at, _] = separators(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
@@ -511,12 +562,14 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let id = digits(start, name_at - 1);
             let region = digits(region_at, amount_at - 1);
             // Amounts are at most 8 bytes, and negative ones at most 7 (spec section 2.2), so one load
-            // holds them. Moving the digits before the point up a byte squeezes it out, which leaves
-            // 8 digits to parse. CRLF or LF, with no branch to mispredict.
-            let end = next - 1 - usize::from(*text.get_unchecked(next - 2) == b'\r');
-            let negative = usize::from(*text.get_unchecked(amount_at) == b'-');
-            let aligned = digits(amount_at + negative, end);
-            let squeezed = (aligned & 0xFFFF_0000_0000_0000) | (aligned & 0x00FF_FFFF_FFFF) << 8;
+            // holds one with what follows it. Its digits, point and sign have bit 5 set, and the CR,
+            // LF or padding after it doesn't, which finds its end with no branch to mispredict. The
+            // sign comes off the bottom, and squeezing the point out leaves 8 digits to parse.
+            let word = load_u64(text, amount_at);
+            let field = (!word & 0x2020_2020_2020_2020).trailing_zeros() & !7; // 8 bits per byte
+            let negative = u32::from(word as u8 == b'-');
+            let aligned = (word >> (8 * negative)) << (64 + 8 * negative - field);
+            let squeezed = _pext_u64(aligned, 0xFFFF_00FF_FFFF_FFFF) << 8;
             let [id, region, cents] = parse_three([id, region, squeezed]);
             let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
             let region = (region as usize).min(REGION_IDS - 1);
@@ -535,7 +588,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
         // for a count of 64.
         let (name_quotes, quotes) = if both <= 64 {
-            let mask = unsafe { byte_mask(text, name_at, b'"', b'"') };
+            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), b'"', b'"') };
             let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
             (below(name), below(both))
         } else {

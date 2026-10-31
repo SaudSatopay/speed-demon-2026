@@ -6,8 +6,8 @@
 
 ## Where it loses
 
-- C board memory was 16.5 MB on `cf10d8a` and 23.5 MB on the 32-segment `30abbe7` run. First-touch reduced it to 12.0 MB on `run-27f5cc082b16`; latest `run-a906ff073a9f` confirms 11.8 MB and K 30.74. The name table takes about 8.4 MB.
-- S is 345 code lines against the reference's 108, which costs about 3.8 speed points.
+- S is about 500 code lines against the reference's 108, which costs about 5 speed points. The two-stage parser, parallel setup and raw threads pay for their lines in T and M.
+- The first stage writes 8 list entries per block whatever the number, which is about 20 instructions per record, because a variable loop's exit mispredicts more than that costs.
 
 ## Where the reference spends its time
 
@@ -154,7 +154,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 ## The final design
 
-Not final yet: see [README](README.md#approach) for the current one.
+Two-stage parsing of 32 KiB pieces, one shared lock-free name table with vector tags, and memory that workers never fault on. See the [README](README.md#approach). What the hardware counters say about it (local, 12 threads, per record): 293 instructions, 0.41 mispredicts, 160 thread cycles, of which about 57 are retiring, 45 wait on loads (2.2 first-level misses from L2, 0.3 from L3), 23 lose to the sibling thread, and 21 wait on other long operations, mostly the locked write.
 
 ## How we know it's correct
 

@@ -53,7 +53,6 @@ const PADDING: usize = 4096;
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
-    fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -1019,9 +1018,7 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
     let mut lists = Lists::default();
     let mut rows = vec![[0; 64]; plan.bitmap_count.div_ceil(64)];
     while let Some(range) = claim(next_range, range_size, docs.len()) {
-        let (at, populate_read) = (range.start & !4095, 22);
-        // SAFETY: this maps pages that the range holds, with fewer faults, and failing changes nothing.
-        unsafe { madvise(docs.as_ptr().add(at), range.end - at, populate_read) };
+        // exp: plain page faults instead of MADV_POPULATE_READ per range.
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
             let [marked, phrases, plains] = look_up(&plan.terms, text, edges, &mut lists);
             let [tokens, _, marks, phrase_at, bool_terms, chained, plain] = &mut lists.0;
@@ -1239,18 +1236,6 @@ fn main() -> io::Result<()> {
     let file = File::create(format!("{out_dir}/results.txt"))?;
     // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
     let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
-    // exp: the scan once more first, into throwaway results, so that T minus the usual T is the scan's
-    // wall time with the mapping already populated.
-    let claimed0 = AtomicUsize::new(0);
-    std::mem::forget(on_threads(threads, || {
-        scan_ranges(docs, &plan, range_size, &claimed0)
-    }));
-    for answer in &plan.answers {
-        *answer.lock().unwrap() = (0, 0, [NONE; SMALLEST]);
-    }
-    for (_, limit) in &plan.slots {
-        limit.store(NONE, Relaxed);
-    }
     let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
     answer_queries(file, &plan, &scans, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.

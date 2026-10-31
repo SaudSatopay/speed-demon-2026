@@ -41,6 +41,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 18 | Bitmap words listed on their own, rows transposed per 64 documents, a threaded query parse, cheaper second looks | Serial phases were 13% of T, and per-document bitmap writes and second looks still cost 5% of the instructions each | pending | — | — | — |
 | 19 | The same design in 130 fewer lines | S 1060 cost 3.8% of K against Cause Of Death's 818, whose T of 0.108 is close behind ours | pending | — | — | — |
 | 20 | exp: the scan twice | Where B's time goes on the box | pending | — | — | — |
+| 21 | exp: plain faults, no populate | Where B's time goes on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -85,6 +86,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D20. Cut lines with no loss of speed. Each of the recent gains was measured again and still pays: threaded parse 2.5 ms against 6.05 serial, chains walked in turn 2.2% of cycles, the bitmap word list about 2%, transposed rows about 1.4%, MADV_POPULATE_READ faults 400 against 4215. Phrases now count under their answer's lock, and the sample counts occurrences, not documents; neither changes an answer. Over 31 interleaved runs: cycles +0.6%, instructions -0.1%, mispredicts -5.7%, M max 43.1 MB against 41.9, S 1060 -> 928. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 **D21. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D22. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 ## What didn't work
 

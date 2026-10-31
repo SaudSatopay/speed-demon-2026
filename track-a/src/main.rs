@@ -30,7 +30,7 @@ const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
 /// Bytes per read: few enough to stay in the caches, enough that a read costs little per line.
-const PIECE: usize = 1 << 15;
+const PIECE: usize = 65536;
 
 /// Spare bytes after a piece in its buffer, so that a load that starts at a short fixed distance from a
 /// line needs no check of its own.
@@ -197,8 +197,10 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// Claims segments until the log, of `len` bytes, runs out. Each line is `ts method endpoint status
 /// latency`, where the timestamp is always 27 bytes. A thread keeps its own unfilled blocks of each
 /// hour, so the hot path reads and writes no line that other threads write, and allocates nothing.
-fn parse(log: &File, len: usize, table: &Table, hours: &[Hour], head: &AtomicUsize, size: usize) {
+fn parse(log: &Path, len: usize, table: &Table, hours: &[Hour], head: &AtomicUsize, size: usize) {
     let (slots, _, lines) = table;
+    // A file of its own, as threads sharing a file bounce the line with its count at every read.
+    let log = File::open(log).unwrap();
     let mut room = [0u8; PIECE + PADDING];
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
     let mut bigs = blocks;
@@ -438,8 +440,8 @@ fn main() -> std::io::Result<()> {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let threads = if asked > 0 { asked } else { allowed };
-    let log = File::open(Path::new(&arg(1, "/data")).join("requests.log"))?;
-    let end = log.metadata()?.len() as usize;
+    let log = Path::new(&arg(1, "/data")).join("requests.log");
+    let end = std::fs::metadata(&log)?.len() as usize;
     let file = File::create(Path::new(&arg(2, "/out")).join("summary.txt"))?;
     // Room for every line: the shortest has 39 bytes, and one with a big latency has at least 45 and
     // takes 3 words. Plus each thread's unfinished blocks.

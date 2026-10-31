@@ -43,6 +43,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 20 | exp: the scan twice | Where B's time goes on the box | pending | — | — | — |
 | 21 | exp: plain faults, no populate | Where B's time goes on the box | pending | — | — | — |
 | 22 | exp: parse and plan twice | Where B's time goes on the box | pending | — | — | — |
+| 23 | exp: the answer phase twice | Where B's time goes on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -91,6 +92,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D22. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **D23. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D24. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 ## What didn't work
 

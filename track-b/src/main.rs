@@ -1221,15 +1221,7 @@ fn main() -> io::Result<()> {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = if asked > 0 { asked } else { allowed };
     let docs = map_file(&format!("{data_dir}/docs.txt"))?;
-    // exp: the queries read and planned once more first, thrown away, so that T minus the usual T is
-    // the wall time of the parse, the sample and the plan.
-    let queries = map_file(&format!("{data_dir}/queries.txt"))?;
-    {
-        let mut plan0 = parse_queries(queries, threads);
-        make_plan(&mut plan0, docs, threads);
-        std::mem::forget(plan0);
-    }
-    let mut plan = parse_queries(queries, threads);
+    let mut plan = parse_queries(map_file(&format!("{data_dir}/queries.txt"))?, threads);
     make_plan(&mut plan, docs, threads);
     // The last document's id is on the last line.
     let last_line = docs
@@ -1248,6 +1240,14 @@ fn main() -> io::Result<()> {
     // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
     let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
     let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
+    // exp: the answers once more first, into the file, which is then written again from the start,
+    // so that T minus the usual T is the wall time of the totals, the posting queries and the printing.
+    let saved: Vec<Answer> = plan.answers.iter().map(|a| *a.lock().unwrap()).collect();
+    answer_queries(file, &plan, &scans, threads);
+    for (answer, saved) in plan.answers.iter().zip(saved) {
+        *answer.lock().unwrap() = saved;
+    }
+    let file = File::create(format!("{out_dir}/results.txt"))?;
     answer_queries(file, &plan, &scans, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)

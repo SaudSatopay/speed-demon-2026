@@ -47,6 +47,7 @@ const SLOTS: usize = 1 << 12;
 unsafe extern "C" {
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -193,8 +194,10 @@ fn order_ids<'a>(table: &[AtomicU32; SLOTS], log: &'a [u8]) -> (Vec<&'a [u8]>, V
 /// One hour's records: an array that threads reserve blocks of, where the next block starts, and the
 /// latencies too big for a record, each as (id << 32 | latency). The array has room for every line of
 /// the log, since a log may be lopsided, and untouched pages cost nothing. A block's unused end stays
-/// zero, which no real record is, since slot 0 is never an id.
-type Hour = (Vec<AtomicU32>, AtomicUsize, Mutex<Vec<u64>>);
+/// zero, which no real record is, since slot 0 is never an id. All the arrays share one mapping, and
+/// each is whole pages, because a mapping per hour costs a call each, and unmapping one stalls every
+/// thread that wants the address space's lock.
+type Hour = (&'static mut [AtomicU32], AtomicUsize, Mutex<Vec<u64>>);
 
 /// Hours since the start of the span, read from four timestamp bytes without parsing a date.
 /// Oct 30, Oct 31, Nov 1 and Nov 2 differ in the last digit of the month and of the day:
@@ -363,7 +366,7 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
     let written = AtomicUsize::new(0);
     on_threads(threads, || {
         let mut text = Vec::new();
-        for (hour, (mut slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
+        for (hour, (slots, next, big)) in std::iter::from_fn(|| queue.lock().unwrap().next()) {
             let records = AtomicU32::get_mut_slice(&mut slots[..next.into_inner()]);
             // Three stable passes sort by latency first and endpoint last. The current text buffer
             // is scratch, so the result is copied out, and its storage is reused for the output bytes.
@@ -380,7 +383,8 @@ fn write_summary(file: File, keys: &[&[u8]], ids: &[usize], hours: Vec<Hour>, th
             big.sort_unstable();
             text.clear();
             format_hour(hour, &records[zeros..], &big, keys, &mut text);
-            drop(slots);
+            // SAFETY: nothing else refers to these whole pages, and nothing reads them again.
+            unsafe { madvise(slots.as_mut_ptr().cast(), slots.len() * 4, 4) }; // MADV_DONTNEED.
             while written.load(Acquire) != hour {
                 thread::yield_now();
             }
@@ -405,12 +409,15 @@ fn main() -> io::Result<()> {
     assert!(log.len() < 1 << 32, "table slots hold 32-bit positions");
     let file = File::create(Path::new(&out_dir).join("summary.txt"))?;
     // Room for every line, the shortest being 40 bytes, plus each thread's unfinished block.
-    let len = log.len() / 40 + BLOCK_RECORDS * (threads + 1);
-    let new_hour = |_| {
-        let slots = vec![0u32; len].into_iter().map(AtomicU32::new).collect();
-        (slots, AtomicUsize::new(0), Mutex::default())
+    let len = (log.len() / 40 + BLOCK_RECORDS * (threads + 1)).next_multiple_of(1024);
+    // SAFETY: this maps fresh zero pages, for the life of the process, reached only through `arena`.
+    let arena = unsafe {
+        let base = mmap(std::ptr::null_mut(), HOURS * len * 4, 3, 0x22, -1, 0);
+        assert!(base as isize != -1);
+        std::slice::from_raw_parts_mut(base.cast::<AtomicU32>(), HOURS * len)
     };
-    let hours: Vec<Hour> = (0..HOURS).map(new_hour).collect();
+    let new_hour = |slots| (slots, AtomicUsize::new(0), Mutex::default());
+    let hours: Vec<Hour> = arena.chunks_mut(len).map(new_hour).collect();
     let table = [const { AtomicU32::new(0) }; SLOTS];
     let cursor = AtomicUsize::new(0);
     // Eight segments per thread balances the load. Tying the size to the thread count also makes

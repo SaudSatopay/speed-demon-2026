@@ -31,6 +31,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 9 | One tag byte per slot picks the slot, no shared insert counter, 110,000 slots to start | Local paired T -10.2% median, 40 of 41 wins on seed 1 and -9.7%, 21 of 21 on seed 7; lines per lookup 2.53 -> about 1; M 13.37 -> 11.79 MB; 393.2 -> 427.6 instructions and 1.53 -> 1.32 mispredicts per record; S +28 | run-ce5c6d99e125 | 0.043 | 16.5 | 72.9 |
 | 10 | Thirty-two input segments per thread | Smaller chunks keep worker finishes closer and reduce the tail | run-39305ec9b1ed | 0.044 | 23.5 | 71.1 |
 | 11 | Touch one word per 2 MiB table extent before workers | Avoid racing to first-fault shared THP extents | run-a906ff073a9f | 0.043 | 11.8 | 74.4 |
+| 12 | Line cuts after the tag table landed: helpers merged, region table fixed at the spec's 1 MiB, no early exit from a full table | S 348 -> 294 for K about +2.6%, with 461.8 -> 455.9 instructions and 1.45 mispredicts per record flat, and a 21-pair local A/B at -0.1% | pending | — | — | — |
 
 ## Decision log
 
@@ -56,6 +57,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D8. BZHI for the key mask.** Context: masking a name's three key words used a `u128` shift each, to cope with a full 8-byte word. Options: keep it, a branch on the length, or BZHI, which x86-64-v3 has. Chose: BZHI. It reads only the low 8 bits of its count, so a name of 32 bytes or more can lose a word from its hash, which is harmless because those names are compared in full. Cost: none in lines. Evidence: counts.sh 414.5 -> 393.1 instructions per record (-5.2%), though the simulated mispredicts move 1.54 -> 1.70, an estimated 3 cycles against about 12 saved. ab.sh 15 runs: -1.9%, inside 16% noise, so T is unproven locally, and the case rests on the box being bound by its clock. Outcome: kept; the board decides.
 
 **D9. Tags instead of probing. Context: linear probing at this load touched 2.53 slot lines per lookup, and every insert updated a shared counter. Chose a word of 8 tag bytes per group, so a lookup goes straight to the slot's line and a full group spills into the next. No counter: a pass gives up only when a search has seen every group full. The table starts at 110,000 slots for the spec's pool of 100,000 names, and more names than slots still restart with a bigger table.
+
+**D10. Fewer lines, same hot path. Context: the tag table and first-touch took S from 317 to 348. Chose to merge helpers and drop what the spec rules out. A file with more names than slots now finishes its pass before restarting, which only costs time in that case.
 
 ## What didn't work
 

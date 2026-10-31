@@ -21,7 +21,7 @@ use std::arch::asm;
 use std::io::{self, BufWriter, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, os::unix::fs::FileExt, ptr::null_mut, thread};
+use std::{arch::x86_64::*, fs::File, os::fd::AsRawFd, ptr::null_mut, thread};
 
 type Attr = [u64; 8];
 type Cpus = [u64; 16];
@@ -45,33 +45,62 @@ const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
 const PIECE: usize = 1 << 15;
 
-/// An input file, read in parts.
-struct Input(File, usize);
+/// An input file, mapped, and copied in parts. A copy in a thread's own buffer stays in its first-level
+/// cache, and a mapping needs far fewer system calls than reads do: the box charges about 10 us each.
+struct Input(&'static [u8]);
 
 impl Input {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        // SAFETY: a fresh read-only mapping, never unmapped, of a file nothing writes to while we run.
+        // An empty file needs no mapping.
+        unsafe {
+            let at = mmap(null_mut(), len.max(1), 1, 2, file.as_raw_fd(), 0);
+            assert!(at as isize != -1 || len == 0);
+            Ok(Input(std::slice::from_raw_parts(
+                if len == 0 {
+                    &raw const PADS as *mut u8
+                } else {
+                    at
+                },
+                len,
+            )))
+        }
+    }
+
+    /// Touches a byte per page table: the worker threads should charge nothing to their CPUs.
+    fn make_page_tables(&self) -> u8 {
+        self.0
+            .iter()
+            .step_by(1 << 21)
+            .fold(0, |all, &byte| all | byte)
+    }
+
+    /// Maps the pages of `pos..end` in one call. A kernel without this call refuses it, and faults.
+    fn map_in(&self, pos: usize, end: usize) {
+        let at = (self.0.as_ptr() as usize + pos) & !4095;
+        // SAFETY: the advice only reads pages in. A range past the mapping is refused.
+        unsafe { madvise(at as *mut u8, end - pos + 4096, 22) };
+    }
+
     /// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
     /// file. In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2),
     /// so it's never inside quotes, and about half the records end in one, so it's never far. A file
     /// without one simply doesn't get split.
-    fn boundary(&self, mut pos: usize, terminator: &[u8]) -> usize {
-        let mut bytes = [0; 512];
-        while let read @ 1.. = self.0.read_at(&mut bytes, pos as u64).unwrap() {
-            if let Some(at) = bytes[..read].iter().position(|&c| c == terminator[0]) {
-                return pos + at + terminator.len();
-            }
-            pos += read;
-        }
-        pos
+    fn boundary(&self, pos: usize, terminator: &[u8]) -> usize {
+        let at = self.0[pos..].iter().position(|&c| c == terminator[0]);
+        at.map_or(self.0.len(), |at| pos + at + terminator.len())
     }
 
     /// Where part `at` of `parts` starts and ends. The first boundary in a file ends its header.
     fn part(&self, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
-        let size = self.1.div_ceil(parts).max(1);
-        let cut = |at: usize| self.boundary((at * size).min(self.1), terminator);
+        let size = self.0.len().div_ceil(parts).max(1);
+        let cut = |at: usize| self.boundary((at * size).min(self.0.len()), terminator);
         (cut(at), cut(at + 1))
     }
 
-    /// Reads `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
+    /// Copies `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
     /// (no generated record comes near that), with `PADDING` zeros after them.
     fn read<'a>(&self, at: usize, len: usize, room: &'a mut [u8]) -> &'a [u8] {
         let fits = len + PADDING <= room.len();
@@ -80,7 +109,7 @@ impl Input {
         } else {
             Vec::leak(vec![0; len + PADDING])
         };
-        self.0.read_exact_at(&mut text[..len], at as u64).unwrap();
+        text[..len].copy_from_slice(&self.0[at..at + len]);
         text[len..len + PADDING].fill(0);
         text
     }
@@ -208,6 +237,7 @@ impl<'a> NameTable<'a> {
             for page in (0..bytes).step_by(4096) {
                 base.add(page).write_volatile(0);
             }
+            std::hint::black_box(records.make_page_tables());
             sched_setaffinity(0, 128, &allowed);
             NameTable {
                 records,
@@ -644,7 +674,8 @@ fn aggregate(
         let mut rows = [EMPTY_ROW; 256];
         segments.run(threads * SEGMENTS, false, |at| {
             let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
-            if !names.full.load(Relaxed) {
+            if !names.full.load(Relaxed) && pos < end {
+                records.map_in(pos, end);
                 parse_records(pos, end, &names, &mut rows, &mut room);
             }
         });
@@ -677,12 +708,8 @@ fn main() -> io::Result<()> {
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let open = |name| {
-        let file = File::open(format!("{data_dir}/{name}.csv"))?;
-        let len = file.metadata()?.len() as usize;
-        io::Result::Ok(Input(file, len))
-    };
-    let (lookup, records) = (open("regions")?, open("records")?);
+    let lookup = Input::open(&format!("{data_dir}/regions.csv"))?;
+    let records = Input::open(&format!("{data_dir}/records.csv"))?;
     let (keys, totals) = aggregate(&records, &lookup, threads, INITIAL_SLOTS);
 
     // Sorted by key, bytewise: `_UNMATCHED` lands last, because `_` is above `Z`. A row's columns are

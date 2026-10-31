@@ -59,6 +59,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 37 | exp: read the whole log once before the parse, to time the copy on the box | 16% fewer user cycles left T at 0.0244, so user code isn't what bounds the parse there | pending | — | — | — |
 | 38 | The read-only pass out again | The copy takes about 6.2 ms on the box: T 0.0312 with the pass against a median of 0.0247, less a thread round | pending | — | — | — |
 | 39 | Each thread opens the log itself, and reads 64 KiB pieces | Each thread reading through one shared file object bounces its reference count, and half as many reads cost half the syscalls | pending | — | — | — |
+| 40 | exp: hours finished while the log is still being read, text written over the hour's own records | M's peak comes from records and text held at once: finishing an hour as soon as reading is past it frees its memory earlier, and removes waiting for a turn to write | pending | — | — | — |
 
 ## Decision log
 
@@ -136,6 +137,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D31. Measurement done: 238 MB in 32 KiB pieces on 12 threads moves at about 38 GB/s, so the copy is about a third of the parse's 17.5 ms and about 11 ms is the parse proper. Back to the build before it, for more samples, as one run of it can't judge a 7% gain against the box's noise.
 
 **D32. A kernel change, for the board. A thread's own file descriptor keeps the shared struct file's count from moving between cores on every pread, and 64 KiB pieces halve the calls while still fitting L2. Locally: paired wall -2.6% on the build before, M flat, S +1. The box's noise needs 3 samples: q2 read T 0.0244 and 0.0230.
+
+**D33. Experiment, on the build before the table change, to judge this design alone. Four of 12 threads finish hours once reading is 1/48 of the log past them, and a late line restarts the run without this; the worst disorder on any banked seed is 1/315 of the log, and 280 full runs saw no restart. Locally: M max-of-5 19.61 -> 17.01 MB, cycles 390M -> 360M, median wall -7 to -14% on a noisy PC, S 296 -> about 358. Grid 44/44, threads 234/234, const-hash 44/44, stress 0 wrong in 300, shuffled and reversed logs pass.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

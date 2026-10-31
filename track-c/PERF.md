@@ -44,6 +44,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 22 | Segment sizes round up, so that no tail is lost at many threads on a tiny file | aede9f8 lost the end of a tiny file at 64 threads (the 12-thread full run was never affected); a chained script of mine pushed it past the failed sweep | pending | — | — | — |
 | 23 | exp: two-stage parse: fixed blocks list the separators, then records read their fields from the list | Parse IPC stuck at 2.1 matches the 75-cycle chain through pos: each field's position depends on loading the one before. One-thread time held with far more instructions, so the chain was the limit | pending | — | — | — |
 | 24 | exp: read the file in 32 KiB pieces with pread, instead of mapping it | Mapping costs about 15% of the CPU in the kernel, plus TLB misses on small pages and the page tables in M; a small buffer also stays in the thread's caches | pending | — | — | — |
+| 25 | No page faults or heap on the worker threads: one mapping holds the table, tags, join table and thread stacks, touched by the main thread while pinned to one CPU; raw pthreads on those stacks; country keys and long-name compares without the heap | A kernel trace showed memory.peak includes each CPU's unused charge batch, up to 252 KB per CPU that ever charges anything; workers still charged through stack faults and malloc arenas, and main wandered between CPUs | pending | — | — | — |
 
 ## Decision log
 
@@ -95,6 +96,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D23. Test on the box. Options: tune the single-pass parser, or break the chain. Local: 1 thread -8%, 12 threads +8%, 307 instructions per record against 265, no fallback parser. The local 12-thread run is dominated by Hyper-V's lock waits, so only the box can decide.
 
 **D24. Test on the box, where syscalls and page faults cost differently from WSL. Local 12 threads: +3%, with system time up. Removes the mapping, padding and populate code. What would change our minds: T or M worse than the mapped two-stage build over three samples.
+
+**D25. Main does all the touching. Options: leave the charges, or one extra thread touching. Local cgroup peak 12.1 -> 9.9 MB (median of 25), worst 11.5; local 12-thread T -10%. S 501 -> 576 for now. What would change our minds: K below the pread build's 37.5.
 
 ## What didn't work
 

@@ -16,7 +16,24 @@
 use std::io::{self, BufWriter, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, os::unix::fs::FileExt, thread};
+use std::{arch::x86_64::*, fs::File, os::unix::fs::FileExt, ptr::null_mut, thread};
+
+// Declared by hand to keep the crate at zero dependencies; std already links glibc.
+unsafe extern "C" {
+    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn pthread_attr_init(attr: *mut [u64; 8]) -> i32;
+    fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
+    fn pthread_create(
+        id: *mut u64,
+        attr: *const [u64; 8],
+        start: unsafe extern "C" fn(*mut u8) -> *mut u8,
+        arg: *mut u8,
+    ) -> i32;
+    fn pthread_join(id: u64, result: *mut *mut u8) -> i32;
+    fn sched_getcpu() -> i32;
+    fn sched_getaffinity(pid: i32, len: usize, mask: *mut [u64; 16]) -> i32;
+    fn sched_setaffinity(pid: i32, len: usize, mask: *const [u64; 16]) -> i32;
+}
 
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
 const PADDING: usize = 128;
@@ -63,17 +80,27 @@ impl Input {
         (cut(at), cut(at + 1))
     }
 
-    /// Reads `pos..end` to the start of `buffer`, with `PADDING` zeros after them.
-    fn read<'a>(&self, pos: usize, end: usize, buffer: &'a mut Vec<u8>) -> &'a [u8] {
+    /// Reads `pos..end` to the start of `buffer`, or of `spare` if it's too long, with `PADDING` zeros
+    /// after them.
+    fn read<'a>(
+        &self,
+        pos: usize,
+        end: usize,
+        buffer: &'a mut [u8],
+        spare: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
         let len = end - pos;
-        if buffer.len() < len + PADDING {
-            buffer.resize(len + PADDING, 0);
-        }
+        let text = if len + PADDING <= buffer.len() {
+            buffer
+        } else {
+            spare.resize(len + PADDING, 0);
+            spare.as_mut_slice()
+        };
         self.file
-            .read_exact_at(&mut buffer[..len], pos as u64)
+            .read_exact_at(&mut text[..len], pos as u64)
             .unwrap();
-        buffer[len..len + PADDING].fill(0);
-        buffer
+        text[len..len + PADDING].fill(0);
+        text
     }
 }
 
@@ -136,8 +163,8 @@ const REGION_IDS: usize = 1 << 20;
 /// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
-/// Words per huge page.
-const PAGE_WORDS: usize = 1 << 18;
+/// Bytes of stack per thread, enough for its rows, buffer and lists.
+const STACK: usize = 80 << 10;
 /// Words per slot, which is one cache line: three words of key, a header, and 256 country bits.
 const SLOT_WORDS: usize = 8;
 /// Most names fit in the slot itself: on seed 1, 99.99% of them.
@@ -158,35 +185,74 @@ static KEY_MASKS: [u64; 7] = [!0, !0, !0, 0, 0, 0, 0];
 /// read them as plain memory.
 struct NameTable<'a> {
     records: &'a Input,
-    words: Vec<AtomicU64>,
-    tags: Vec<AtomicU8>,
-    regions: Vec<AtomicU8>,   // The join table, country indices by region id.
-    index_of: Vec<AtomicU8>,  // Country indices by code, which takes every one in `[A-Z]{3}`.
-    keys: Mutex<Vec<String>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
-    first: usize,             // The word where the first slot starts, on a cache line boundary.
+    words: &'static [AtomicU64],
+    tags: &'static [AtomicU8],
+    regions: &'static [AtomicU8], // The join table, country indices by region id.
+    stacks: *mut u8,
+    index_of: Vec<AtomicU8>, // Country indices by code, which takes every one in `[A-Z]{3}`.
+    keys: Mutex<Vec<[u8; 3]>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
     groups: usize, // Homes. The tags and slots have one more group, for the last home's window.
     full: AtomicBool,
 }
 
+// SAFETY: only `new` and the thread that started the workers use `stacks`, before the workers run.
+unsafe impl Sync for NameTable<'_> {}
+
 impl<'a> NameTable<'a> {
-    fn new(records: &'a Input, slots: usize) -> Self {
+    /// Maps the slots, tags, join table and threads' stacks together, and touches every page here on
+    /// one thread. The kernel charges a memory group's pages to each CPU in batches, and what a CPU
+    /// has charged but not used yet counts in the peak: up to 252 KB per CPU that ever takes a page
+    /// fault. A thread that never faults adds none of that.
+    fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
+        let mut allowed = [0u64; 16];
+        // SAFETY: the masks are the size given. If a call fails, this thread just stays free to move.
+        unsafe {
+            sched_getaffinity(0, 128, &mut allowed);
+            let cpu = sched_getcpu().max(0) as usize;
+            let mut here = [0u64; 16];
+            here[cpu / 64 % 16] = 1 << (cpu % 64);
+            sched_setaffinity(0, 128, &here);
+        }
         let tags = (slots / GROUP + 1) * GROUP;
-        // These are fresh zero pages from the system, untouched until a thread needs them.
-        let words: Vec<_> = vec![0u64; tags * SLOT_WORDS + 8]
-            .into_iter()
-            .map(AtomicU64::new)
-            .collect();
-        let bytes = |len| vec![0u8; len].into_iter().map(AtomicU8::new).collect();
-        NameTable {
-            records,
-            first: words.as_ptr().align_offset(64),
-            words,
-            tags: bytes(tags),
-            regions: bytes(REGION_IDS),
-            index_of: bytes(26 * 26 * 26),
-            keys: Mutex::new(vec!["_UNMATCHED".to_string()]),
-            groups: slots / GROUP,
-            full: AtomicBool::new(false),
+        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
+        let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
+        let bytes = stacks_at + threads * STACK;
+        let (read_write, private_anonymous, huge_page) = (3, 0x22, 1 << 21);
+        // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
+        // so the parts don't overlap, and zero is a valid value of each atomic.
+        unsafe {
+            let at = mmap(
+                null_mut(),
+                bytes + huge_page,
+                read_write,
+                private_anonymous,
+                -1,
+                0,
+            );
+            assert!(at as isize != -1);
+            let base = at.add(at.align_offset(huge_page));
+            (0..bytes)
+                .step_by(4096)
+                .for_each(|at| base.add(at).write_volatile(0));
+            sched_setaffinity(0, 128, &allowed);
+            NameTable {
+                records,
+                words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),
+                tags: std::slice::from_raw_parts(base.add(tags_at).cast(), tags),
+                regions: std::slice::from_raw_parts(base.add(regions_at).cast(), REGION_IDS),
+                stacks: base.add(stacks_at),
+                index_of: vec![0u8; 26 * 26 * 26]
+                    .into_iter()
+                    .map(AtomicU8::new)
+                    .collect(),
+                keys: Mutex::new({
+                    let mut keys = Vec::with_capacity(256);
+                    keys.push(*b"___");
+                    keys
+                }),
+                groups: slots / GROUP,
+                full: AtomicBool::new(false),
+            }
         }
     }
 
@@ -206,7 +272,7 @@ impl<'a> NameTable<'a> {
                 let mut keys = self.keys.lock().unwrap();
                 if index.load(Relaxed) == 0 {
                     index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
-                    keys.push(String::from_utf8_lossy(&text[pos..pos + 3]).into_owned());
+                    keys.push([text[pos], text[pos + 1], text[pos + 2]]);
                 }
             }
             self.regions[id as usize].store(index.load(Relaxed), Relaxed);
@@ -241,7 +307,7 @@ impl<'a> NameTable<'a> {
 
     /// Where a slot's words start.
     fn base(&self, group: usize, slot: u32) -> usize {
-        self.first + (group * GROUP + slot as usize) * SLOT_WORDS
+        (group * GROUP + slot as usize) * SLOT_WORDS
     }
 
     /// The tags of the two groups at `group`, which must be a home.
@@ -286,10 +352,15 @@ impl<'a> NameTable<'a> {
                 return false;
             }
             if len > INLINE_BYTES {
-                let mut other = vec![0; len];
-                let at = (*stored).load(Relaxed);
-                self.records.file.read_exact_at(&mut other, at).unwrap();
-                return other == text[start..start + len];
+                let (at, mut other) = ((*stored).load(Relaxed), [0u8; 256]);
+                return (0..len).step_by(other.len()).all(|done| {
+                    let part = other.len().min(len - done);
+                    let source = &self.records.file;
+                    source
+                        .read_exact_at(&mut other[..part], at + done as u64)
+                        .unwrap();
+                    other[..part] == text[start + done..start + done + part]
+                });
             }
             let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
             let name = at(text.as_ptr().add(start));
@@ -414,7 +485,8 @@ fn parse_records(
     end: usize,
     names: &NameTable,
     rows: &mut Rows,
-    buffer: &mut Vec<u8>,
+    buffer: &mut [u8],
+    spare: &mut Vec<u8>,
 ) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
@@ -422,7 +494,7 @@ fn parse_records(
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
-        let text = names.records.read(pos, pos + len, buffer);
+        let text = names.records.read(pos, pos + len, buffer, spare);
         // A piece starts at a record's start, so outside quotes.
         let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
         listed[0] = 0;
@@ -595,59 +667,78 @@ impl Jobs {
     }
 }
 
+/// Runs a closure, from a new thread's start.
+unsafe extern "C" fn start<F: Fn()>(work: *mut u8) -> *mut u8 {
+    // SAFETY: `aggregate` passes a closure that outlives the thread.
+    unsafe { (*work.cast::<F>())() };
+    null_mut()
+}
+
+/// Calls `work` on `threads` threads, this one and others on the given stacks.
+fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: *mut u8) {
+    let mut ids = [0u64; 256];
+    let others = threads.min(ids.len()) - 1;
+    // SAFETY: each thread has its own stack, inside the mapping, and is joined before `work` ends.
+    unsafe {
+        let mut attr = [0u64; 8];
+        for (at, id) in ids[..others].iter_mut().enumerate() {
+            pthread_attr_init(&mut attr);
+            pthread_attr_setstack(&mut attr, stacks.add(at * STACK), STACK);
+            let arg = std::ptr::from_ref(work).cast_mut().cast();
+            assert!(pthread_create(id, &attr, start::<F>, arg) == 0);
+        }
+        work();
+        ids[..others]
+            .iter()
+            .for_each(|&id| drop(pthread_join(id, null_mut())));
+    }
+}
+
 /// Parses the whole file on `threads` threads and merges their rows, returning them with their keys.
-/// The threads share the setup too: touching each huge page once before anything writes to it, which
-/// keeps two threads from each getting one, then the regions. Eight segments per thread balances the
-/// load. Tying the sizes to the thread count also makes the SD_THREADS test sweep move every cut. The
-/// spec's pool of names is a distribution, not a promise: if a file holds more names than the table,
-/// the pass is thrown away and redone with a bigger table.
+/// The threads share the regions too. Eight segments per thread balances the load. Tying the sizes to
+/// the thread count also makes the SD_THREADS test sweep move every cut. The spec's pool of names is a
+/// distribution, not a promise: if a file holds more names than the table, the pass is thrown away and
+/// redone with a bigger table.
 fn aggregate(
     records: &Input,
     lookup: &Input,
     threads: usize,
     slots: usize,
 ) -> (Vec<String>, Vec<Row>) {
-    let names = NameTable::new(records, slots);
-    let (pages, lines, segments) = (Jobs::default(), Jobs::default(), Jobs::default());
+    let names = NameTable::new(records, slots, threads);
+    let (lines, segments) = (Jobs::default(), Jobs::default());
     let totals = Mutex::new(vec![EMPTY_ROW; 256]);
     let work = || {
-        let page_count = names.words.len().div_ceil(PAGE_WORDS);
-        pages.run_all(page_count, |page| {
-            names.words[page * PAGE_WORDS].store(0, Relaxed)
+        let mut spare = Vec::new();
+        let mut buffer = [0u8; PIECE + PADDING];
+        lines.run_all(threads * 16, |at| {
+            let (pos, end) = lookup.part(threads * 16, at, b"\n");
+            names.parse_regions(lookup.read(pos, end, &mut buffer, &mut spare), end - pos);
         });
-        let mut buffer = Vec::new();
-        lines.run_all(threads * 4, |at| {
-            let (pos, end) = lookup.part(threads * 4, at, b"\n");
-            names.parse_regions(lookup.read(pos, end, &mut buffer), end - pos);
-        });
-        let mut rows = Box::new([EMPTY_ROW; 256]);
+        let mut rows = [EMPTY_ROW; 256];
         segments.run(threads * SEGMENTS, |at| {
             let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
             if !names.full.load(Relaxed) {
-                parse_records(pos, end, &names, &mut rows, &mut buffer);
+                parse_records(pos, end, &names, &mut rows, &mut buffer, &mut spare);
             }
         });
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {
             merge(total, row);
         }
     };
-    thread::scope(|scope| {
-        let work = &work;
-        if threads > 1 {
-            scope.spawn(move || {
-                (2..threads).for_each(|_| drop(scope.spawn(work)));
-                work();
-            });
-        }
-        work();
-    });
+    run_threads(&work, threads, names.stacks);
     if names.full.load(Relaxed) {
         return aggregate(records, lookup, threads, slots * 4);
     }
-    (
-        names.keys.into_inner().unwrap(),
-        totals.into_inner().unwrap(),
-    )
+    let keys = names.keys.into_inner().unwrap().into_iter();
+    let keys = keys.map(|key| {
+        if key == *b"___" {
+            "_UNMATCHED".into()
+        } else {
+            String::from_utf8_lossy(&key).into_owned()
+        }
+    });
+    (keys.collect(), totals.into_inner().unwrap())
 }
 
 fn main() -> io::Result<()> {

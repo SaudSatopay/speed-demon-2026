@@ -159,9 +159,10 @@ fn zeroed_u32s(len: usize) -> Vec<AtomicU32> {
 
 /// Seeds and new numbers a thread takes at a time when numbering.
 const SEED_BLOCK: usize = 1 << 12;
-/// A node's entry while counting: its out-degree, then up to three out-neighbours + 1 for numbering.
-/// Nodes average 2.9, so this sees most edges, and it fits one cache line, unlike two arrays.
-const RECORD: usize = 4;
+/// A node's entry while counting: its out-degree, then two words holding up to three out-neighbours
+/// + 1 for numbering, packed in as many bits each as the node count needs (21 at full scale). Nodes
+/// average 2.9, so this sees most edges, and three words cost 7 MB less than four at the memory peak.
+const RECORD: usize = 3;
 
 /// Numbers the nodes so that neighbours sit close in memory, because the input's ids are random, which
 /// makes every hop a cache miss. Each thread takes a block of numbers, a region, and fills it with one
@@ -174,6 +175,7 @@ const RECORD: usize = 4;
 /// Returns the numbers and each number's out-degree, read from the record as its node expands.
 fn local_numbering(
     records: &[AtomicU32],
+    bits: u32,
     nodes: usize,
     threads: usize,
 ) -> (Vec<AtomicU32>, Vec<AtomicU32>) {
@@ -222,8 +224,12 @@ fn local_numbering(
                         let (node, own) = queue[next];
                         let record = &records[node as usize * RECORD..][..RECORD];
                         out_counts[own as usize].store(record[0].load(Relaxed), Relaxed);
-                        for link in &record[1..] {
-                            let neighbour = link.load(Relaxed) as usize;
+                        // A fixed three fields keeps the loop unrolled; an unused one reads as 0.
+                        let mut packed = u64::from(record[1].load(Relaxed))
+                            | u64::from(record[2].load(Relaxed)) << 32;
+                        for _ in 0..3 {
+                            let neighbour = (packed & ((1 << bits) - 1)) as usize;
+                            packed >>= bits;
                             if neighbour != 0
                                 && let Some(claimed) = claim(neighbour - 1)
                             {
@@ -340,19 +346,26 @@ fn build_graph(graph_file: &[u8], threads: usize) -> (Graph, Vec<AtomicU32>) {
     next_number(graph_file, &mut pos); // The edge count: the file's length says the same.
     let edge_lines = &graph_file[pos..];
     let records = zeroed_u32s(nodes * RECORD);
+    // Neighbour + 1 fits `bits`, and a graph past 2^21 nodes keeps two neighbours instead of three,
+    // which only makes the numbering a little worse. A field can straddle the two words, so each
+    // word gets its part of it; the other threads' fields in the word make it a locked or.
+    let bits = usize::BITS - nodes.leading_zeros();
+    let fields = (64 / bits.max(1)).min(3);
     for_each_batch(edge_lines, threads, |batch| {
         for &(tail, _, _) in batch {
             prefetch(&records[tail as usize * RECORD]);
         }
         for &(tail, head, _) in batch {
             let record = &records[tail as usize * RECORD..][..RECORD];
-            let seen = record[0].fetch_add(1, Relaxed) as usize;
-            if seen < RECORD - 1 {
-                record[seen + 1].store(head + 1, Relaxed);
+            let seen = record[0].fetch_add(1, Relaxed);
+            if seen < fields {
+                let packed = u64::from(head + 1) << (seen * bits);
+                record[1].fetch_or(packed as u32, Relaxed);
+                record[2].fetch_or((packed >> 32) as u32, Relaxed);
             }
         }
     });
-    let (numbers, out_counts) = local_numbering(&records, nodes, threads);
+    let (numbers, out_counts) = local_numbering(&records, bits, nodes, threads);
     drop(records);
     let mut forward = Graph::from_counts(out_counts);
 

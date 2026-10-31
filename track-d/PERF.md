@@ -39,6 +39,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 17 | u16 directory entries with a page-count guard | Halves the directory footprint while rejecting out-of-range page ids | run-f10dee4d919e | 0.166 | 67.9 | 69.7 |
 | 18 | Remove low-degree nodes that no query starts or ends at, joining their neighbours by shortcuts (`simplify`) | Smaller graphs should cut search time and both graphs' memory. `counts.sh` sample: 1275.8 -> 1159.6 instructions/edge, 6.17 -> 6.10 mispredicts/edge. Scored locally under THP always, 4 paired rounds: T 85.7 -> 83.2 ms, per-run M 68.9 -> 53 MB, S 428 -> 690. | run-7e9d3724c645 | 0.160 | 60.3 | 69.1 |
 | 19 | Touch one word per 2 MiB of every shared array on the main thread, `ranks` included, and raise the mmap threshold to 1 MiB so each thread's simplify buffer stays in its own arena | With simplify the peak moves to the build phase, where threads race for huge pages: board M 60.3 MB against a local floor of 45. Scored locally under THP always, 3 paired rounds: M 54.6-55.1 -> 50.6-52.7 MB, T flat. `counts.sh` sample: 1161.1 instructions/edge, 6.10 mispredicts/edge. | run-a8bd7fb8b3c7 | 0.152 | 46.0 | 70.8 |
+| 20 | exp: count records of three words: the out-degree, then up to three neighbours packed in fields of as many bits as the node count needs, each written once with a locked OR | `records` set the memory floor in the numbering phase: 27.8 MB of 16-byte records. Nine cgroup pairs under THP always: median 45.30 -> 42.24 MB, paired -2.91 MB (the peak then moves to the search phase). counts.sh sample 1161.0 -> 1167.9 instructions and 6.10 -> 5.94 mispredicts per edge; quick 45/45, threads 240/240; a synthetic graph of 2.2M nodes, past 2^21 where two neighbours are kept, matches the old binary byte for byte; S 690 -> 698 | pending | — | — | — |
 
 ## Decision log
 
@@ -80,6 +81,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D17. Try simplify on the board as an experiment.** Local K is about flat (29.40 -> 29.47), and the box's slower memory could move T either way, so only a board run can settle it. Keep it only if the board's K beats 24.81.
 
 **D18. Stop threads racing for huge pages, on top of simplify.** Without simplify this can't help: the peak there is set in the search phase (about 68 MB), and touching the arrays leaves it unchanged. If the board's K still doesn't beat 24.81, revert both.
+
+**D19. Pack the count records into 12 bytes. Context: with the search floor at about 38 MB, the numbering phase's `records` + `numbers` + `out_counts` (41 MB) set the peak. Chose: three words per node; the neighbours sit in a 64-bit pair of words in fields of `bits` = the width of the node count (21 at full scale), each written once with `fetch_or`, a field split across the words taking two; a graph past 2^21 nodes keeps two neighbours, so the numbering degrades and the answers never do. Cost: S +8, and 0.6% more instructions in the count pass. Evidence: nine THP-always cgroup pairs, 45.30 -> 42.24 MB median, paired -2.91 MB; grids pass; a 2.2M-node synthetic graph agrees with the old binary. What would change our minds: board M not below 44 MB, or T up.
 
 ## What didn't work
 

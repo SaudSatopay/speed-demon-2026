@@ -29,6 +29,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 6 | A lookup with one exit branch, and plain bitmap stores in ranges of whole bitmap words | The scan took 2.2 mispredicts per token, and `find` was 60% of the instructions | run-7b57f5310a53 | 0.308 | 40.5 | 66.4 |
 | 7 | Scan a document in stages: token edges, a small hot table with prefetched misses, a bit per term held, truth-table BOOL checks | Local phases showed BOOL evaluation at 42% and lookup at 28% of the scan, with stamps, packed queries and hits all missing cache | pending | — | — | — |
 | 8 | Plan without sorts, shared term counts, 5-slot checks, a 4-way hot table of short keys, ranges claimed in order | Single-thread plan 30 -> 20 ms; the commonest OR term of a query needs no check; threads finished unevenly; hot table compares took 40 instructions per token | pending | — | — | — |
+| 9 | A set-based main table, one heap, a parallel sample, postings queries answered before any printing | The main table's probes mispredicted on every collision, page faults cost 15% of the serial phases, the sample ran on one thread, and bitmap queries made batches wait on each other | pending | — | — | — |
 
 ## Decision log
 
@@ -49,6 +50,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D8. Replace the token-at-a-time scan. Context: one thread took 1120 ms to scan: BOOL 470, lookup 320, phrases 110. Chose stages per document with one branch each: edges from 64-byte masks, a 1024-slot table for hot terms whose misses are prefetched and resolved in a batch, a bit per term instead of a stamp, and a 64-bit truth table per query anchor so a check has no branch. Cost: S 799 -> about 950. Evidence: 12-thread local T 194 -> 140 ms, 43/43, 228/228, const-hash 38/38. What would change our minds: the board's T falling by less than S costs.
 
 **D9. Keep cutting the serial plan and BOOL checks. Context: the first rewrite left BOOL at a third of the scan and the plan at 20% of T. Chose: query parsing through the token edges; lists placed by counting instead of sorted; the commonest trailing OR term of a query counted once per term with other anchors skipping its documents; checks with five slots since the anchor's own bit is known; 4-way hot sets of 8-byte keys; ranges claimed in order by each thread, with sums kept as ids instead of offsets, so no parts. Evidence: local T 139 -> 120 ms, grid and thread sweep pass. What would change our minds: board T not falling.
+
+**D10. Remove what stays serial and what mispredicts. Context: at 12 threads, the plan and answer phases were 26 of 120 ms, and lookup misses 18% of the scan. Chose: a main table of 64-byte sets of four keys compared with one vector instruction, so a lookup has no branch; one heap with a 64 MB top pad and one arena, so huge pages replace thousands of small faults; the sample split between threads, shared counters; bitmap queries first, then lines in order. Evidence: local T 120 -> 105 ms under THP always, mispredicts 86 -> 59 per document, all grids pass. What would change our minds: M above the 44 MB cap, since one arena changes how memory is laid out.
 
 ## What didn't work
 

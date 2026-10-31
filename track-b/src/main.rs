@@ -30,8 +30,10 @@ const FIRST_TERM: usize = 64;
 const TERM_BITS: u32 = (1 << 24) - 1;
 /// ...and the top bits say what else to do. A term's phrases are checked around each occurrence...
 const PHRASE_ANCHOR: u32 = 1 << 31;
-/// ...and its BOOL queries are checked for each document that contains it.
+/// ...and its BOOL queries are checked for each document that contains it...
 const BOOL_ANCHOR: u32 = 1 << 30;
+/// ...and its chain gets each document that contains it.
+const CHAINED: u32 = 1 << 29;
 /// No query or document has this number.
 const NONE: u32 = u32::MAX;
 /// The commonest terms sit in a table of this many sets, which stays in the fastest cache.
@@ -51,6 +53,7 @@ const PADDING: usize = 4096;
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -149,38 +152,28 @@ fn on_threads(threads: usize, work: impl Fn() + Sync) {
     });
 }
 
-/// A token's key, in the low 96 bits: its first 12 bytes, lowercased and zero-padded. Setting this bit
-/// in every byte lowercases ASCII letters, and digits already have it set. A longer token, which is
-/// rare, also sets the top bit, which no shorter token's key has, and its slot needs a full compare.
-fn token_key(file: &[u8], start: usize, len: usize) -> u128 {
-    const LOWER: u64 = 0x2020_2020_2020_2020;
-    let kept = 8 * len.min(12) as u32;
+/// A token's first 8 bytes, lowercased and zero-padded, with the top bit set if there are more, which
+/// no byte of a token has. Setting this bit in every byte lowercases ASCII letters, and digits already
+/// have it set.
+fn short_key(file: &[u8], start: usize, len: usize) -> u64 {
     // SAFETY: callers pass a token's start, and the mapping continues for `PADDING` bytes past the
-    // file. The loads need no alignment, and the build targets x86-64-v3, which has BMI2, whose BZHI
+    // file. The load needs no alignment, and the build targets x86-64-v3, which has BMI2, whose BZHI
     // keeps the given number of low bits, or all of them if that's more than the width.
-    unsafe {
-        let at = file.as_ptr().add(start);
-        let low = at.cast::<u64>().read_unaligned();
-        let high = at.add(8).cast::<u32>().read_unaligned();
-        let high = _bzhi_u32(high | LOWER as u32, kept.saturating_sub(64));
-        u128::from(_bzhi_u64(low | LOWER, kept))
-            | u128::from(high | u32::from(len > 12) << 31) << 64
-    }
-}
-
-/// `short_key(token_key(..))`, without the load of the rest.
-fn short_token_key(file: &[u8], start: usize, len: usize) -> u64 {
-    // SAFETY: as in `token_key`.
     unsafe {
         let bytes = file.as_ptr().add(start).cast::<u64>().read_unaligned();
         _bzhi_u64(bytes | 0x2020_2020_2020_2020, 8 * len.min(9) as u32) | u64::from(len > 8) << 63
     }
 }
 
-/// The first 8 bytes of a token's key, with the top bit set if the token is longer, which no key's bytes
-/// have. A token that fits has no other bits in its key, so this tells it from all others.
-fn short_key(key: u128) -> u64 {
-    key as u64 | u64::from((key >> 64) as u32 != 0) << 63
+/// The next 4 bytes of the token, likewise. The top bit, set if there are more still, marks a token that
+/// needs a full compare, and those are rare.
+fn long_key(file: &[u8], start: usize, len: usize) -> u32 {
+    let kept = 8 * len.saturating_sub(8).min(4) as u32;
+    // SAFETY: as in `short_key`.
+    unsafe {
+        let bytes = file.as_ptr().add(start + 8).cast::<u32>().read_unaligned();
+        _bzhi_u32(bytes | 0x2020_2020, kept) | u32::from(len > 12) << 31
+    }
 }
 
 /// Mixes a short key with one multiply, whose high bits depend on every input bit. A test build swaps
@@ -191,30 +184,60 @@ fn hash(short_key: u64) -> u64 {
     if cfg!(sd_const_hash) { 0 } else { hash }
 }
 
-/// A slot of a term table is a u128, four to a cache line: a key in the low 96 bits, or else 0, and in
-/// the top 32 its term's number and flags.
-fn word_of(slot: u128) -> u32 {
-    (slot >> 96) as u32
+/// Which of `sets` sets, a power of two, a hash starts at: its top bits.
+fn home(sets: usize, hash: u64) -> usize {
+    (hash >> (64 - sets.trailing_zeros())) as usize
 }
 
-/// Which slot of a table of `slots` slots, a power of two, a hash starts at: its top bits.
-fn home(slots: usize, hash: u64) -> usize {
-    (hash >> (64 - slots.trailing_zeros())) as usize
-}
-
-/// Four short keys, compared at once, and their terms' words, in one cache line.
-#[derive(Clone, Copy, Default)]
+/// Four terms in one cache line, whose keys are compared at once, so a lookup has no branch on which
+/// of them it found, or whether it found one.
+#[derive(Clone, Copy)]
 #[repr(align(64))]
-struct HotSet {
-    keys: [u64; 4],
-    words: [u32; 4],
+struct TermSet {
+    short_keys: [u64; 4], // 0 in the ways not used yet, which fill in order.
+    long_keys: [u32; 4],
+    words: [u32; 4], // The term's number and flags.
 }
 
-/// Query terms to dense ids, by open addressing with linear probing. A hit always compares the full
-/// key: terms longer than the key's 12 bytes are checked against the query file.
+impl TermSet {
+    /// A bit for each way holding this short key.
+    fn ways(&self, short_key: u64) -> u32 {
+        // SAFETY: the build targets x86-64-v3, which has AVX2, and the struct is aligned.
+        unsafe {
+            let keys = _mm256_load_si256(self.short_keys.as_ptr().cast());
+            let same = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(short_key as i64));
+            _mm256_movemask_pd(_mm256_castsi256_pd(same)) as u32
+        }
+    }
+
+    /// A bit for each way holding this long key.
+    fn long_ways(&self, long_key: u32) -> u32 {
+        // SAFETY: as in `ways`.
+        unsafe {
+            let keys = _mm_load_si128(self.long_keys.as_ptr().cast());
+            let same = _mm_cmpeq_epi32(keys, _mm_set1_epi32(long_key as i32));
+            _mm_movemask_ps(_mm_castsi128_ps(same)) as u32
+        }
+    }
+
+    /// The word of the first of these ways, or 0, the word of the term no query uses, if there are none.
+    fn word(&self, ways: u32) -> u32 {
+        self.words[ways.trailing_zeros() as usize & 3] & 0u32.wrapping_sub(u32::from(ways != 0))
+    }
+}
+
+/// `count` empty sets. The kernel supplies the zeros, and only the sets touched cost anything.
+fn empty_sets(count: usize) -> Vec<TermSet> {
+    let layout = std::alloc::Layout::array::<TermSet>(count).unwrap();
+    // SAFETY: the layout isn't empty, zeros are a valid TermSet, and the Vec frees with this layout.
+    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout).cast(), count, count) }
+}
+
+/// Query terms to dense ids, by open addressing with linear probing over sets. A hit always compares
+/// the whole token: terms longer than the keys' 12 bytes are checked against the query file.
 struct TermTable<'a> {
-    slots: Vec<u128>, // The length is a power of two.
-    hot: Vec<HotSet>, // The commonest terms of each hash that fit a short key, chosen by the plan.
+    sets: Vec<TermSet>, // The length is a power of two.
+    hot: Vec<TermSet>, // The commonest terms of each hash that fit a short key, chosen by the plan.
     keys: Vec<&'a [u8]>,
 }
 
@@ -222,65 +245,81 @@ impl<'a> TermTable<'a> {
     /// Sized for `query_bytes` of query text, where 16 bytes hold about one distinct term.
     fn new(query_bytes: usize) -> Self {
         TermTable {
-            slots: vec![0; (query_bytes / 8).next_power_of_two().max(1 << 12)],
-            hot: vec![HotSet::default(); HOT_SETS],
+            sets: empty_sets((query_bytes / 32).next_power_of_two().max(1 << 10)),
+            hot: empty_sets(HOT_SETS),
             keys: vec![&[]; FIRST_TERM],
         }
     }
 
-    /// The slot of the term for the token at `start..end` of `file`, in any letter case, or else the
-    /// empty slot that ends its probe, whose word is 0, `NO_TERM`.
-    fn find(&self, file: &[u8], start: usize, end: usize, key: u128) -> u128 {
-        let mask = self.slots.len() - 1;
-        let mut index = home(self.slots.len(), hash(short_key(key)));
+    /// The word of the term for the token at `start..end` of `file`, in any letter case, or else 0,
+    /// from a probe that starts at set `index`. A set with room left ends a probe.
+    fn find(&self, file: &[u8], start: usize, end: usize, short_key: u64, mut index: usize) -> u32 {
+        let long_key = long_key(file, start, end - start);
         loop {
-            let slot = self.slots[index];
-            let differs =
-                (slot as u64 ^ key as u64) | u64::from((slot >> 64) as u32 ^ (key >> 64) as u32);
-            // The term, or the empty slot, unless a term longer than the key disagrees past it.
-            if differs.min(slot as u64) == 0
-                && (key >> 95 & 1 == 0 || slot == 0 || self.long_term_is(slot, &file[start..end]))
-            {
-                return slot;
+            let set = &self.sets[index];
+            let mut ways = set.ways(short_key) & set.long_ways(long_key);
+            if long_key >> 31 != 0 {
+                ways = self.ways_of_long_term(set, ways, &file[start..end]);
             }
-            index = (index + 1) & mask;
+            if (ways != 0) | (set.short_keys[3] == 0) {
+                return set.word(ways);
+            }
+            index = (index + 1) & (self.sets.len() - 1);
         }
     }
 
-    /// Whether a term longer than the key's 12 bytes, whose key matches, is this token.
+    /// Which of these ways, whose keys match a token longer than them, hold the token.
     #[cold]
-    fn long_term_is(&self, slot: u128, token: &[u8]) -> bool {
-        token.eq_ignore_ascii_case(self.keys[(word_of(slot) & TERM_BITS) as usize])
+    fn ways_of_long_term(&self, set: &TermSet, ways: u32, token: &[u8]) -> u32 {
+        let is_token = |way: &u32| {
+            let term = set.words[*way as usize] & TERM_BITS;
+            ways >> way & 1 != 0 && token.eq_ignore_ascii_case(self.keys[term as usize])
+        };
+        (0..4).filter(is_token).map(|way| 1 << way).sum()
     }
 
     /// Adds the query term at `start..end` of `file`, if it's new, and returns its id.
     fn intern(&mut self, file: &'a [u8], start: usize, end: usize) -> u32 {
-        let key = token_key(file, start, end - start);
-        let slot = self.find(file, start, end, key);
-        if slot != 0 {
-            return word_of(slot);
+        let short = short_key(file, start, end - start);
+        let index = home(self.sets.len(), hash(short));
+        let word = self.find(file, start, end, short, index);
+        if word != 0 {
+            return word;
         }
         let term = self.keys.len() as u32;
         self.keys.push(&file[start..end]);
-        place_slot(&mut self.slots, key | u128::from(term) << 96);
-        if self.keys.len() * 4 > self.slots.len() * 3 {
-            let mut bigger = vec![0; self.slots.len() * 2];
-            for &slot in self.slots.iter().filter(|&&slot| slot != 0) {
-                place_slot(&mut bigger, slot);
+        place_term(
+            &mut self.sets,
+            short,
+            long_key(file, start, end - start),
+            term,
+        );
+        if self.keys.len() > self.sets.len() * 3 {
+            let mut bigger = empty_sets(self.sets.len() * 2);
+            for set in &self.sets {
+                for way in (0..4).filter(|&way| set.short_keys[way] != 0) {
+                    place_term(
+                        &mut bigger,
+                        set.short_keys[way],
+                        set.long_keys[way],
+                        set.words[way],
+                    );
+                }
             }
-            self.slots = bigger;
+            self.sets = bigger;
         }
         term
     }
 }
 
-fn place_slot(slots: &mut [u128], slot: u128) {
-    let mask = slots.len() - 1;
-    let mut index = home(slots.len(), hash(short_key(slot << 32 >> 32)));
-    while slots[index] != 0 {
-        index = (index + 1) & mask;
+fn place_term(sets: &mut [TermSet], short_key: u64, long_key: u32, word: u32) {
+    let mut index = home(sets.len(), hash(short_key));
+    while sets[index].short_keys[3] != 0 {
+        index = (index + 1) & (sets.len() - 1);
     }
-    slots[index] = slot;
+    let set = &mut sets[index];
+    let way = set.ways(0).trailing_zeros() as usize;
+    (set.short_keys[way], set.long_keys[way], set.words[way]) = (short_key, long_key, word);
 }
 
 /// A term of a query, with the operator that applies it. A phrase's steps have no operator.
@@ -292,9 +331,9 @@ struct Step {
 
 struct Query {
     is_phrase: bool,
-    slot: u32, // A BOOL query's number among those answered in the scan, or NONE for the rest.
+    slot: u32,   // A BOOL query's number, where its answer goes.
     shared: u32, // The number of the term count that also goes into its answer, or NONE.
-    start: u32, // Its steps are `steps[start..end]`.
+    start: u32,  // Its steps are `steps[start..end]`.
     end: u32,
 }
 
@@ -462,26 +501,45 @@ struct Plan {
     bools: Vec<Packed>,
     shared_of: Vec<u32>, // ...and where a term's own count sits, after the checks' counts.
     count_query: Vec<u32>, // Which query or term count each count belongs to.
+    posting_queries: Vec<u32>, // The queries anchored on a common term.
     count_slots: usize,  // Those, then one count for each term with one, then a spare.
 }
 
-fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
-    let term_count = queries.terms.keys.len();
-    let (mut last_doc, mut sample_df) = (vec![NONE; term_count], vec![0u32; term_count]);
-    let mut sampled_docs = 0;
-    let sample = (0, docs.len().min(SAMPLE_BYTES));
-    for_each_doc(docs, sample, &mut Vec::new(), |doc, text, edges| {
-        sampled_docs += 1;
-        for pair in edges.chunks_exact(2) {
-            let (start, end) = (text + pair[0] as usize, text + pair[1] as usize);
-            let key = token_key(docs, start, end - start);
-            let term = word_of(queries.terms.find(docs, start, end, key)) as usize;
-            if last_doc[term] != doc {
-                last_doc[term] = doc;
-                sample_df[term] += 1;
-            }
-        }
+/// How many documents hold each term, among pieces of the corpus as big as `SAMPLE_BYTES` in all, and
+/// how many documents those pieces have.
+fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, u32) {
+    let df: Vec<AtomicU32> = (0..terms.keys.len()).map(|_| AtomicU32::new(0)).collect();
+    let (sampled_docs, next_piece) = (AtomicU32::new(0), AtomicUsize::new(0));
+    let piece = SAMPLE_BYTES.min(docs.len()) / threads;
+    on_threads(threads, || {
+        let start = next_piece.fetch_add(1, Relaxed) * (docs.len() / threads);
+        let mut seen_in = vec![NONE; df.len()];
+        for_each_doc(
+            docs,
+            (start, start + piece),
+            &mut Vec::new(),
+            |doc, text, edges| {
+                sampled_docs.fetch_add(1, Relaxed);
+                for pair in edges.chunks_exact(2) {
+                    let (start, end) = (text + pair[0] as usize, text + pair[1] as usize);
+                    let short = short_key(docs, start, end - start);
+                    let index = home(terms.sets.len(), hash(short));
+                    let term = terms.find(docs, start, end, short, index) as usize;
+                    if seen_in[term] != doc {
+                        seen_in[term] = doc;
+                        df[term].fetch_add(1, Relaxed);
+                    }
+                }
+            },
+        );
     });
+    let df = df.into_iter().map(AtomicU32::into_inner).collect();
+    (df, sampled_docs.into_inner())
+}
+
+fn make_plan(docs: &[u8], queries: &mut Queries, threads: usize) -> Plan {
+    let term_count = queries.terms.keys.len();
+    let (mut sample_df, sampled_docs) = sample_terms(docs, &queries.terms, threads);
 
     // A query anchored on a common term, with df above about N/48, is answered from postings: bitmaps
     // for its common terms and chains for the others. On memory alone, a bitmap (N/8 bytes) and a
@@ -491,14 +549,22 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
     const BITMAP: u32 = 1 << 31;
     let mut store_of = vec![NONE; term_count];
     let (mut bitmap_count, mut list_count, mut scan_count) = (0, 0, 0);
-    // Each query answered in the scan's anchors, then NONE.
+    // Each BOOL query's anchors, then NONE. A query reading postings has none.
     let (mut query_anchors, mut these) = (Vec::with_capacity(queries.list.len()), Vec::new());
+    let mut posting_queries = Vec::new();
     let Queries { list, steps, terms } = queries;
-    for query in list.iter_mut().filter(|query| !query.is_phrase) {
+    for (number, query) in list
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, query)| !query.is_phrase)
+    {
         let steps = &steps[query.start as usize..query.end as usize];
+        query.slot = scan_count;
+        scan_count += 1;
         these.clear();
         anchors(steps, &sample_df, &mut these);
         if these.iter().any(|&term| common(term)) {
+            posting_queries.push(number as u32);
             for step in steps {
                 let store = &mut store_of[step.term as usize];
                 if *store == NONE && common(step.term) {
@@ -510,8 +576,6 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
                 }
             }
         } else {
-            query.slot = scan_count;
-            scan_count += 1;
             // After the last AND or NOT, each OR's term alone makes a document match. The commonest
             // of them becomes the first anchor, needing no check: the term's own count serves every
             // query so anchored, and the other anchors skip the documents that hold it.
@@ -525,8 +589,8 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
                 query.shared = 0;
             }
             query_anchors.extend_from_slice(&these);
-            query_anchors.push(NONE);
         }
+        query_anchors.push(NONE);
     }
 
     // Number the terms: those with bitmaps, then those with chains, then the rest, the commonest first
@@ -567,7 +631,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
     let mut shared_of = vec![NONE; term_count];
     let mut shared_count = 0;
     let mut at_anchor = 0;
-    for query in list.iter_mut().filter(|query| query.slot != NONE) {
+    for query in list.iter_mut().filter(|query| !query.is_phrase) {
         let these = &mut query_anchors[at_anchor..];
         if query.shared != NONE {
             let first = new_number[these[0] as usize] as usize;
@@ -626,7 +690,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
                 *slot = step.term;
             }
             *at += entry.len() as u32;
-        } else if query.slot != NONE {
+        } else {
             let these = &query_anchors[at_anchor..];
             let count = these.iter().position(|&term| term == NONE).unwrap_or(0);
             let unchecked = usize::from(query.shared != NONE);
@@ -645,23 +709,28 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
         *shared = check_count + (*shared).min(shared_count);
     }
     let mut hot_df = vec![[0u32; 4]; HOT_SETS];
-    for slot in terms.slots.iter_mut().filter(|slot| **slot != 0) {
-        let term = new_number[word_of(*slot) as usize] as usize;
-        let word = term as u32
-            | u32::from(starts(&phrase_start, term)) * PHRASE_ANCHOR
-            | u32::from(starts(&bool_start, term) || shared_of[term] != check_count + shared_count)
-                * BOOL_ANCHOR;
-        let key = *slot << 32 >> 32;
-        *slot = key | u128::from(word) << 96;
-        // The four commonest terms of each hot set. A longer key always misses, and then gets compared.
-        let short = short_key(key);
-        let set = home(HOT_SETS, hash(short));
-        let dfs = &mut hot_df[set];
-        let least = (0..4).min_by_key(|&way| dfs[way]).unwrap_or(0);
-        if sample_df[term] > dfs[least] && short >> 63 == 0 {
-            dfs[least] = sample_df[term];
-            terms.hot[set].keys[least] = short;
-            terms.hot[set].words[least] = word;
+    for set in terms.sets.iter_mut() {
+        for way in (0..4).filter(|&way| set.short_keys[way] != 0) {
+            let term = new_number[set.words[way] as usize] as usize;
+            let chained = term.wrapping_sub(chain_from as usize) < list_count as usize;
+            let word = term as u32
+                | u32::from(starts(&phrase_start, term)) * PHRASE_ANCHOR
+                | u32::from(
+                    starts(&bool_start, term) || shared_of[term] != check_count + shared_count,
+                ) * BOOL_ANCHOR
+                | u32::from(chained) * CHAINED;
+            set.words[way] = word;
+            // The four commonest terms of each hot set. A longer key always misses, and then gets
+            // compared in full.
+            let short = set.short_keys[way];
+            let hot = home(HOT_SETS, hash(short));
+            let dfs = &mut hot_df[hot];
+            let least = (0..4).min_by_key(|&way| dfs[way]).unwrap_or(0);
+            if sample_df[term] > dfs[least] && short >> 63 == 0 {
+                dfs[least] = sample_df[term];
+                terms.hot[hot].short_keys[least] = short;
+                terms.hot[hot].words[least] = word;
+            }
         }
     }
     Plan {
@@ -673,6 +742,7 @@ fn make_plan(docs: &[u8], queries: &mut Queries) -> Plan {
         bools,
         shared_of,
         count_query,
+        posting_queries,
         count_slots: (scan_slots + 1) as usize,
     }
 }
@@ -707,21 +777,29 @@ struct ScanResult {
 /// The bits of `hits` that hold the sum of ids, which `main` checks has room.
 const SUM_BITS: u32 = 40;
 
-/// The ten smallest matching documents of a query or term count, ascending, then NONE, and the last
-/// of them, which only falls, so that the documents past it need no lock. Those fill first, as threads
-/// work through the corpus together, and only a thread's own first ten ever get this far.
-struct Smallest {
-    limit: Vec<AtomicU32>,
-    docs: Vec<Mutex<[u32; SMALLEST]>>,
+/// What a query's line prints, or what a term's count adds to it.
+#[derive(Clone, Copy)]
+struct Answer {
+    count: u64,
+    sum: u64,
+    smallest: [u32; SMALLEST], // Ascending, then NONE.
 }
 
-impl Smallest {
-    fn add(&self, slot: usize, doc: u32) {
+/// The answers, each with its own lock, and the last of each one's ten smallest documents, which only
+/// falls, so that the documents past it need no lock. Those fill first, as threads work through the
+/// corpus together, and only a thread's own first ten ever get this far.
+struct Answers {
+    limit: Vec<AtomicU32>,
+    slots: Vec<Mutex<Answer>>,
+}
+
+impl Answers {
+    fn add_smallest(&self, slot: usize, doc: u32) {
         if doc < self.limit[slot].load(Relaxed) {
-            let mut docs = self.docs[slot].lock().unwrap();
-            insert_smallest(&mut docs, doc);
-            if docs[SMALLEST - 1] != NONE {
-                self.limit[slot].store(docs[SMALLEST - 1], Relaxed);
+            let smallest = &mut self.slots[slot].lock().unwrap().smallest;
+            insert_smallest(smallest, doc);
+            if smallest[SMALLEST - 1] != NONE {
+                self.limit[slot].store(smallest[SMALLEST - 1], Relaxed);
             }
         }
     }
@@ -737,6 +815,14 @@ fn insert_smallest(smallest: &mut [u32; SMALLEST], doc: u32) {
     }
 }
 
+/// A token that the hot table doesn't hold.
+#[derive(Clone, Copy, Default)]
+struct Miss {
+    short: u64,
+    index: u32, // The set where its probe starts.
+    at: u32,    // Its number in the document.
+}
+
 /// Claims ranges of the corpus until none is left, and scans them.
 fn scan_ranges(
     docs: &[u8],
@@ -746,7 +832,7 @@ fn scan_ranges(
     plan: &Plan,
     bitmaps: &[AtomicU64],
     words: usize,
-    smallest: &Smallest,
+    answers: &Answers,
 ) -> ScanResult {
     let terms = &queries.terms;
     let mut result = ScanResult {
@@ -759,9 +845,7 @@ fn scan_ranges(
     let mut present = vec![0u64; terms.keys.len().div_ceil(64)];
     let bitmap_count = plan.bitmap_count;
     let chain_from = (FIRST_TERM + bitmap_count.next_multiple_of(64)) as u32;
-    let chain_count = plan.list_count as u32;
-    let hot: &[HotSet; HOT_SETS] = terms.hot.as_slice().try_into().unwrap();
-    let table_shift = 64 - terms.slots.len().trailing_zeros();
+    let hot: &[TermSet; HOT_SETS] = terms.hot.as_slice().try_into().unwrap();
     let mut edges = Vec::new();
     let (mut tokens, mut misses) = (Vec::new(), Vec::new());
     let (mut phrase_at, mut bool_terms, mut chain_terms) = (Vec::new(), Vec::new(), Vec::new());
@@ -779,7 +863,7 @@ fn scan_ranges(
                 let count = edges.len() / 2;
                 if tokens.len() <= count {
                     tokens.resize(count + 1, 0);
-                    misses.resize(count + 1, 0);
+                    misses.resize(count + 1, Miss::default());
                     phrase_at.resize(count + 1, 0);
                     bool_terms.resize(count + 1, 0);
                     chain_terms.resize(count + 1, 0);
@@ -789,33 +873,34 @@ fn scan_ranges(
                 let mut missed = 0;
                 for (at, pair) in edges.chunks_exact(2).enumerate() {
                     let (start, end) = (pair[0] as usize, pair[1] as usize);
-                    let key = short_token_key(docs, text + start, end - start);
-                    let hash = hash(key);
-                    let set = &hot[(hash >> (64 - HOT_SETS.trailing_zeros())) as usize];
-                    // SAFETY: the build targets x86-64-v3, which has AVX2. A set's keys are 32 bytes, its
-                    // first field in an aligned struct. There's room for every token in both lists, `missed`
-                    // is at most `at`, and the prefetched slot is in the table.
+                    let short = short_key(docs, text + start, end - start);
+                    let hash = hash(short);
+                    let set = &hot[home(HOT_SETS, hash)];
+                    let ways = set.ways(short);
+                    let miss = usize::from(ways == 0);
+                    let index = home(terms.sets.len(), hash);
+                    // SAFETY: there's room for every token in both lists, `missed` is at most `at`, a way's
+                    // number is below 4, and the prefetched set is in the table.
                     unsafe {
-                        let keys = _mm256_load_si256(set.keys.as_ptr().cast());
-                        let same = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                        let ways = _mm256_movemask_pd(_mm256_castsi256_pd(same)) as u32;
-                        let miss = usize::from(ways == 0);
-                        let target = (hash >> table_shift) as usize & 0usize.wrapping_sub(miss);
                         *tokens.get_unchecked_mut(at) =
                             *set.words.get_unchecked(ways.trailing_zeros() as usize & 3);
-                        *misses.get_unchecked_mut(missed) = at as u32;
-                        _mm_prefetch(terms.slots.as_ptr().add(target).cast(), _MM_HINT_T0);
-                        missed += miss;
+                        *misses.get_unchecked_mut(missed) = Miss {
+                            short,
+                            index: index as u32,
+                            at: at as u32,
+                        };
+                        let target = index & 0usize.wrapping_sub(miss);
+                        _mm_prefetch(terms.sets.as_ptr().add(target).cast(), _MM_HINT_T0);
                     }
+                    missed += miss;
                 }
-                for &at in &misses[..missed] {
-                    let at = at as usize;
+                for miss in &misses[..missed] {
+                    let at = miss.at as usize;
                     let (start, end) = (
                         text + edges[2 * at] as usize,
                         text + edges[2 * at + 1] as usize,
                     );
-                    tokens[at] =
-                        word_of(terms.find(docs, start, end, token_key(docs, start, end - start)));
+                    tokens[at] = terms.find(docs, start, end, miss.short, miss.index as usize);
                 }
                 // Mark what the document holds, and list what to do about it at the end.
                 let (mut phrases, mut bools, mut chains) = (0, 0, 0);
@@ -832,7 +917,7 @@ fn scan_ranges(
                         *bool_terms.get_unchecked_mut(bools) = term;
                         bools += (word >> 30 & 1) as usize & first;
                         *chain_terms.get_unchecked_mut(chains) = term;
-                        chains += usize::from(term.wrapping_sub(chain_from) < chain_count) & first;
+                        chains += (word >> 29 & 1) as usize & first;
                     }
                 }
                 // No other thread writes this document's bitmap words, so setting a bit takes no atomic.
@@ -894,7 +979,7 @@ fn scan_ranges(
                     result.hits[shared] += this_doc;
                     // A thread's hits ascend, so only its first ten can be among the smallest.
                     if result.hits[shared] >> SUM_BITS <= SMALLEST as u64 {
-                        smallest.add(plan.count_query[shared] as usize, doc);
+                        answers.add_smallest(plan.count_query[shared] as usize, doc);
                     }
                     let (from, to) = (
                         plan.bool_start[term] as usize,
@@ -911,7 +996,7 @@ fn scan_ranges(
                         let counts = u64::from(packed.truth >> holds & 1);
                         *hits += counts * this_doc;
                         if counts != 0 && *hits >> SUM_BITS <= SMALLEST as u64 {
-                            smallest.add(plan.count_query[from + at] as usize, doc);
+                            answers.add_smallest(plan.count_query[from + at] as usize, doc);
                         }
                     }
                 }
@@ -931,9 +1016,7 @@ struct Index<'a> {
     scans: &'a [ScanResult],
     hit_start: Vec<u32>, // A phrase query's documents are `hits[hit_start[q]..hit_start[q + 1]]`.
     hits: Vec<u32>,
-    counts: Vec<u64>, // A BOOL query's matches and their sum, for queries answered in the scan.
-    sums: Vec<u64>,
-    smallest: Smallest,
+    answers: Answers,
 }
 
 impl Index<'_> {
@@ -971,15 +1054,19 @@ fn collect_hits(results: &[ScanResult], query_count: usize) -> (Vec<u32>, Vec<u3
 }
 
 /// Sums the threads' counts and ids into each scan-answered query's and term's count and sum of ids.
-fn total_hits(results: &[ScanResult], plan: &Plan) -> (Vec<u64>, Vec<u64>) {
-    let (mut counts, mut sums) = (vec![0u64; plan.count_slots], vec![0u64; plan.count_slots]);
+fn total_hits(results: &[ScanResult], plan: &Plan, answers: &mut Answers) {
+    let answers: Vec<&mut Answer> = answers
+        .slots
+        .iter_mut()
+        .map(|answer| answer.get_mut().unwrap())
+        .collect();
+    let mut answers = answers;
     for result in results {
-        for (&query, &hits) in plan.count_query.iter().zip(&result.hits) {
-            counts[query as usize] += hits >> SUM_BITS;
-            sums[query as usize] += hits & ((1 << SUM_BITS) - 1);
+        for (&slot, &hits) in plan.count_query.iter().zip(&result.hits) {
+            answers[slot as usize].count += hits >> SUM_BITS;
+            answers[slot as usize].sum += hits & ((1 << SUM_BITS) - 1);
         }
     }
-    (counts, sums)
 }
 
 /// One thread's running result R for a BOOL query anchored on a common term, as a bitmap.
@@ -1012,24 +1099,29 @@ impl Evaluator {
         }
     }
 
-    fn print_result(&self, out: &mut Vec<u8>) {
-        let (mut count, mut sum) = (0u64, 0u64);
-        let mut smallest = Vec::with_capacity(SMALLEST);
+    fn answer(&self) -> Answer {
+        let mut answer = Answer {
+            count: 0,
+            sum: 0,
+            smallest: [NONE; SMALLEST],
+        };
+        let mut found = 0;
         for (i, &word) in self.bits.iter().enumerate() {
             let ones = u64::from(word.count_ones());
-            count += ones;
-            sum += 64 * i as u64 * ones;
+            answer.count += ones;
+            answer.sum += 64 * i as u64 * ones;
             // The sum of a word's ids, from the popcounts of the positions with each index bit set.
             for (bit, mask) in INDEX_BIT_MASKS.iter().enumerate() {
-                sum += u64::from((word & mask).count_ones()) << bit;
+                answer.sum += u64::from((word & mask).count_ones()) << bit;
             }
             let mut rest = word;
-            while rest != 0 && smallest.len() < SMALLEST {
-                smallest.push(64 * i as u32 + rest.trailing_zeros());
+            while rest != 0 && found < SMALLEST {
+                answer.smallest[found] = 64 * i as u32 + rest.trailing_zeros();
+                found += 1;
                 rest &= rest - 1;
             }
         }
-        print_line(out, count, sum, &smallest);
+        answer
     }
 }
 
@@ -1068,17 +1160,28 @@ fn print_list(out: &mut Vec<u8>, docs: &[u32]) {
     );
 }
 
-/// Threads claim batches of queries in order, and each waits for the batch before it to reach the
-/// file. The wait is short, because batches cost about the same.
-fn answer_queries(file: File, queries: &Queries, index: &Index, threads: usize) {
-    let next_batch = AtomicUsize::new(0);
-    let written = AtomicUsize::new(0);
+/// First the queries that read postings, as they take most of the time. Then threads claim batches of
+/// queries in order, and each waits for the batch before it to reach the file. The wait is short,
+/// because batches cost about the same.
+fn answer_queries(file: File, plan: &Plan, queries: &Queries, index: &Index, threads: usize) {
+    let (next_query, next_batch, written) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
     let list = &queries.list;
     on_threads(threads, || {
         let mut evaluator = Evaluator {
             bits: vec![0; index.words],
             other: vec![0; index.words],
         };
+        while let Some(&number) = plan.posting_queries.get(next_query.fetch_add(1, Relaxed)) {
+            let query = &list[number as usize];
+            evaluator.run(queries.steps_of(query), index);
+            *index.answers.slots[query.slot as usize].lock().unwrap() = evaluator.answer();
+        }
+    });
+    on_threads(threads, || {
         let (mut text, mut sorted) = (Vec::new(), Vec::new());
         let claim = || Some(next_batch.fetch_add(1, Relaxed)).filter(|b| b * BATCH < list.len());
         while let Some(batch) = claim() {
@@ -1091,26 +1194,22 @@ fn answer_queries(file: File, queries: &Queries, index: &Index, threads: usize) 
                     sorted.extend_from_slice(&index.hits[from as usize..to as usize]);
                     sorted.sort_unstable();
                     print_list(&mut text, &sorted);
-                } else if query.slot == NONE {
-                    evaluator.run(queries.steps_of(query), index);
-                    evaluator.print_result(&mut text);
                 } else {
-                    let slot = query.slot as usize;
-                    let (mut count, mut sum) = (index.counts[slot], index.sums[slot]);
-                    let mut smallest = *index.smallest.docs[slot].lock().unwrap();
+                    let mut answer = *index.answers.slots[query.slot as usize].lock().unwrap();
                     if query.shared != NONE {
-                        let shared = query.shared as usize;
-                        count += index.counts[shared];
-                        sum += index.sums[shared];
-                        for &doc in index.smallest.docs[shared].lock().unwrap().iter() {
-                            insert_smallest(&mut smallest, doc);
+                        let shared = *index.answers.slots[query.shared as usize].lock().unwrap();
+                        answer.count += shared.count;
+                        answer.sum += shared.sum;
+                        for doc in shared.smallest {
+                            insert_smallest(&mut answer.smallest, doc);
                         }
                     }
+                    let shown = (answer.count as usize).min(SMALLEST);
                     print_line(
                         &mut text,
-                        count,
-                        sum,
-                        &smallest[..(count as usize).min(SMALLEST)],
+                        answer.count,
+                        answer.sum,
+                        &answer.smallest[..shown],
                     );
                 }
             }
@@ -1136,6 +1235,15 @@ fn document_count(docs: &[u8]) -> usize {
 }
 
 fn main() -> io::Result<()> {
+    // All of the heap comes from one contiguous region, grown a lot at a time, so that the kernel can
+    // back it with huge pages, in far fewer page faults than threads' arenas and small mappings take.
+    let (top_pad, mmap_threshold, arena_max) = (-2, -3, -8);
+    // SAFETY: no thread has started, and these only tune the allocator.
+    unsafe {
+        mallopt(arena_max, 1);
+        mallopt(mmap_threshold, 1 << 30);
+        mallopt(top_pad, 1 << 26);
+    }
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -1143,7 +1251,7 @@ fn main() -> io::Result<()> {
     let threads = thread_count();
     let docs = map_file(&data_dir.join("docs.txt"))?;
     let mut queries = parse_queries(map_file(&data_dir.join("queries.txt"))?);
-    let plan = make_plan(docs, &mut queries);
+    let plan = make_plan(docs, &mut queries, threads);
 
     let words = document_count(docs).div_ceil(64);
     assert!(
@@ -1160,13 +1268,16 @@ fn main() -> io::Result<()> {
     // SAFETY: AtomicU64 has the layout of u64, and nothing else uses `bitmaps` during the scan.
     let shared: &[AtomicU64] =
         unsafe { std::slice::from_raw_parts(bitmaps.as_ptr().cast(), bitmaps.len()) };
-    let smallest = Smallest {
+    let empty = Answer {
+        count: 0,
+        sum: 0,
+        smallest: [NONE; SMALLEST],
+    };
+    let mut answers = Answers {
         limit: (0..plan.count_slots)
             .map(|_| AtomicU32::new(NONE))
             .collect(),
-        docs: (0..plan.count_slots)
-            .map(|_| Mutex::new([NONE; SMALLEST]))
-            .collect(),
+        slots: (0..plan.count_slots).map(|_| Mutex::new(empty)).collect(),
     };
     let file = File::create(Path::new(&out_dir).join("results.txt"))?;
     // Enough ranges that a thread slowed for a while doesn't hold the others up.
@@ -1174,10 +1285,10 @@ fn main() -> io::Result<()> {
     let next_range = AtomicUsize::new(0);
     let results: Vec<ScanResult> = thread::scope(|scope| {
         let scan = |_| {
-            let (queries, plan, smallest, next_range) = (&queries, &plan, &smallest, &next_range);
+            let (queries, plan, answers, next_range) = (&queries, &plan, &answers, &next_range);
             scope.spawn(move || {
                 scan_ranges(
-                    docs, range_size, next_range, queries, plan, shared, words, smallest,
+                    docs, range_size, next_range, queries, plan, shared, words, answers,
                 )
             })
         };
@@ -1189,7 +1300,7 @@ fn main() -> io::Result<()> {
     });
 
     let (hit_start, hits) = collect_hits(&results, queries.list.len());
-    let (counts, sums) = total_hits(&results, &plan);
+    total_hits(&results, &plan, &mut answers);
     let index = Index {
         bitmap_count: plan.bitmap_count,
         bitmaps,
@@ -1197,11 +1308,9 @@ fn main() -> io::Result<()> {
         scans: &results,
         hit_start,
         hits,
-        counts,
-        sums,
-        smallest,
+        answers,
     };
-    answer_queries(file, &queries, &index, threads);
+    answer_queries(file, &plan, &queries, &index, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)
 }

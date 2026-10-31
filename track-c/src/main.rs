@@ -43,7 +43,7 @@ unsafe extern "C" {
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
 const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
-const PIECE: usize = 1 << 15;
+const PIECE: usize = 48 << 10;
 
 /// An input file, read in parts.
 struct Input(File, usize);
@@ -141,7 +141,7 @@ const REGION_IDS: usize = 1 << 20;
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 68 << 10;
+const STACK: usize = 84 << 10;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
 /// Slots per group. A name's home is a group, and it may sit there or in the next one.

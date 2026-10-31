@@ -2,7 +2,7 @@
 //!
 //! The log is memory-mapped and cut into segments that threads claim from an atomic cursor, so a
 //! thread that falls behind simply claims fewer. Each line is read at fixed offsets where the format
-//! allows it, and with block loads where it doesn't. One lock-free table, shared by all threads,
+//! allows it, and with block loads where it doesn't. One lock-free table of cache lines, shared by all threads,
 //! turns endpoints into ids, and each line becomes one 32-bit record in a shared array for its hour,
 //! where each thread reserves small blocks. When the log is done, threads claim hours: each groups one
 //! hour's array with three stable radix passes, formats it, frees it, and waits for its turn to append
@@ -115,38 +115,68 @@ fn hash(first: u64, last: u64, len: usize) -> u64 {
     if cfg!(sd_const_hash) { 0 } else { hash }
 }
 
+/// A slot of the endpoint table, one cache line: the first 60 bytes that followed where the key first
+/// occurred, then that position, published last. It's never 0 for a key, so 0 means empty, and 1 means
+/// that another thread is filling the slot. Comparing here, not against the log, touches one line, where
+/// the log would need a line of a different page each time.
+#[repr(C, align(64))]
+struct Slot {
+    bytes: std::cell::UnsafeCell<[u8; 60]>,
+    position: AtomicU32,
+}
+
+// SAFETY: a thread writes `bytes` only after winning `position`, which others then wait on.
+unsafe impl Sync for Slot {}
+
 /// The id of the endpoint at `start..end`, adding it if it's new. An id is a slot number in a table
-/// that all threads share with no locks: a slot holds where the key first occurred in the log, which
-/// is never 0, so 0 means empty, and a published slot never changes. A key is always compared in full,
-/// through its closing space, because templated paths share prefixes, suffixes and lengths, and that
-/// space is why a slot needs no length. Slot 0 stays free: see `Hour`.
+/// that all threads share with no locks, and a published slot never changes. A key is always compared
+/// in full, through its closing space, because templated paths share prefixes, suffixes and lengths, and
+/// that space is why a slot needs no length. Slot 0 stays free: see `Hour`.
 ///
 /// # Safety
 /// `log` must come from `map_file`, `start` must be at least 8, `start <= end`, `end` must be inside
 /// the log and hold a space, and `table` must have been filled only by this function, with this log.
-unsafe fn id_of(table: &[AtomicU32; SLOTS], log: &[u8], start: usize, end: usize) -> u32 {
+unsafe fn id_of(table: &[Slot], log: &[u8], start: usize, end: usize) -> u32 {
     let len = end - start;
     let outside = 64 - 8 * len.min(8); // Bits of an 8-byte load that aren't this key's.
     // SAFETY, for this load and the next two: all three start inside the log.
     let first = unsafe { load::<u64>(log, start) } << outside;
     let last = unsafe { load::<u64>(log, end - 8) } >> outside;
-    let block = unsafe { load(log, start) };
-    let position = start as u32;
+    let block: [__m256i; 2] = unsafe { load(log, start) };
     let mut index = (hash(first, last, len) >> 52) as usize;
     loop {
         index = (index & (SLOTS - 1)).max(1);
         let slot = &table[index];
-        if slot.load(Relaxed) == 0 && slot.compare_exchange(0, position, Relaxed, Relaxed).is_ok() {
+        let mut position = slot.position.load(Acquire);
+        if position == 0
+            && slot
+                .position
+                .compare_exchange(0, 1, Relaxed, Relaxed)
+                .is_ok()
+        {
+            // SAFETY: winning the exchange makes this thread the only writer, and no one reads the
+            // bytes until the store below. The log holds these 60 bytes, or the padding does.
+            unsafe {
+                slot.bytes
+                    .get()
+                    .cast::<[__m256i; 2]>()
+                    .write_unaligned(block)
+            };
+            slot.position.store(start as u32, Release);
             return index as u32;
         }
-        let first = slot.load(Relaxed) as usize;
+        while position <= 1 {
+            std::hint::spin_loop();
+            position = slot.position.load(Acquire);
+        }
+        // SAFETY: the bytes were written before the position was published, and never change again.
+        let stored = unsafe { slot.bytes.get().cast::<[__m256i; 2]>().read_unaligned() };
         // One compare of a whole block covers nearly all keys, whatever their length, and a call to
         // memcmp would branch on the length. The rest of a long key may be longer than what's left of
         // the log after `first`, if that key is shorter and on the last line, hence the `get`.
-        // SAFETY: `first` is the `start` of an earlier call, which was inside the log.
-        if (!equal_bytes(unsafe { load(log, first) }, block)).trailing_zeros() as usize
-            > len.min(63)
-            && (len < 64 || log.get(first + 64..=first + len) == Some(&log[start + 64..=end]))
+        let first = position as usize;
+        if (!equal_bytes(stored, block)).trailing_zeros() as usize > len.min(59)
+            && (len < 60 || log.get(first + 60..=first + len) == Some(&log[start + 60..=end]))
         {
             return index as u32;
         }
@@ -157,8 +187,8 @@ unsafe fn id_of(table: &[AtomicU32; SLOTS], log: &[u8], start: usize, end: usize
 /// Each id's endpoint, with an empty key for unused ids, and the ids in use, in the byte order of
 /// their endpoints (`[u8]` compares as unsigned bytes, with a proper prefix first), after id 0,
 /// which no endpoint has: it's what the unused ends of blocks hold.
-fn order_ids<'a>(table: &[AtomicU32; SLOTS], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<usize>) {
-    let key_of = |slot: &AtomicU32| match slot.load(Relaxed) as usize {
+fn order_ids<'a>(table: &[Slot], log: &'a [u8]) -> (Vec<&'a [u8]>, Vec<usize>) {
+    let key_of = |slot: &Slot| match slot.position.load(Relaxed) as usize {
         0 => &log[..0],
         // SAFETY: a slot holds the `start` of a call to `id_of`, which was inside the log.
         first => &log[first..][..unsafe { offset_of_space(log, first) }],
@@ -215,7 +245,7 @@ unsafe fn parse_latency(log: &[u8], pos: usize) -> (u32, usize) {
 /// the timestamp is always 27 bytes. A thread keeps its own unfilled block of each hour, as a slice,
 /// and its own big latencies, so the hot path reads and writes no line that other threads write.
 /// `log` is the mapping from `map_file`, whose padding the unchecked loads here rely on.
-fn parse(log: &[u8], table: &[AtomicU32; SLOTS], hours: &[Hour], head: &AtomicUsize, size: usize) {
+fn parse(log: &[u8], table: &[Slot], hours: &[Hour], head: &AtomicUsize, size: usize) {
     let mut blocks: [&[AtomicU32]; HOURS] = [&[]; HOURS];
     let mut bigs = [const { Vec::new() }; HOURS];
     let claim = || Some(head.fetch_add(size, Relaxed)).filter(|&start| start < log.len());
@@ -404,7 +434,11 @@ fn main() -> std::io::Result<()> {
     let arena = unsafe { std::slice::from_raw_parts_mut(base.cast::<AtomicU32>(), HOURS * len) };
     let new_hour = |slots| (slots, AtomicUsize::new(0), Mutex::default());
     let hours: Vec<Hour> = arena.chunks_mut(len).map(new_hour).collect();
-    let table = [const { AtomicU32::new(0) }; SLOTS];
+    let new_slot = |_| Slot {
+        bytes: std::cell::UnsafeCell::new([0; 60]),
+        position: AtomicU32::new(0),
+    };
+    let table: Vec<Slot> = (0..SLOTS).map(new_slot).collect();
     let cursor = AtomicUsize::new(0);
     // Eight segments per thread balances the load. Tying the size to the thread count also makes
     // the SD_THREADS test sweep move every cut, down to cuts smaller than a line on tiny inputs.

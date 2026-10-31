@@ -46,6 +46,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 24 | Seventy fewer lines: single-use helpers folded into their callers, the three claim loops through one `next_chunk`, the numbers parsed through one closure, a `Side` pair started per query, tuple assignments | S 718 -> 648, about +1.6% K. counts.sh sample 1068.4 -> 1064.9 instructions and 5.96 -> 6.24 mispredicts per edge (layout noise in the tier loop, worth a quarter of the gain); quick 45/45, threads 240/240 | pending | — | — | — |
 | 25 | exp: read the graph file in 32 KiB pieces instead of mapping it | On C and A this beat the mapping on the box by 10% or more: page faults on a mapped file cost far more there than here. D reads the file twice, so it gets twice the copies but also no faults | pending | — | — | — |
 | 26 | Map the graph file again | Reading it in pieces gave T 0.1501 against about 0.151, for 18 more lines: D's parse is too small a part of its run | pending | — | — | — |
+| 27 | 28 fewer lines: offsets close up in the region pass, no shrink between queries, shorter helpers | S 648 costs K, and measuring each block showed every large one pays for itself, so only small cuts are left: removing simplify costs 9% K, tier 3 alone also 9% | pending | — | — | — |
 
 ## Decision log
 
@@ -101,6 +102,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D24. Test on the box: local cycles -4%, S +11.
 
 **D25. Mapping stays.
+
+**D26. Trim, keep the design. S 648 -> 620, instructions -1%, mispredicts +0.16 per edge, M the same; grid, sweep and constant-hash all pass.
 
 ## What didn't work
 

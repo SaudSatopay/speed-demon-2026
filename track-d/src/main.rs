@@ -275,8 +275,7 @@ impl Graph {
 
     /// The first arc number of `node`, and its arcs.
     fn arcs_of(&self, node: u32) -> (usize, &[AtomicU32]) {
-        let start = self.offsets[node as usize].load(Relaxed) as usize;
-        let end = self.offsets[node as usize + 1].load(Relaxed) as usize;
+        let [start, end] = [0, 1].map(|i| self.offsets[node as usize + i].load(Relaxed) as usize);
         (start, &self.arcs[start..end])
     }
 
@@ -383,12 +382,9 @@ fn reverse(forward: Graph, threads: usize) -> [Graph; 2] {
 
 /// Nodes per region, a block of node numbers that one thread simplifies on its own.
 const REGION: usize = 1 << 13;
-/// A node with more neighbours than this stays. With at most 3, joining its neighbours adds no arcs.
-const MAX_DEGREE: usize = 3;
 /// A node's neighbours in its region, at most, while simplifying.
 const WIDTH: usize = 8;
 const NO_ARC: u16 = u16::MAX;
-const REMOVED: u16 = u16::MAX;
 
 /// A node while its region is simplified: its neighbours, and the weights of its arcs to them and from
 /// them. From position `len` on, the weights are all `NO_ARC`, which makes a failed `find` read as "no
@@ -433,22 +429,12 @@ impl Local {
     }
 }
 
-/// The weight of two arcs in a row, or `NO_ARC` if either is absent.
-fn through(first: u16, then: u16) -> u16 {
-    (u32::from(first) + u32::from(then)).min(u32::from(NO_ARC)) as u16
-}
-
 /// Whether some path of at most two arcs from `a` to `b` is no longer than `bound`. It stops at the
 /// first one, and a `bound` of `NO_ARC` is met by the direct arc, present or not. Every arc is in
 /// both its ends' lists, so the second hop is read from `b`'s, which is in cache, not the middle node's.
 fn within(a: &Local, b: &Local, b_id: u16, bound: u16) -> bool {
-    a.arcs[0][a.find(b_id)] <= bound
-        || a.ids[..a.len as usize]
-            .iter()
-            .zip(&a.arcs[0])
-            .any(|(&x, &to_x)| {
-                u32::from(to_x) + u32::from(b.arcs[1][b.find(x)]) <= u32::from(bound)
-            })
+    let via = |(&x, &to_x): (&u16, &u16)| to_x.saturating_add(b.arcs[1][b.find(x)]) <= bound;
+    a.arcs[0][a.find(b_id)] <= bound || a.ids[..a.len as usize].iter().zip(&a.arcs[0]).any(via)
 }
 
 /// Shrinks the graph to what the queries can use. Queries are known by now, so any node that no query
@@ -460,7 +446,7 @@ fn within(a: &Local, b: &Local, b_id: u16, bound: u16) -> bool {
 fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads: usize) {
     let nodes = forward.offsets.len() - 1;
     let regions = nodes.div_ceil(REGION);
-    // Until a region is done, non-zero means its node must stay. After that, the node's rank in the region.
+    // Until a region is done, non-zero means its node must stay. After that, the rank of a node that stays.
     let ranks: Vec<AtomicU16> = vec![0u16; nodes].into_iter().map(AtomicU16::new).collect();
     // Touched here for the same reason as in `zeroed_u32s`.
     for rank in ranks.iter().step_by(1 << 20) {
@@ -510,9 +496,10 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                     }
                 }
             }
-            for tier in 2..=MAX_DEGREE {
+            for tier in 2..=3 {
                 // Only a node with up to `tier` neighbours can go, and a neighbour that loses one is
-                // worth a second look. The first candidates are picked with no branch to mispredict.
+                // worth a second look; a node with more than 3 stays, since joining its neighbours would
+                // add arcs. The first candidates are picked with no branch to mispredict.
                 let wanted =
                     |local: &Local| !local.stays && (1..=tier).contains(&(local.len as usize));
                 stack.resize(size, 0);
@@ -528,16 +515,12 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                     if !wanted(&node) {
                         continue;
                     }
-                    // Weights of at most 2^15 keep every shortcut below NO_ARC, and only a very long
-                    // chain gets there. Absent arcs wrap around to 0 here.
-                    let heaviest = to[..len]
-                        .iter()
-                        .chain(&from[..len])
-                        .map(|w| w.wrapping_add(1))
-                        .max();
+                    // Weights below 2^15 keep every shortcut below NO_ARC, and only a very long
+                    // chain gets there. Past `len`, the weights are all NO_ARC, which doesn't count.
+                    let heavy = |&w: &u16| (1 << 15..NO_ARC).contains(&w);
                     let neighbours = &node.ids[..len];
                     let full = |&x: &u16| locals[x as usize].len as usize + len > WIDTH + 2;
-                    if heaviest > Some(1 << 15) || neighbours.iter().any(full) {
+                    if node.arcs.iter().flatten().any(heavy) || neighbours.iter().any(full) {
                         continue;
                     }
                     locals[v as usize].len = 0;
@@ -546,8 +529,9 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                     }
                     for (i, &a) in neighbours.iter().enumerate() {
                         for (j, &b) in neighbours[..i].iter().enumerate() {
+                            // Two arcs in a row: a sum that saturates reads as no arc.
                             let (a_to_b, b_to_a) =
-                                (through(from[i], to[j]), through(from[j], to[i]));
+                                (from[i].saturating_add(to[j]), from[j].saturating_add(to[i]));
                             let (at_a, at_b) = (&locals[a as usize], &locals[b as usize]);
                             let a_to_b = if tier >= 3 && within(at_a, at_b, b, a_to_b) {
                                 NO_ARC
@@ -571,7 +555,9 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
             let first = forward.offsets[start].load(Relaxed) as usize;
             let (mut slot, mut alive, mut rest) = (first, 0, kept.drain(..).peekable());
             for (v, node) in locals[..size].iter().enumerate() {
-                forward.offsets[start + v].store(slot as u32, Relaxed);
+                // The region's offsets close up here, at the ranks of the nodes that stay: a removed
+                // node's entry is written again by the next node that stays, with the same slot.
+                forward.offsets[start + alive as usize].store(slot as u32, Relaxed);
                 for (&id, &weight) in node.ids[..node.len as usize].iter().zip(&node.arcs[0]) {
                     if weight != NO_ARC {
                         forward.store(slot, (start + id as usize) as u32, weight.into());
@@ -583,7 +569,7 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
                     slot += 1;
                 }
                 let stays = node.stays || node.len > 0;
-                ranks[start + v].store(if stays { alive } else { REMOVED }, Relaxed);
+                ranks[start + v].store(alive, Relaxed);
                 alive += u16::from(stays);
             }
             live[region].store(alive.into(), Relaxed);
@@ -604,15 +590,8 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
     let (bits, low) = (forward.weight_bits, (1 << forward.weight_bits) - 1);
     for_ranges(regions, threads, |from, to| {
         for region in from..to {
-            let (start, (_, arc_base, first)) = (region * REGION, bases[region]);
-            for node in start..(start + REGION).min(nodes) {
-                let rank = ranks[node].load(Relaxed);
-                if rank != REMOVED {
-                    let offset = forward.offsets[node].load(Relaxed) - first + arc_base;
-                    forward.offsets[start + rank as usize].store(offset, Relaxed);
-                }
-            }
-            for arc in &forward.arcs[first as usize..][..ends[region].load(Relaxed) as usize] {
+            let first = bases[region].2 as usize;
+            for arc in &forward.arcs[first..][..ends[region].load(Relaxed) as usize] {
                 let value = arc.load(Relaxed);
                 arc.store(dense(value >> bits) << bits | value & low, Relaxed);
             }
@@ -621,7 +600,7 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
     for (region, &(node_base, arc_base, first)) in bases.iter().enumerate() {
         for rank in 0..live[region].load(Relaxed) as usize {
             let offset = forward.offsets[region * REGION + rank].load(Relaxed);
-            forward.offsets[node_base as usize + rank].store(offset, Relaxed);
+            forward.offsets[node_base as usize + rank].store(offset - first + arc_base, Relaxed);
         }
         for index in 0..ends[region].load(Relaxed) as usize {
             let arc = forward.arcs[first as usize + index].load(Relaxed);
@@ -642,9 +621,8 @@ fn simplify(forward: &mut Graph, queries: &mut [(u32, u32, AtomicU64)], threads:
     forward.arcs.shrink_to_fit();
 }
 
-/// Nodes per page of the label store, and the entries a side's lists keep between queries.
+/// Nodes per page of the label store.
 const PAGE: usize = 64;
-const KEPT_ENTRIES: usize = 1 << 15;
 
 /// One side of a search: its tentative distances and its queue. Distances live in pages of `PAGE`
 /// nodes, found through a directory indexed by node, which persists across queries and is reset through
@@ -686,14 +664,8 @@ impl<D: Copy + Ord + Default + Not<Output = D> + TryFrom<u64> + Into<u64>> Side<
         for entry in self.used.drain(..) {
             self.directory[entry as usize] = 0;
         }
-        // A rare huge search shouldn't leave every thread holding its memory for good.
         self.pages.truncate(1);
-        self.pages.shrink_to(KEPT_ENTRIES / PAGE);
-        self.used.shrink_to(KEPT_ENTRIES);
-        for bucket in &mut self.buckets {
-            bucket.clear();
-            bucket.shrink_to(KEPT_ENTRIES);
-        }
+        self.buckets.iter_mut().for_each(Vec::clear);
         self.last = D::default();
         self.set_label(node, D::default());
         self.push(D::default(), node);

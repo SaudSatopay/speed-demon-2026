@@ -38,6 +38,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 16 | Step 15 reverted: the quote scan and the lookup are as in step 14 again | Two board runs with step 15, run-f2dc362cb1f6 at T 0.0400 and run-fca909ccd556 at 0.0402, sit inside the 0.0399 to 0.0404 band of the three runs before it, so cutting 0.86 mispredicts per record moved nothing on the box, and its 12 lines cost K 0.6% | pending | — | — | — |
 | 17 | A tight per-record path: one quote mask and carry-less multiply per record, slot guess kept from the prefetch, vector key compare, 32-byte batch entries, batch of 8 | Stubbing showed parse 55% and name table 40% of the run, with locked ORs near nothing (racy store: -2%); at 12 threads memory waits on the region table and the tags stood out, and instructions were 467 per record against a hand budget near 200 | pending | — | — | — |
 | 18 | Threads start before the join table, tags as one vector per two groups (no spill branch), three numbers in one vector, name hash from its first 8 bytes, no bounds checks in the apply step | Traces show 88% of the run is parallel with every thread busy, so instructions still rule; a sample of the disassembly showed the spill branch, three digit parsers and repeated checks | pending | — | — | — |
+| 19 | MADV_POPULATE_READ on each claimed segment | A sample of the 12-thread run showed about 14% in the kernel, mostly mapping file pages a fault at a time | pending | — | — | — |
 
 ## Decision log
 
@@ -77,6 +78,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D17. Rewrite the per-record path rather than the design. Context: rivals are at half our T with the same M. Options: per-thread rings for the shared bits (racy-store test says at most 2%), or fewer instructions and fewer waits. Chose the second: local 12-thread median 26.5 -> 18.9 ms with huge pages always, one-thread instructions 467 -> 331 per record, S 294 -> 379 for now. What would change our minds: no T gain on the box.
 
 **D18. Same design, fewer instructions. Options: per-thread rings (no gain measured), or more of the same cuts. Chose the cuts: one-thread instructions 331 -> about 289 per record, local 12-thread 18.9 -> about 17.5 ms. The byte-wise tag exchange first allowed two slots for one name (3 wrong in 600 stress runs, caught by the grid); one load now answers both the hit and the free question (0 wrong in 600). What would change our minds: a wrong answer in any stress run, or no T gain on the box.
+
+**D19. Map each segment's pages in one call. Context: page faults cost about a tenth of the CPU. Options: read() into buffers, which costs memory and a copy, or this. Chose this: local scorer T up 434x -> 502x, paired -3.6%, 3 lines. What would change our minds: no T gain on the box, where faults may cost less.
 
 ## What didn't work
 

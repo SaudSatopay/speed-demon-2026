@@ -17,6 +17,7 @@ use std::{arch::x86_64::*, fs::File, os::fd::AsRawFd, ptr::null_mut, thread};
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+    fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Readable zero bytes after each mapped file, so that block loads can run past its end.
@@ -210,10 +211,10 @@ impl<'a> NameTable<'a> {
         self.first + (group * GROUP + slot as usize) * SLOT_WORDS
     }
 
-    /// The tags of the two groups at `group`.
+    /// The tags of the two groups at `group`, which must be a home.
     fn window(&self, group: usize) -> __m256i {
-        assert!(group < self.groups);
-        // SAFETY: the tags have a group past the last home. x86-64-v3 has AVX2.
+        // SAFETY: `home` and the spill step stay below `groups`, and the tags have a group past the
+        // last home. x86-64-v3 has AVX2.
         unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(group * GROUP).cast()) }
     }
 
@@ -529,6 +530,11 @@ fn aggregate(file: &[u8], lookup: &[u8], threads: usize, slots: usize) -> (Vec<S
             // The first boundary in the file ends the header, which always ends in CRLF (spec
             // section 2.2), so the first segment starts just after it.
             let last = next_boundary(file, (start + segment).min(file.len()));
+            // Maps the segment's pages in one call, instead of a page fault per 16 pages. A kernel
+            // without this call just refuses it, and the faults come as before.
+            let at = (file.as_ptr() as usize + start) & !4095;
+            // SAFETY: the advice only reads pages in. A range past the mapping is refused.
+            unsafe { madvise(at as *mut u8, segment + 4096, 22) };
             parse_records(next_boundary(file, start), last, regions, names, &mut rows);
         }
         for (total, row) in totals.lock().unwrap().iter_mut().zip(rows.iter()) {

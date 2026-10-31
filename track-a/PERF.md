@@ -53,6 +53,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 31 | Back to the kernel's own fault-around: mapping each segment ahead lost on the board | Three runs with MADV_POPULATE_READ gave T 0.0297, 0.0295 and 0.0294, against 0.0283 without | pending | — | — | — |
 | 32 | exp: read the log in 32 KiB pieces, keys in lines of their own | T barely moved with 18% fewer instructions, and on C reading in pieces beat mmap on the box | pending | — | — | — |
 | 33 | Page-sized record blocks | Reading in pieces took T 0.0285 -> 0.025 on the board, so faults are what limit A there, and hour arrays are most of what's left | pending | — | — | — |
+| 34 | exp: parse the whole log twice, to measure the parse on the box | Local timing has misled us on A twice, and nothing measures the box's split between parse and output | pending | — | — | — |
 
 ## Decision log
 
@@ -118,6 +119,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D25. Experiment. Locally: cycles 406M -> 355M, L2 misses per line 0.47 -> 0.27, faults 8550 -> 5050, M flat, wall +6%, S 285 -> 289. The local wall is uninformative, since Hyper-V inflates syscalls. Key bytes go into reserved lines before the compare-and-swap, so no store overlaps a published word. Judge over several runs: the box varies 4% on A.
 
 **D26. Fewer faults per record. A thread reserves a page of an hour's array at a time instead of 256 records, so it faults once per block rather than once per four. Locally: faults 5050 -> 4220, wall -1.7%, M +0.06 MB, S flat. Grid 44/44, threads 234/234, const-hash 39/39, stress 0 wrong in 300. Before this, on the box: T 0.0252 and 0.0250.
+
+**D27. Measurement only. The second parse goes to throwaway arrays, so the output doesn't change. T minus T without it (0.0245) is the parse's wall time on the box, and what's left is startup, output and exit. It says where to look next. Reverted in the next push.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

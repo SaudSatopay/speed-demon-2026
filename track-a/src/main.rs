@@ -339,7 +339,7 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
         let n = group.len();
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let errors: u64 = group.iter().map(|record| u64::from(record & 1)).sum();
-        let big_count = n - group.partition_point(|&r| latency(r) < BIG_LATENCY);
+        let big_count = group.iter().filter(|&&r| latency(r) == BIG_LATENCY).count();
         let id = group[0] >> ID_SHIFT;
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
@@ -348,8 +348,7 @@ fn format_hour(hour: usize, sorted: &[u32], big: &[u64], keys: &[&[u8]], out: &m
                 None => u64::from(latency(group[index])),
             }
         };
-        let (p50, p99) = (pct(50), pct(99));
-        let p95 = if n <= 19 { p99 } else { pct(95) }; // Both ranks are then n.
+        let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         out.extend_from_slice(stamp.as_bytes());
         out.extend_from_slice(keys[id as usize]);
         let count = n as u64;

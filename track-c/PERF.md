@@ -146,6 +146,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 110 | exp: 6 segments per thread, sample 5 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
 | 111 | exp: 3 segments per thread, sample 3 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
 | 112 | exp: 1seg, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
+| 113 | exp: h105k, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
 
 ## Decision log
 
@@ -373,6 +374,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D111.** Median of three decides
 
 **D112.** Median of three decides against 45.90
+
+**D113.** Median of three decides against 45.90
 
 ## What didn't work
 

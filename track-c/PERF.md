@@ -168,6 +168,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 132 | exp: cuts, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 | 133 | exp: tags16, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 | 134 | exp: cuts, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
+| 135 | exp: tags16, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 
 ## Decision log
 
@@ -439,6 +440,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D133.** Median of three decides
 
 **D134.** Median of three decides
+
+**D135.** Median of three decides
 
 ## What didn't work
 

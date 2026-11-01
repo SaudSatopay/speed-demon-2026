@@ -1173,6 +1173,7 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
     let (anchor_lists, this_doc) = (&plan.anchor_lists[..], (1 << SUM_BITS) + u64::from(doc));
     // SAFETY: `hits` has every tally. A thread's hits ascend, so only its first ten can be among the
     // smallest.
+    let hit_words = hits.as_ptr();
     let mut add = |counts: u64, at: usize| unsafe {
         let hit = hits.get_unchecked_mut(at);
         *hit += counts * this_doc;
@@ -1195,6 +1196,7 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
             let AnchorList(from, long_from, own_tally) = *anchor_lists.get_unchecked(term as usize);
             let AnchorList(to, long_to, _) = *anchor_lists.get_unchecked(term as usize + 1);
             prefetch(checks.wrapping_add(from as usize).cast());
+            prefetch(hit_words.wrapping_add(from as usize).cast());
             // One store lists four of the term's short checks, which is enough for most, whatever
             // `listed` then keeps of them, and the loop lists any more.
             let at = _mm_add_epi32(_mm_set1_epi32(from as i32), _mm_setr_epi32(0, 1, 2, 3));

@@ -242,7 +242,7 @@ impl<'a> NameTable<'a> {
     }
 
     fn home(hash: u32) -> usize {
-        (u64::from(hash) * (HOMES / 32) as u64 >> 32) as usize * 32
+        (u64::from(hash) * HOMES as u64 >> 32) as usize
     }
 
     /// One bit per slot of a window of tags, set where the tag is `tag`.
@@ -491,7 +491,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let home = NameTable::home(hash);
             let hits = NameTable::slots_with(names.window(home), hash as u8);
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
-            _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
+            _mm_prefetch::<_MM_HINT_T0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
             *found.get_unchecked_mut(record) = (guess as u32, cents as u32, id_region);
         }

@@ -120,6 +120,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | run-918ea96eea72 | 0.0200 | 10.7 | 82.2 |
 | 85 | T0 for the slot prefetch | ask to read the line first, it might queue less on a contended line | pending | — | — | — |
 | 86 | Tag windows on multiples of 32 | homes aligned so a window never straddles a line, at the cost of more names outside their first window | pending | — | — | — |
+| 87 | T0 for the slot prefetch, second sample | first sample ran while the box was slow, A slowed 10 percent in the same run with no code change | pending | — | — | — |
 
 ## Decision log
 
@@ -295,6 +296,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D85.** Test T0 in place of ET0 on the board, three samples.
 
 **D86.** T0 (7c28e9d) rejected on one sample, T 0.0227 K 41.66, far past the noise. Test aligned homes next, three samples.
+
+**D87.** Correction to the last entry: one T0 sample at T 0.0227 does not reject it, since A slowed in that run too. Three samples each, taken in turn.
 
 ## What didn't work
 

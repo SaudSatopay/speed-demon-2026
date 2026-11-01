@@ -68,6 +68,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 34 | exp: block queries at anchors holding N/24 documents, not N/48 | N/48 read T 0.0909 against 0.0996 at N/96, though local cycles rose 1.5%, so what a block's queries cost on the box isn't what local cycles say | pending | — | — | — |
 | 35 | Block queries at anchors holding N/48 documents | Board: N/96 T 0.0996, N/48 T 0.0909, N/24 T 0.0942, one sample each, and local cycles ranked them the other way round: 2.10G, 2.13G, 2.16G | pending | — | — | — |
 | 36 | Marks as stamps with no clearing per document, a one-multiply hash, ids from a counter, per-thread sample counts, a fourth way for short terms, phrases compared in one vector, the second pass 8 words at a time, and the corpus prefetched 16 blocks ahead | On the box T is thread cycles over 12 threads at 2.5 GHz, and about 35 mispredicts per document came mostly from each stage's loop exit, so whole stages could go | pending | — | — | — |
+| 37 | Parked threads map the corpus ahead with MADV_POPULATE_READ, a common sure term's tally runs by blocks, columns numbered by first use and aligned, short checks packed in 8 bytes, a phrase anchor's neighbour stored for a first test, answers on their own cache lines, no barrier in the answer round, and 78 fewer lines | The board showed B more sensitive to L2 than local cycles say, so this round goes after bytes a thread drags through L2 per document and per block: block queries 2767 to 1913, columns 5067 to 3013, columns read per block 158 to 94 KB | pending | — | — | — |
 
 ## Decision log
 
@@ -144,6 +145,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D36.** Decided by the board, and a second sample of N/48. Fewer block queries cost less on the box than local cycles say, as a block's columns and tallies go through a cache shared by two threads at 2.5 GHz, and N/24 leaves more checks. No new lines.
 
 **D37.** Local, seed 1, 12 threads, on the N/96 build: cycles 2.109G to 1.763G (seed 2 2.084G to 1.759G), instructions 3.337G to 2.885G, mispredicts 8.63M to 4.85M, wall 47.4 to 41.0 ms, S +45. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300. Dropped, no gain: batched tallies, SWAR print, LF block apart, block-sized ranges, phrase pre-prefetch, 1 and 4 MiB samples. Worse: table of 1<<17 sets +4%, 1<<15 +6%, NTA on sets +2%, sets prefetched a document ahead +3%. The corpus prefetch is the one cache change here, for the board to judge.
+
+**D38.** Local, seed 1, 12 threads: cycles 1.84G to 1.69G, instructions 2.917G to 2.869G, cache misses 44.5M to 35.8M, wall -2.4 to -5%, S 1056 to 1032, M about 27 MB. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300. The "too many ids" assert goes; the README's limits give the corpus size that the 40-bit sums hold. Tried and dropped: one thread round (+1 ms), the plan on threads, heap prefault, mapped output, skipping empty sets (12% are empty, +1.5%), selective clears.
 
 ## What didn't work
 

@@ -10,9 +10,10 @@
 //!    run, or its OR terms). For nine queries in ten the anchors are rare: at each anchor's first
 //!    occurrence in a document, the marks of what the document holds index a truth table. A query whose
 //!    anchors are common goes by blocks instead: each thread keeps a bit per document of a block for each
-//!    term of such queries, and runs them in vectors when the block is full. A phrase is anchored on its
-//!    rarest term.
-//! 3. **Scan** (`scan_ranges`). Threads claim ranges of the corpus in order and take a document at a
+//!    term of such queries, and runs them in vectors when the block is full. A common term that alone makes
+//!    a query match has just its own count run so, and the query's other anchors stay rare. A phrase is
+//!    anchored on its rarest term.
+//! 3. **Scan** (`scan_and_answer`). Threads claim ranges of the corpus in order and take a document at a
 //!    time, in stages without a branch per token: `token_edges` finds the tokens, `look_up` finds their
 //!    terms and marks most, `mark` the rest, and the later stages act on what those listed:
 //!    `check_phrases` tries each phrase around its anchor's occurrences once the document's tokens are
@@ -41,7 +42,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::{arch::x86_64::*, fs::File, io::Write, mem::zeroed, os::fd::AsRawFd, thread};
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
@@ -85,6 +86,7 @@ const CASE_BITS: u64 = 0x2020_2020_2020_2020;
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file of this directory read-only for the life of the process, followed by `PADDING` readable
@@ -158,12 +160,8 @@ fn token_edges(file: &[u8], text: usize, edges: &mut Vec<u32>) -> usize {
         // A thread takes long enough over a document that the hardware's prefetch rarely has the next one's
         // lines ready, so each block prefetches the line 16 blocks on.
         // SAFETY: a prefetch has no other effect, whatever the address.
-        unsafe {
-            _mm_prefetch(
-                file.as_ptr().wrapping_add(text + block + 1024).cast(),
-                _MM_HINT_T0,
-            )
-        };
+        let ahead = file.as_ptr().wrapping_add(text + block + 1024);
+        unsafe { _mm_prefetch(ahead.cast(), _MM_HINT_T0) };
         let (tokens, line_feeds) = block_masks(file, text + block);
         // Only the bits below the first LF, if there is one.
         let tokens = tokens & (line_feeds.wrapping_sub(1) & !line_feeds);
@@ -426,7 +424,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
             }
             pos = line_feed + 1;
             let to = steps.len() as u32;
-            queries.push(Query { is_bool, from, to });
+            queries.push(Query(is_bool, from, to));
         }
         (part.start, queries, steps)
     });
@@ -439,7 +437,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
     for (_, mut queries, steps) in parts {
         let base = plan.steps.len() as u32;
         plan.steps.extend(steps);
-        let moved = |q: &mut Query| (q.from, q.to) = (base + q.from, base + q.to);
+        let moved = |q: &mut Query| (q.1, q.2) = (base + q.1, base + q.2);
         queries.iter_mut().for_each(moved);
         plan.queries.extend(queries);
     }
@@ -500,42 +498,48 @@ fn anchors(steps: &[u32], df: &[u32], out: &mut Vec<u32>) {
 /// document counts here: whether it matches, and holds none of the query's earlier anchors, where it
 /// has already counted. Most queries have few terms, and need a smaller check.
 #[derive(Clone, Copy)]
-#[repr(C)]
-struct Check<const TERMS: usize> {
+struct Check {
     truth: u32,
-    terms: [u32; TERMS], // The other terms, then term 0.
+    terms: [u32; 5], // The other terms, then term 0.
+}
+
+/// A check of up to three other terms fits in one word: the low bits of its truth table, then those terms
+/// here, if their numbers fit. The rest go as long checks.
+const PACKED_AT: [u32; 3] = [8, 26, 44];
+const PACKED_MAX: u32 = (1 << 18) - 1;
+
+/// 1 if a document with this stamp, holding the terms marked in `present`, counts at this packed check.
+fn counts_packed(check: u64, present: &[u8], stamp: __m128i) -> u64 {
+    // SAFETY: `present` has a mark for every term, and the build targets x86-64-v3, which has AVX.
+    unsafe {
+        let term = |slot: usize| (check >> PACKED_AT[slot]) as usize & PACKED_MAX as usize;
+        let mark = |slot| i32::from(*present.get_unchecked(term(slot)));
+        let marks = _mm_insert_epi8::<1>(_mm_cvtsi32_si128(mark(0)), mark(1));
+        let marks = _mm_insert_epi8::<2>(marks, mark(2));
+        // A stamp isn't 0, which fills the rest of the vector.
+        let holds = _mm_movemask_epi8(_mm_cmpeq_epi8(marks, stamp));
+        u64::from(check as u32 >> holds & 1)
+    }
 }
 
 /// 1 if a document with this stamp, holding the terms marked in `present`, counts at this check, else 0.
-fn counts<const TERMS: usize>(check: &Check<TERMS>, present: &[u8], stamp: __m128i) -> u64 {
+fn counts(check: &Check, present: &[u8], stamp: __m128i) -> u64 {
     // SAFETY: `present` has a mark for every term, and the build targets x86-64-v3, which has AVX.
     unsafe {
         let mark = |slot| i32::from(*present.get_unchecked(check.terms[slot] as usize));
         let marks = _mm_insert_epi8::<1>(_mm_cvtsi32_si128(mark(0)), mark(1));
         let marks = _mm_insert_epi8::<2>(marks, mark(2));
-        let marks = match TERMS {
-            3 => marks,
-            _ => _mm_insert_epi8::<4>(_mm_insert_epi8::<3>(marks, mark(3)), mark(4)),
-        };
+        let marks = _mm_insert_epi8::<4>(_mm_insert_epi8::<3>(marks, mark(3)), mark(4));
         // A stamp isn't 0, which fills the rest of the vector.
         let holds = _mm_movemask_epi8(_mm_cmpeq_epi8(marks, stamp));
         u64::from(check.truth >> holds & 1)
     }
 }
 
-/// What a step of a query makes of the set so far, given its term's set, as masks.
-fn apply(op: u32, set: u64, term_set: u64) -> u64 {
-    match op {
-        AND => set & term_set,
-        NOT => set & !term_set,
-        _ => set | term_set,
-    }
-}
-
 /// The check of a query with these steps at the given anchor, after the `earlier` ones. Each term's set
 /// is a mask over the 64 possible documents, so the steps give the truth table directly, and its top half
 /// is what's left with the last term, the anchor, present.
-fn make_check(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check<5> {
+fn make_check(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check {
     // The positions in a word that have each of their 6 index bits set: a period of twice this width. These
     // divisions fold at compile time. (A division by a variable here would cost more than the rest of the plan.)
     let index_bits = [1, 2, 4, 8, 16, 32].map(|width| (!0u64 / ((1 << width) + 1)) << width);
@@ -546,7 +550,12 @@ fn make_check(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check<5> {
         let slot = if term == anchor { 5 } else { others };
         others += usize::from(term != anchor);
         terms[slot] = term;
-        table = apply(step & !TERM_BITS, table, index_bits[slot]);
+        // What the step makes of the set so far, given its term's set, as masks.
+        table = match step & !TERM_BITS {
+            AND => table & index_bits[slot],
+            NOT => table & !index_bits[slot],
+            _ => table | index_bits[slot],
+        };
         blocked |= u64::from(earlier.contains(&term)) * index_bits[slot];
     }
     let truth = ((table & !blocked) >> 32) as u32;
@@ -572,39 +581,30 @@ fn group<T>(keys: usize, all: impl Clone + Iterator<Item = (u32, T)>) -> (Vec<u3
 
 /// What a query's line prints, or what a term's tally adds to it.
 #[derive(Clone, Copy)]
-#[repr(C)]
 struct Answer {
     count: u64,           // How many documents match.
     sum: u64,             // The sum of their ids.
     ids: [u32; SMALLEST], // The smallest ids, ascending, then NONE.
 }
 
+/// An answer in a cache line of its own, which its lock and all it holds fit, as threads take it at once.
+#[repr(align(64))]
+struct Slot(Mutex<Answer>);
+
 /// A query: whether it's a BOOL rather than a phrase, and the range of its steps.
-struct Query {
-    is_bool: bool,
-    from: u32,
-    to: u32,
-}
+struct Query(bool, u32, u32);
 
 /// What a document calls for at a term's first occurrence in it, as places among the tallies, which
 /// are in the order of the short checks, the long checks, then the terms'. A term's checks end where the
 /// next term's start.
 #[derive(Clone, Copy)]
-#[repr(C)]
-struct AnchorList {
-    short_from: u32,
-    long_from: u32,
-    own_tally: u32,
-}
+struct AnchorList(u32, u32, u32); // Where its short checks start, where its long ones do, and its own tally.
 
-/// A tally's place in the plan. What each thread has counted is in `Scan::hits`.
-struct Tally {
-    answer: u32, // The answer it goes into.
-    // The last of that answer's ten smallest documents when this last saw them, which only falls, so
-    // that the documents past it need no lock. Those fill first, as threads work through the corpus
-    // together, and only a thread's own first ten ever get this far.
-    limit: AtomicU32,
-}
+/// A tally's place in the plan: the answer it goes into, and the last of that answer's ten smallest
+/// documents when this last saw them, which only falls, so that the documents past it need no lock. Those
+/// fill first, as threads work through the corpus together, and only a thread's own first ten ever get this
+/// far. What each thread has counted is in `Scan::hits`.
+struct Tally(u32, AtomicU32);
 
 /// The queries, and what the sample decided: how each term is stored, and what to check at each term's
 /// occurrences. The threads share this while they scan.
@@ -612,26 +612,28 @@ struct Tally {
 struct Plan<'a> {
     terms: TermTable<'a>,
     queries: Vec<Query>,
-    steps: Vec<u32>,        // All the queries' steps, one query after another.
-    rowed_count: usize,     // How many terms have rows...
-    sparse_count: usize,    // ...and how many have columns without them.
-    phrase_start: Vec<u32>, // A term's phrases are `phrases[phrase_start[t]..phrase_start[t + 1]]`...
-    phrases: Vec<u32>, // ...each its query, the anchor's position in it, its length, its terms.
+    steps: Vec<u32>,     // All the queries' steps, one query after another.
+    rowed_count: usize,  // How many terms have rows...
+    sparse_count: usize, // ...and how many have columns without them.
+    // A term's phrases are `phrases[phrase_start[t].0..phrase_start[t + 1].0]`. If it's just one, of two or more
+    // terms, the other number is the term after its anchor, or before it with the top bit set. Else it's 0.
+    phrase_start: Vec<(u32, u32)>,
+    phrases: Vec<u32>, // Each its query, the anchor's position in it, its length, its terms.
     anchor_lists: Vec<AnchorList>,
-    short_checks: Vec<Check<3>>,
-    long_checks: Vec<Check<5>>,
-    block_steps: Vec<Vec<u32>>, // The steps of the queries that go by blocks, by how many steps they have.
-    block_queries: usize,       // How many there are. Their tallies are the last.
+    short_checks: Vec<u64>,
+    long_checks: Vec<Check>,
+    block_steps: Vec<Vec<u32>>, // What goes by blocks, by how many steps: common terms alone, then queries.
+    block_queries: usize,       // How many of those there are. Their tallies are the last.
     shared_answer: Vec<u32>, // For each query, the answer of the term's tally that adds to it, or NONE.
     // The answers: the queries', in order, then one for each term with a tally, then a spare.
-    answers: Vec<Mutex<Answer>>,
+    answers: Vec<Slot>,
     tallies: Vec<Tally>,
 }
 
-/// Locks an answer. Only a panicking thread could poison the lock, and a panic aborts the process here,
+/// Takes a lock. Only a panicking thread could poison the lock, and a panic aborts the process here,
 /// so there's no error to handle.
-fn lock(answer: &Mutex<Answer>) -> MutexGuard<'_, Answer> {
-    answer.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Puts a document among the smallest of a tally's answer. Returns `TOO_BIG` if it's past the limit, as all
@@ -640,12 +642,12 @@ fn lock(answer: &Mutex<Answer>) -> MutexGuard<'_, Answer> {
 #[cold]
 fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
     let tally = &plan.tallies[at];
-    if doc >= tally.limit.load(Relaxed) {
+    if doc >= tally.1.load(Relaxed) {
         return TOO_BIG;
     }
-    let mut answer = lock(&plan.answers[tally.answer as usize]);
+    let mut answer = lock(&plan.answers[tally.0 as usize].0);
     insert_smallest(&mut answer.ids, doc);
-    tally.limit.store(answer.ids[SMALLEST - 1], Relaxed);
+    tally.1.store(answer.ids[SMALLEST - 1], Relaxed);
     0
 }
 
@@ -684,52 +686,6 @@ const NEITHER: usize = 2;
 /// How far the sample's counts tell the terms with neither apart, when numbering them.
 const DF_CAP: u32 = 255;
 
-/// Numbers the terms: those with rows, then the others with columns, then the rest, the commonest first
-/// so that what the scan touches most sits together. Puts the numbers in the term table and the steps,
-/// and returns them.
-fn number_terms(plan: &mut Plan, df: &[u32], store_of: &[usize], flags: &mut [u32]) -> Vec<u32> {
-    // One bucket for rows, one for the other columns, and for the rest one per count, the largest first.
-    let rank = |t: usize| (DF_CAP - df[t].min(DF_CAP)) as usize;
-    let bucket = |t: usize| store_of[t] + store_of[t] / NEITHER * rank(t);
-    let keyed = (FIRST_TERM..df.len()).map(|t| (bucket(t) as u32, t));
-    let (start, ordered) = group(NEITHER + DF_CAP as usize + 1, keyed);
-    (plan.rowed_count, plan.sparse_count) = (start[1] as usize, (start[2] - start[1]) as usize);
-    let mut new_number = vec![0; df.len()];
-    for (at, &term) in ordered.iter().enumerate() {
-        new_number[term] = (FIRST_TERM + at) as u32;
-        flags[term] |= new_number[term] | (u32::from(store_of[term] == COLUMN_ONLY) * SPARSE);
-    }
-    // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
-    for word in plan
-        .terms
-        .sets
-        .iter_mut()
-        .flat_map(|set| &mut set.rest[..=NO_WAY])
-    {
-        *word = flags[(*word & TERM_BITS) as usize] | (*word & !TERM_BITS);
-    }
-    for step in &mut plan.steps {
-        *step = (*step & !TERM_BITS) | new_number[(*step & TERM_BITS) as usize];
-    }
-    new_number
-}
-
-/// Lists each anchor term's phrases, given (term, (query, the anchor's position in it)).
-fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u32]) {
-    let keyed = anchored.iter().map(|&(t, p)| (new_number[t as usize], p));
-    let (start, phrases) = group(plan.terms.count, keyed);
-    // The last range is empty, past the last key, and gives the end of the last term's phrases.
-    for range in start.windows(2) {
-        plan.phrase_start.push(plan.phrases.len() as u32);
-        for &(query, position) in &phrases[range[0] as usize..range[1] as usize] {
-            let Query { from, to, .. } = plan.queries[query as usize];
-            plan.phrases.extend([query, position, to - from]);
-            plan.phrases.extend(&plan.steps[from as usize..to as usize]);
-        }
-    }
-    plan.phrases.extend([0; 8]);
-}
-
 /// Decides from the sample how each query is answered and how each term is stored, then lists what to
 /// check at each term's occurrences.
 fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
@@ -739,8 +695,7 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
     // cost less than listing its first occurrence in each document that holds it. Any choice gives
     // the same answers. `df[0]` is about how many documents the sample has.
-    let by_blocks =
-        |anchors: &[u32]| anchors.iter().map(|&t| df[t as usize]).sum::<u32>() * 48 >= df[0];
+    let sum_of = |anchors: &[u32]| anchors.iter().map(|&t| df[t as usize]).sum::<u32>();
     let rowed = |term: u32| df[term as usize] * 48 >= df[0];
     // How each term is stored, and what its word holds beyond its number.
     let (mut store_of, mut flags) = (vec![NEITHER; df.len()], vec![0; df.len()]);
@@ -748,12 +703,15 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let (mut term_tally, mut term_tallies) = (vec![NONE; df.len()], 0);
     // Each phrase and its anchor term, each check and its anchor term, and one query's anchors.
     let (mut anchored, mut checks, mut query_anchors) = (vec![], vec![], vec![]);
-    let mut block_queries = vec![];
+    // The queries that go by blocks, and their terms in order of first use. Then the common terms whose own
+    // tallies go by blocks, and those tallies' answers.
+    let (mut block_queries, mut used) = (vec![], vec![]);
+    let (mut block_terms, mut block_term_answers) = (vec![], vec![]);
     let query_count = plan.queries.len() as u32;
     plan.shared_answer.resize(query_count as usize, NONE);
 
     // First, how each query is answered.
-    for (query, &Query { is_bool, from, to }) in plan.queries.iter().enumerate() {
+    for (query, &Query(is_bool, from, to)) in plan.queries.iter().enumerate() {
         let (query, steps) = (query as u32, &plan.steps[from as usize..to as usize]);
         if !is_bool {
             // Any term of a phrase would be correct as its anchor. The rarest triggers the fewest checks.
@@ -765,27 +723,39 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         }
         query_anchors.clear();
         anchors(steps, &df, &mut query_anchors);
-        if by_blocks(&query_anchors) {
+        // After the last AND or NOT, each OR's term alone makes a document match. The commonest
+        // of them becomes the first anchor, needing no check: the term's own tally serves every
+        // query so anchored, and the other anchors skip the documents that hold it. Those steps have
+        // no operator, and each is an anchor. If it's common, that tally goes by blocks too, in a run of
+        // its own, as long as the other anchors are rare. Then no check is anchored on it, as those are all
+        // rare: a term has its own tally by marks or by blocks, not both.
+        let trailing = steps.iter().rev().take_while(|step| is_or(step));
+        let sure = trailing.max_by_key(|&&term| df[term as usize]);
+        let (sum, sure_count) = (sum_of(&query_anchors), sure.map_or(0, |&t| df[t as usize]));
+        let common_sure = sure_count * 48 >= df[0] && (sum - sure_count) * 48 < df[0];
+        if sum * 48 >= df[0] && !common_sure {
             block_queries.push(query);
             for term in steps.iter().map(|step| step & TERM_BITS) {
+                used.extend((store_of[term as usize] == NEITHER).then_some(term));
                 store_of[term as usize] = if rowed(term) { ROWED } else { COLUMN_ONLY };
             }
             continue;
         }
-        // After the last AND or NOT, each OR's term alone makes a document match. The commonest
-        // of them becomes the first anchor, needing no check: the term's own tally serves every
-        // query so anchored, and the other anchors skip the documents that hold it. Those steps have
-        // no operator, and each is an anchor.
-        let trailing = steps.iter().rev().take_while(|step| is_or(step));
-        let sure = trailing.max_by_key(|&&term| df[term as usize]);
         if let Some(&term) = sure {
             query_anchors.sort_by_key(|&anchor| anchor != term);
-            flags[term as usize] |= BOOL_ANCHOR;
+            flags[term as usize] |= u32::from(!common_sure) * BOOL_ANCHOR;
             // The term's tally if it has one, or else the next.
             let tally = &mut term_tally[term as usize];
+            let first = *tally == NONE;
             *tally = (*tally).min(term_tallies);
             term_tallies += u32::from(*tally == term_tallies);
             plan.shared_answer[query as usize] = query_count + *tally;
+            if first && common_sure {
+                block_terms.push(term);
+                block_term_answers.push(query_count + *tally);
+                used.extend((store_of[term as usize] == NEITHER).then_some(term));
+                store_of[term as usize] = ROWED;
+            }
         }
         let skipped = usize::from(sure.is_some());
         for (at, &term) in query_anchors.iter().enumerate().skip(skipped) {
@@ -794,76 +764,116 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         }
     }
 
-    // Then the terms' numbers, which the rest of the plan is written in.
-    let new_number = number_terms(plan, &df, &store_of, &mut flags);
-    list_phrases(plan, &anchored, &new_number);
+    // Then the terms' numbers, which the rest of the plan is written in, and which go in the term table and
+    // the steps: those with rows, then the others with columns, by first use so that a query's columns sit
+    // together, then the rest, the commonest first so that what the scan touches most sits together. One
+    // bucket for rows, one for the other columns, and for the rest four per count, the largest first: BOOL
+    // anchors, then the phrase anchors, then the others, as only anchors use the lists they index.
+    let rank = |t: usize| (DF_CAP - df[t].min(DF_CAP)) as usize;
+    let unlike = |t: usize, flag: u32| usize::from(flags[t] & flag == 0);
+    let kind = |t: usize| 2 * unlike(t, BOOL_ANCHOR) + unlike(t, PHRASE_ANCHOR);
+    let bucket = |t: usize| store_of[t] + store_of[t] / NEITHER * (4 * rank(t) + kind(t));
+    let others = (FIRST_TERM..df.len()).filter(|&t| store_of[t] == NEITHER);
+    let terms = used.iter().map(|&t| t as usize).chain(others);
+    let keyed = terms.map(|t| (bucket(t) as u32, t));
+    let (start, ordered) = group(NEITHER + 4 * DF_CAP as usize + 4, keyed);
+    (plan.rowed_count, plan.sparse_count) = (start[1] as usize, (start[2] - start[1]) as usize);
+    let mut new_number = vec![0; df.len()];
+    for (at, &term) in ordered.iter().enumerate() {
+        new_number[term] = (FIRST_TERM + at) as u32;
+        flags[term] |= new_number[term] | (u32::from(store_of[term] == COLUMN_ONLY) * SPARSE);
+    }
+    // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
+    for set in &mut plan.terms.sets {
+        for word in &mut set.rest[..=NO_WAY] {
+            *word = flags[(*word & TERM_BITS) as usize] | (*word & !TERM_BITS);
+        }
+    }
+    for step in &mut plan.steps {
+        *step = (*step & !TERM_BITS) | new_number[(*step & TERM_BITS) as usize];
+    }
+    // Then each anchor term's phrases.
+    let keyed = anchored.iter().map(|&(t, p)| (new_number[t as usize], p));
+    let (start, phrases) = group(plan.terms.count, keyed);
+    // The last range is empty, past the last key, and gives the end of the last term's phrases.
+    for range in start.windows(2) {
+        let of_term = &phrases[range[0] as usize..range[1] as usize];
+        let at = plan.phrases.len();
+        for &(query, position) in of_term {
+            let Query(_, from, to) = plan.queries[query as usize];
+            plan.phrases.extend([query, position, to - from]);
+            plan.phrases.extend(&plan.steps[from as usize..to as usize]);
+        }
+        let mut near = 0;
+        if let ([_], &[_, position, len, ref terms @ ..]) = (of_term, &plan.phrases[at..]) {
+            let before = u32::from(position + 1 == len);
+            let term = terms.get((position + 1).wrapping_sub(2 * before) as usize);
+            near = term.map_or(0, |term| term | before << 31);
+        }
+        plan.phrase_start.push((at as u32, near));
+    }
+    plan.phrases.extend([0; 8]);
 
     // Then a term's checks, the short ones of all terms first. A short check holds up to 3 other terms.
     let (term_count, answers) = (plan.terms.count, query_count + term_tallies + 1);
     for (term, (_, check)) in &mut checks {
-        *term = new_number[*term as usize] + u32::from(check.terms[3] != 0) * term_count as u32;
         check.terms = check.terms.map(|term| new_number[term as usize]);
+        let long = check.terms[3] != 0 || check.terms[..3].iter().any(|&t| t > PACKED_MAX);
+        *term = new_number[*term as usize] + u32::from(long) * term_count as u32;
     }
     let (starts, checks) = group(2 * term_count, checks.iter().copied());
-    let narrow = |&(_, Check { truth, terms }): &(u32, Check<5>)| {
-        let terms = [terms[0], terms[1], terms[2]];
-        Check { truth, terms }
+    let put = |word: u64, (at, term): (&u32, u32)| word | u64::from(term) << at;
+    let pack = |&(_, Check { truth, terms }): &(u32, Check)| {
+        PACKED_AT
+            .iter()
+            .zip(terms)
+            .fold(u64::from(truth & 255), put)
     };
     let (short, long) = checks.split_at(starts[term_count] as usize);
-    plan.short_checks = short.iter().map(narrow).collect();
+    plan.short_checks = short.iter().map(pack).collect();
     plan.long_checks = long.iter().map(|&(_, check)| check).collect();
 
-    // Then the queries that go by blocks, those of the same length together, so that the loop over a
-    // query's steps rarely mispredicts its exit. A step there holds a column's number for its term.
-    let length = |query: &u32| {
-        let Query { from, to, .. } = plan.queries[*query as usize];
-        to - from
-    };
+    // Then what goes by blocks: the common terms alone, as runs of one step, and the queries, those of the
+    // same length together, so that the loop over a query's steps rarely mispredicts its exit. A step there
+    // holds a column's number for its term.
+    let length = |query: &u32| plan.queries[*query as usize].2 - plan.queries[*query as usize].1;
     let longest = block_queries.iter().map(length).max().unwrap_or(0) as usize;
     let keyed = block_queries.iter().map(|query| (length(query), *query));
     let (_, block_queries) = group(longest + 1, keyed);
-    plan.block_steps = vec![vec![]; longest + 1];
+    plan.block_steps = vec![vec![]; longest + 2];
+    let column = |term: &u32| new_number[*term as usize] - FIRST_TERM as u32;
+    plan.block_steps[1].extend(block_terms.iter().map(column));
     for &query in &block_queries {
-        let Query { from, to, .. } = plan.queries[query as usize];
+        let Query(_, from, to) = plan.queries[query as usize];
         let steps = plan.steps[from as usize..to as usize].iter();
         let columns = steps.map(|step| step - FIRST_TERM as u32);
         plan.block_steps[(to - from) as usize].extend(columns);
     }
-    plan.block_queries = block_queries.len();
+    plan.block_queries = block_terms.len() + block_queries.len();
 
-    // Then a tally for each check, for each term with one of its own, a spare, and each block query; and
-    // the answers.
-    let check_queries = checks.iter().map(|&(query, _)| query);
-    let tally_answers = check_queries
-        .chain(query_count..answers)
-        .chain(block_queries);
-    let tally = |answer| Tally {
-        answer,
-        limit: AtomicU32::new(NONE),
-    };
+    // Then a tally for each check, for each term with one of its own, a spare, and each run by blocks; and
+    // the answers. A term whose own tally goes by blocks isn't an anchor, so its place among the others
+    // stays empty.
+    let checked = checks.iter().map(|&(query, _)| query);
+    let blocks = block_term_answers.into_iter().chain(block_queries);
+    let tally_answers = checked.chain(query_count..answers).chain(blocks);
+    let tally = |answer| Tally(answer, AtomicU32::new(NONE));
     plan.tallies = tally_answers.map(tally).collect();
     let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
-    let blank = |_| Mutex::new(Answer { count, sum, ids });
+    let blank = |_| Slot(Mutex::new(Answer { count, sum, ids }));
     plan.answers = (0..answers).map(blank).collect();
 
     // Last, where each term's checks are, and its own tally, or the spare for a term without one, which
     // nothing reads.
-    let list = |t| AnchorList {
-        short_from: starts[t],
-        long_from: starts[term_count + t],
-        own_tally: 0,
-    };
+    let list = |t| AnchorList(starts[t], starts[term_count + t], 0);
     plan.anchor_lists = (0..=term_count).map(list).collect();
     for (term, &new) in new_number.iter().enumerate() {
-        plan.anchor_lists[new as usize].own_tally =
+        plan.anchor_lists[new as usize].2 =
             checks.len() as u32 + term_tally[term].min(term_tallies);
     }
 }
 
 // ---- The scan: what each thread keeps, and the stages of a document ----
-
-// What the comments and the scan's cache behaviour rely on.
-const _: () = assert!(size_of::<TermSet>() == 64);
 
 /// One thread's results, and its list of short checks for the document in hand. A thread claims ranges
 /// in document order, so the documents it counts ascend, which is why only its first ten for each tally
@@ -908,10 +918,12 @@ fn make_room(lists: &mut DocLists, room: usize) {
 /// a byte's stamps count.
 const BLOCK_DOCS: u32 = 255;
 
-/// A term's bits over a block of documents.
-type Column = [u64; 4];
+/// A term's bits over a block of documents, in half a cache line.
+#[repr(align(32))]
+#[derive(Clone, Copy)]
+struct Column([u64; 4]);
 
-/// The bits of `hits` that hold the sum of ids, which `main` checks has room.
+/// The bits of `hits` that hold the sum of ids, enough for the spec's numbers of documents.
 const SUM_BITS: u32 = 40;
 
 /// A high bit of `hits`, past any count, which says that no more documents are among the smallest.
@@ -938,8 +950,8 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
     }
     let (tokens, unsure) = (&mut lists.tokens[..], &mut lists.unsure[..]);
     let (flagged, present) = (&mut lists.flagged[..], &mut lists.present[..]);
-    let (stamp, last) = (lists.stamp, terms.count as u32);
     let (keys, places) = (&mut lists.keys[..], &mut lists.places[..]);
+    let (stamp, last) = (lists.stamp, terms.count as u32);
     // A set is 64 bytes, so these take a hash to a set's distance from the first.
     let shift = 32 - 6 - terms.sets.len().trailing_zeros() as i32;
     let distances = (terms.sets.len() as i64 - 1) << 6;
@@ -1064,7 +1076,7 @@ fn mark(lists: &mut DocLists, flagged: usize, columns: &mut [Column]) -> [usize;
             let word = *tokens.get_unchecked(at as usize);
             let term = word & TERM_BITS;
             let column = (term - FIRST_TERM as u32).min(spare) as usize;
-            *columns.get_unchecked_mut(column).get_unchecked_mut(part) |= bit;
+            *columns.get_unchecked_mut(column).0.get_unchecked_mut(part) |= bit;
             let held = present.get_unchecked_mut(term as usize);
             let first = usize::from(*held != stamp);
             *held = stamp;
@@ -1075,20 +1087,6 @@ fn mark(lists: &mut DocLists, flagged: usize, columns: &mut [Column]) -> [usize;
         }
     }
     [bool_count, phrases]
-}
-
-/// Keeps which terms with rows a document holds, each 64 of them a word of its row.
-fn set_row(lists: &DocLists, rows: &mut [[u64; 64]], doc: u32) {
-    let (present, stamp) = (&lists.present[FIRST_TERM..], lists.stamp);
-    for (row, marks) in rows.iter_mut().zip(present.as_chunks::<64>().0) {
-        // SAFETY: a chunk has these 64 bytes, and the build targets x86-64-v3, which has AVX2.
-        let half = |at: usize| unsafe {
-            let marks = _mm256_loadu_si256(marks.as_ptr().add(at).cast());
-            let held = _mm256_cmpeq_epi8(marks, _mm256_set1_epi8(stamp as i8));
-            _mm256_movemask_epi8(held) as u32
-        };
-        row[doc as usize % 64] = u64::from(half(0)) | u64::from(half(32)) << 32;
-    }
 }
 
 /// Turns 64 documents' rows into these documents' word of each column, the `word`th, by swapping ever
@@ -1107,7 +1105,7 @@ fn store_rows(rows: &mut [[u64; 64]], columns: &mut [Column], word: usize) {
             }
         }
         for (&bits, column) in row.iter().zip(&mut columns[index * 64..]) {
-            column[word] = bits;
+            column.0[word] = bits;
         }
         *row = [0; 64];
     }
@@ -1119,8 +1117,14 @@ fn check_phrases(ats: &[u32], tokens: &[u32], plan: &Plan, doc: u32, counted: &m
     counted.clear();
     for at in ats.iter().map(|&at| at as usize) {
         let term = (tokens[at] & TERM_BITS) as usize;
-        let from = plan.phrase_start[term] as usize;
-        let mut entries = &plan.phrases[from..plan.phrase_start[term + 1] as usize];
+        // Most occurrences of a term with one phrase have the wrong neighbour, which this tells without the
+        // look at the phrase, a cache miss.
+        let (from, near) = plan.phrase_start[term];
+        let held = tokens.get((at + 1).wrapping_sub(2 * (near >> 31) as usize));
+        if near != 0 && held.map_or(0, |word| word & TERM_BITS) != near & TERM_BITS {
+            continue;
+        }
+        let mut entries = &plan.phrases[from as usize..plan.phrase_start[term + 1].0 as usize];
         while let [query, position, len, rest @ ..] = entries {
             let (phrase, after) = rest.split_at(*len as usize);
             entries = after;
@@ -1141,7 +1145,7 @@ fn check_phrases(ats: &[u32], tokens: &[u32], plan: &Plan, doc: u32, counted: &m
             // An anchor can occur twice in a document, but the document counts once.
             if run.is_some_and(same) && !counted.contains(query) {
                 counted.push(*query);
-                let mut answer = lock(&plan.answers[*query as usize]);
+                let mut answer = lock(&plan.answers[*query as usize].0);
                 (answer.count, answer.sum) = (answer.count + 1, answer.sum + u64::from(doc));
                 insert_smallest(&mut answer.ids, doc);
             }
@@ -1161,7 +1165,7 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
     // SAFETY: the build targets x86-64-v3, which has AVX.
     let stamp = unsafe { _mm_set1_epi8(lists.stamp as i8) };
     let (hits, short) = (&mut scan.hits[..], &mut scan.short_list[..]);
-    let (checks, short_hits) = (plan.short_checks.as_ptr(), hits.as_ptr());
+    let checks = plan.short_checks.as_ptr();
     let (anchor_lists, this_doc) = (&plan.anchor_lists[..], (1 << SUM_BITS) + u64::from(doc));
     // SAFETY: `hits` has every tally. A thread's hits ascend, so only its first ten can be among the
     // smallest.
@@ -1184,11 +1188,9 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
         // SAFETY: `anchor_lists` has one entry more than there are terms, `short` has room for all the checks
         // and four more, and an anchor's checks are all in `long_checks`.
         unsafe {
-            let list = *anchor_lists.get_unchecked(term as usize);
-            let next = *anchor_lists.get_unchecked(term as usize + 1);
-            let (from, to) = (list.short_from, next.short_from);
+            let AnchorList(from, long_from, own_tally) = *anchor_lists.get_unchecked(term as usize);
+            let AnchorList(to, long_to, _) = *anchor_lists.get_unchecked(term as usize + 1);
             prefetch(checks.wrapping_add(from as usize).cast());
-            prefetch(short_hits.wrapping_add(from as usize).cast());
             // One store lists four of the term's short checks, which is enough for most, whatever
             // `listed` then keeps of them, and the loop lists any more.
             let at = _mm_add_epi32(_mm_set1_epi32(from as i32), _mm_setr_epi32(0, 1, 2, 3));
@@ -1197,8 +1199,8 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
                 short[listed + (at - from) as usize] = at;
             }
             listed += (to - from) as usize;
-            add(1, list.own_tally as usize);
-            for at in list.long_from as usize..next.long_from as usize {
+            add(1, own_tally as usize);
+            for at in long_from as usize..long_to as usize {
                 let check = plan.long_checks.get_unchecked(at - short_count);
                 add(counts(check, present, stamp), at);
             }
@@ -1206,8 +1208,8 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
     }
     for &at in &short[..listed] {
         // SAFETY: the list came from `anchor_lists`.
-        let check = unsafe { plan.short_checks.get_unchecked(at as usize) };
-        add(counts(check, present, stamp), at as usize);
+        let check = unsafe { *plan.short_checks.get_unchecked(at as usize) };
+        add(counts_packed(check, present, stamp), at as usize);
     }
 }
 
@@ -1225,7 +1227,7 @@ static STEP_MASKS: StepMasks = StepMasks([
 #[cold]
 fn add_smallest_of_block(plan: &Plan, at: usize, set: __m256i, first_doc: u32) -> u64 {
     // SAFETY: a vector has the layout of four words.
-    let words = unsafe { std::mem::transmute::<__m256i, Column>(set) };
+    let words = unsafe { std::mem::transmute::<__m256i, [u64; 4]>(set) };
     for (word, &bits) in words.iter().enumerate() {
         let mut rest = bits;
         while rest != 0 {
@@ -1268,11 +1270,7 @@ fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u3
                 let mut set = column(*query.get_unchecked(0));
                 for &step in query.get_unchecked(1..) {
                     let with = column(step);
-                    let masks = STEP_MASKS
-                        .0
-                        .as_ptr()
-                        .add((step >> 30) as usize)
-                        .cast::<__m256i>();
+                    let masks = STEP_MASKS.0.as_ptr().add((step >> 30) as usize).cast();
                     let kept = _mm256_xor_si256(with, _mm256_load_si256(masks));
                     let added = _mm256_and_si256(with, _mm256_load_si256(masks.add(1)));
                     set = _mm256_or_si256(_mm256_and_si256(set, kept), added);
@@ -1283,20 +1281,15 @@ fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u3
                 let places = _mm256_add_epi8(look(low_sum, low), look(high_sum, high));
                 let in_word = _mm256_sad_epu8(ones, zero);
                 let by_pair = _mm256_maddubs_epi16(ones, byte_numbers);
-                let sums = _mm256_add_epi64(
-                    _mm256_add_epi64(
-                        _mm256_sad_epu8(places, zero),
-                        _mm256_mul_epu32(in_word, starts),
-                    ),
-                    _mm256_slli_epi64(_mm256_sad_epu8(by_pair, zero), 3),
-                );
+                let first_docs = _mm256_mul_epu32(in_word, starts);
+                let sums = _mm256_add_epi64(_mm256_sad_epu8(places, zero), first_docs);
+                let sums =
+                    _mm256_add_epi64(sums, _mm256_slli_epi64(_mm256_sad_epu8(by_pair, zero), 3));
                 let found = _mm256_add_epi64(sums, _mm256_slli_epi64(in_word, SUM_BITS as i32));
-                let half = _mm_add_epi64(
-                    _mm256_castsi256_si128(found),
-                    _mm256_extracti128_si256(found, 1),
-                );
-                let found =
-                    _mm_cvtsi128_si64(_mm_add_epi64(half, _mm_unpackhi_epi64(half, half))) as u64;
+                let high = _mm256_extracti128_si256(found, 1);
+                let half = _mm_add_epi64(_mm256_castsi256_si128(found), high);
+                let found = _mm_add_epi64(half, _mm_unpackhi_epi64(half, half));
+                let found = _mm_cvtsi128_si64(found) as u64;
                 let hit = hits.get_unchecked_mut(at);
                 // Fewer than ten so far, and more now, in a way the compiler can't turn into a coin-toss
                 // branch. A thread's hits ascend, so only its first ten can be among the smallest.
@@ -1314,14 +1307,11 @@ fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u3
 /// Finishes a block: the last row if it's part full, its queries, and clean columns for the next.
 fn finish_block(plan: &Plan, scan: &mut Scan, rows: &mut [[u64; 64]], first_doc: u32, docs: u32) {
     if docs % 64 != 0 {
-        store_rows(
-            rows,
-            &mut scan.columns[..plan.rowed_count],
-            docs as usize / 64,
-        );
+        let with_rows = &mut scan.columns[..plan.rowed_count];
+        store_rows(rows, with_rows, docs as usize / 64);
     }
     answer_block(plan, &scan.columns, &mut scan.hits, first_doc);
-    scan.columns.fill([0; 4]);
+    scan.columns.fill(Column([0; 4]));
 }
 
 /// Claims the next `size` of the numbers below `len`, if any are left.
@@ -1330,24 +1320,64 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
     (from < len).then(|| from..(from + size).min(len))
 }
 
-/// Claims ranges of the corpus until none is left, and scans them.
-fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicUsize) -> Scan {
+// ---- After the scan: the output ----
+
+/// How far each job that the threads share has got: the next of each to claim, and how far the file has
+/// got.
+#[derive(Default)]
+struct Progress {
+    next_range: AtomicUsize,    // In bytes of the corpus.
+    hits: Mutex<Vec<Vec<u64>>>, // Each thread's `Scan::hits`, once it has scanned...
+    scanned: AtomicUsize,       // ...and how many have.
+    next_total: AtomicUsize,    // The next tally to add up.
+    totalled: AtomicUsize,      // How many threads have no more to add up.
+    next_batch: AtomicUsize,    // In queries, as is...
+    written: AtomicUsize,       // ...how many of them have reached the file.
+}
+
+/// Counts this thread as here, and waits for the others. All these waits are short, as threads finish
+/// about together, and a thread that sleeps through one takes far longer to wake.
+fn wait_for_all(here: &AtomicUsize, threads: usize) {
+    here.fetch_add(1, Release);
+    while here.load(Acquire) < threads {
+        thread::yield_now();
+    }
+}
+
+/// One thread's part of the scan and the answers. What it counted goes where every thread can read it once
+/// all are done. Then the totals, before any printing. Then threads claim batches of queries in order, and
+/// each waits for the batch before it to reach the file.
+fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progress, threads: usize) {
+    // 48 ranges per thread: enough that a thread slowed for a while holds no one up, and that all
+    // finish within a small part of the scan.
+    let range_size = docs.len() / (threads * 48) + 1;
+    // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();
     scan.hits.resize(plan.tallies.len(), 0);
-    scan.columns = vec![[0; 4]; plan.rowed_count + plan.sparse_count + 1];
+    scan.columns = vec![Column([0; 4]); plan.rowed_count + plan.sparse_count + 1];
     scan.short_list = vec![0; plan.short_checks.len() + 4];
-    // With a row's worth more, as `set_row` reads whole rows of marks.
+    // With a row's worth more, as a row's marks are read whole.
     let mut lists = DocLists::default();
     lists.present = vec![0; plan.terms.count + 64];
     let mut rows = vec![[0; 64]; plan.rowed_count.div_ceil(64)];
-    while let Some(range) = claim(next_range, range_size, docs.len()) {
+    while let Some(range) = claim(&progress.next_range, range_size, docs.len()) {
         let (mut first_doc, mut in_block) = (0, 0);
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
             first_doc = if in_block == 0 { doc } else { first_doc };
             lists.stamp = in_block as u8 + 1;
             let flagged = look_up(&plan.terms, text, edges, &mut lists);
             let [bools, phrases] = mark(&mut lists, flagged, &mut scan.columns);
-            set_row(&lists, &mut rows, in_block);
+            // Keeps which terms with rows the document holds, each 64 of them a word of its row.
+            let marks = lists.present[FIRST_TERM..].as_chunks::<64>().0;
+            for (row, marks) in rows.iter_mut().zip(marks) {
+                // SAFETY: a chunk has these 64 bytes, and the build targets x86-64-v3, which has AVX2.
+                let half = |at: usize| unsafe {
+                    let marks = _mm256_loadu_si256(marks.as_ptr().add(at).cast());
+                    let held = _mm256_cmpeq_epi8(marks, _mm256_set1_epi8(lists.stamp as i8));
+                    _mm256_movemask_epi8(held) as u32
+                };
+                row[in_block as usize % 64] = u64::from(half(0)) | u64::from(half(32)) << 32;
+            }
             in_block += 1;
             if in_block % 64 == 0 {
                 let part = (in_block - 1) as usize / 64;
@@ -1368,61 +1398,10 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
             lists.present.fill(0);
         }
     }
-    scan
-}
-
-// ---- After the scan: the output ----
-
-/// Prints a query's line: each number with a space after it, the last of which becomes the line's end.
-fn print_line(out: &mut Vec<u8>, answer: &Answer) {
-    let Answer { count, sum, ids } = answer;
-    let docs = ids.iter().take(*count as usize).map(|&d| u64::from(d));
-    for value in [*count, *sum].into_iter().chain(docs) {
-        // The 20 digits of the largest u64, then the space.
-        let (mut digits, mut start) = ([b' '; 21], 20);
-        for value in std::iter::successors(Some(value), |&v| (v >= 10).then(|| v / 10)) {
-            start -= 1;
-            digits[start] = b'0' + (value % 10) as u8;
-        }
-        out.extend_from_slice(&digits[start..]);
-    }
-    *out.last_mut().expect("a line has numbers") = b'\n';
-}
-
-/// How far each job that the threads share has got: the next of each to claim, and how far the file has
-/// got.
-#[derive(Default)]
-struct Progress {
-    next_range: AtomicUsize,     // In bytes of the corpus.
-    next_scan_slot: AtomicUsize, // In `Shared::scans`.
-    next_total: AtomicUsize,     // The next tally to add up.
-    next_batch: AtomicUsize,     // In queries, as is...
-    written: AtomicUsize,        // ...how many of them have reached the file.
-}
-
-/// What the threads of the scan and answer round share.
-#[repr(C)]
-struct Shared {
-    progress: Progress,
-    barrier: Barrier,           // Between phases.
-    scans: Vec<OnceLock<Scan>>, // A slot for each thread's scan.
-}
-
-/// One thread's part of the scan and the answers. Its scan goes into its slot, for every thread to read
-/// once all are done. Then the totals, before any printing. Then threads claim batches of queries in order,
-/// and each waits for the batch before it to reach the file. The wait is short, because batches cost about
-/// the same.
-fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
-    let (progress, barrier) = (&shared.progress, &shared.barrier);
-    // 48 ranges per thread: enough that a thread slowed for a while holds no one up, and that all
-    // finish within a small part of the scan.
-    let range_size = docs.len() / (shared.scans.len() * 48) + 1;
-    let scan = scan_ranges(docs, plan, range_size, &progress.next_range);
-    let slot = progress.next_scan_slot.fetch_add(1, Relaxed);
-    assert!(shared.scans[slot].set(scan).is_ok(), "slot taken twice");
-    barrier.wait();
-    let scan_in = |slot| OnceLock::get(slot).expect("every scan is stored by now");
-    let scans: Vec<&Scan> = shared.scans.iter().map(scan_in).collect();
+    lock(&progress.hits).push(scan.hits);
+    wait_for_all(&progress.scanned, threads);
+    let address = |hits: &Vec<u64>| hits.as_ptr();
+    let scans: Vec<_> = lock(&progress.hits).iter().map(address).collect();
 
     // Adds the threads' counts and ids of each tally into its answer. All threads' hits for a tally are
     // summed before its answer is locked, so an answer is visited once per tally, not once per thread as
@@ -1430,27 +1409,41 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
     // this.
     let next_tallies = || claim(&progress.next_total, BATCH, plan.tallies.len());
     for at in std::iter::from_fn(next_tallies).flatten() {
-        let hits: u64 = scans.iter().map(|scan| scan.hits[at] & !TOO_BIG).sum();
-        let mut answer = lock(&plan.answers[plan.tallies[at].answer as usize]);
+        // SAFETY: each thread's `hits` has every tally.
+        let at_hits = |hits: &*const u64| unsafe { *hits.add(at) } & !TOO_BIG;
+        let hits: u64 = scans.iter().map(at_hits).sum();
+        let mut answer = lock(&plan.answers[plan.tallies[at].0 as usize].0);
         answer.count += hits >> SUM_BITS;
         answer.sum += hits & ((1 << SUM_BITS) - 1);
     }
 
-    barrier.wait();
+    wait_for_all(&progress.totalled, threads);
 
     // Printing, each query's answer with what its term's tally adds to it.
     let mut text = Vec::new();
     while let Some(batch) = claim(&progress.next_batch, BATCH, plan.queries.len()) {
         text.clear();
         for query in batch.clone() {
-            let mut line = *lock(&plan.answers[query]);
+            let mut line = *lock(&plan.answers[query].0);
             // NONE is no answer's number.
             if let Some(term_answer) = plan.answers.get(plan.shared_answer[query] as usize) {
-                let Answer { count, sum, ids } = *lock(term_answer);
+                let Answer { count, sum, ids } = *lock(&term_answer.0);
                 (line.count, line.sum) = (line.count + count, line.sum + sum);
                 ids.iter().for_each(|&d| insert_smallest(&mut line.ids, d));
             }
-            print_line(&mut text, &line);
+            // Each number has a space after it, the last of which becomes the line's end.
+            let Answer { count, sum, ids } = line;
+            let docs = ids.iter().take(count as usize).map(|&d| u64::from(d));
+            for value in [count, sum].into_iter().chain(docs) {
+                // The 20 digits of the largest u64, then the space.
+                let (mut digits, mut start) = ([b' '; 21], 20);
+                for value in std::iter::successors(Some(value), |&v| (v >= 10).then(|| v / 10)) {
+                    start -= 1;
+                    digits[start] = b'0' + (value % 10) as u8;
+                }
+                text.extend_from_slice(&digits[start..]);
+            }
+            *text.last_mut().expect("a line has numbers") = b'\n';
         }
         while progress.written.load(Acquire) != batch.start {
             thread::yield_now();
@@ -1484,21 +1477,26 @@ pub extern "C" fn main() -> i32 {
     let (docs, queries) = (map_file(&data, "docs.txt"), map_file(&data, "queries.txt"));
     // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
     // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
+    // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
+    // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
+    // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
+    let mut mappers = vec![];
+    for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
+        mappers.push(thread::spawn(move || {
+            thread::park();
+            // SAFETY: this only maps pages of the mapping, and a part starts at a page.
+            unsafe { madvise(part.as_ptr(), part.len(), 22) };
+        }));
+    }
     let mut plan = parse_queries(queries, threads, 1 << 16);
+    mappers.iter().for_each(|mapper| mapper.thread().unpark());
     make_plan(&mut plan, docs, threads);
-    // The last document's id starts the last line, which trimming only ever shortens past the id.
-    let last_line = docs.trim_ascii_end().rsplit(|&byte| byte == b'\n').next();
-    let last_doc = id_at(last_line.unwrap_or_default(), 0);
-    // The ids sum to under N * N / 2, which `SUM_BITS` must hold.
-    assert!((last_doc as usize) < 1 << (SUM_BITS / 2), "too many ids");
     let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
-    // One round of threads scans, then answers, as starting threads again costs more than a barrier.
-    let shared = Shared {
-        progress: Progress::default(),
-        barrier: Barrier::new(threads),
-        scans: (0..threads).map(|_| OnceLock::new()).collect(),
-    };
-    on_threads(threads, || scan_and_answer(docs, &plan, &file, &shared));
+    // One round of threads scans, then answers, as starting threads again costs more than a short wait.
+    let progress = Progress::default();
+    on_threads(threads, || {
+        scan_and_answer(docs, &plan, &file, &progress, threads)
+    });
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)
 }

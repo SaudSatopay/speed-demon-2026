@@ -43,7 +43,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, io::IoSlice, io::Write, os::fd::AsRawFd, thread};
+use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, thread};
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
 /// table doesn't depend on a slot that no term took, so this term also fills the unused slots of a
@@ -1452,23 +1452,15 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
         }
         pieces.push((batch.start, text));
     }
-    // The last thread here writes it all at once, in one call to the kernel, which costs less than a call
-    // per batch in turn.
+    // The last thread here writes it all, so that none of them waits its turn.
     let mut printed = progress.printed.lock().unwrap();
     printed.0 += 1;
     printed.1.append(&mut pieces);
     if printed.0 == threads {
         printed.1.sort_unstable_by_key(|piece| piece.0);
-        let mut slices: Vec<_> = printed
-            .1
-            .iter()
-            .map(|piece| IoSlice::new(&piece.1))
-            .collect();
-        let mut rest = &mut slices[..];
-        while !rest.is_empty() {
+        for piece in &printed.1 {
             // `panic = "abort"`: a failed write ends the process.
-            let written = file.write_vectored(rest).expect("writing the results");
-            IoSlice::advance_slices(&mut rest, written);
+            file.write_all(&piece.1).expect("writing the results");
         }
     }
     drop(printed);
@@ -1512,8 +1504,11 @@ pub extern "C" fn main() -> i32 {
         for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
             mappers.push(thread::spawn(move || {
                 thread::park();
-                // SAFETY: this only maps pages of the mapping, and a part starts at a page.
-                unsafe { madvise(part.as_ptr(), part.len(), 22) };
+                // A piece at a time, as this holds the lock that a thread's start waits for.
+                for piece in part.chunks(1 << 20) {
+                    // SAFETY: this only maps pages of the mapping, and a piece starts at a page.
+                    unsafe { madvise(piece.as_ptr(), piece.len(), 22) };
+                }
             }));
         }
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");

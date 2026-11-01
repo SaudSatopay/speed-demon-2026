@@ -284,15 +284,13 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
         // A line belongs to the segment holding its first byte, so a segment after the first starts a
         // byte early, and skips the line already started. The log ends in LF, so there's an LF to find.
         let mut last_stamp = 0;
-        let mut line = match start {
-            0 => 0,
-            _ => {
-                start
-                    + text[start - 1..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .expect("no LF")
-            }
+        let first = text[start.saturating_sub(1)..]
+            .iter()
+            .position(|&b| b == b'\n');
+        let mut line = if start > 0 {
+            start + first.expect("no LF")
+        } else {
+            0
         };
         while line < end {
             // SAFETY: a prefetch needs no valid address, and never faults.
@@ -623,20 +621,12 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // Exit would take the log's pages out of the address space one by one on the last thread, and
         // the clock counts that, so whichever threads are done share the work first. From the log's
         // start on, as threads still reading are near its end, and a page taken from them just comes back.
-        loop {
-            let at = released.fetch_add(RELEASE, Relaxed);
-            if at >= end {
-                break;
-            }
+        let claims = (0..).map(|_| released.fetch_add(RELEASE, Relaxed));
+        for at in claims.take_while(|&at| at < end) {
+            let page = log[at..].as_ptr().cast_mut();
             // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`
             // is a multiple of a page, and a failure would only leave them for exit.
-            unsafe {
-                madvise(
-                    log.as_ptr().add(at).cast_mut(),
-                    RELEASE.min(end - at),
-                    MADV_DONTNEED,
-                )
-            };
+            unsafe { madvise(page, RELEASE.min(end - at), MADV_DONTNEED) };
         }
     };
     // The scope joins them all.
@@ -664,13 +654,9 @@ extern "C" fn main() -> i32 {
     let text = unsafe {
         let room = end + PADDING + (1 << 12);
         let base = mmap(0, room, 1, MAP_PRIVATE_ANON_NORESERVE, -1, 0);
-        assert_ne!(base as isize, -1, "mmap: {}", io::Error::last_os_error());
+        assert_ne!(base as isize, -1, "mmap");
         let mapped = mmap(base as usize, end, 1, MAP_PRIVATE_FIXED, log.as_raw_fd(), 0);
-        assert!(
-            end == 0 || mapped == base,
-            "mmap: {}",
-            io::Error::last_os_error()
-        );
+        assert!(end == 0 || mapped == base, "mmap");
         from_raw_parts(base, end + PADDING)
     };
     let round = |share| round(text, arg(2, "/out").as_ref(), threads, share);

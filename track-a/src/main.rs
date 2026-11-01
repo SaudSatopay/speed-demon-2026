@@ -37,7 +37,7 @@ const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
 /// Bytes per read: few enough to stay in the caches, enough that a read costs little per line.
-const PIECE: usize = 1 << 16;
+const PIECE: usize = 1 << 15;
 
 /// Room for the spec's exactly 1,842 endpoints, at a low load.
 const SLOTS: usize = 1 << 14;
@@ -191,7 +191,7 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// reads and writes no line that other threads write, and allocates nothing.
 fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Option<[usize; 2]>) {
     // With 192 spare bytes after a piece, so that a load that starts at a short fixed distance from a
-    // line needs no check of its own.
+    // line needs no check of its own, and 128 to line a read up with its source in a cache line.
     let mut room = [0u8; PIECE + 192 + 128];
     let base = room.as_ptr().align_offset(64);
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
@@ -206,10 +206,10 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
         // line is much shorter than a piece, so there's an LF to find.
         let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
+            // No more than what the segment's lines need: the longest line is well below 256 bytes.
             let room = &mut room[base + pos % 64..];
-            let got = log
-                .read_at(&mut room[..PIECE.min(end - pos + 256)], pos as u64)
-                .unwrap();
+            let want = PIECE.min(end - pos + 256);
+            let got = log.read_at(&mut room[..want], pos as u64).unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
             let whole = room[..got].iter().rposition(|&b| b == b'\n').unwrap() + 1;
             let (stop, text, skip) = (whole.min(end - pos), &room[..], usize::from(pos < start));

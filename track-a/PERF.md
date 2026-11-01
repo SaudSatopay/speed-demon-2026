@@ -89,6 +89,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 54 | `main` as the C entry point, which skips the setup std does before it | Before main, std reads /proc/self/maps and installs signal handlers, and gives each thread a signal stack, at about 5 more system calls per thread, some taking the address space's lock for writing | pending | — | — | — |
 | 55 | exp: reads that stop where the segment does, with source and destination at the same place in a cache line | A segment's last read took a full piece whatever was left, so about 5% of all copying was thrown away, and the read's destination had no relation to its source | pending | — | — | — |
 | 56 | exp: 64 KiB pieces | Half the system calls, for 32 KiB more per thread | pending | — | — | — |
+| 57 | Reads that stop where the segment does, lined up with their source, in 32 KiB pieces again | With 64 KiB pieces T stayed at 0.0188 and M rose to 17.0, so the pieces go back to 32 KiB, and reads that stop with the segment, at T 0.0189 against 0.0193, stay | pending | — | — | — |
 
 ## Decision log
 
@@ -203,6 +204,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D55.** Experiment, against T 0.0191 to 0.0193. On the box, reading twice cost about 1.2 us per page per thread, far above a copy of cached data, so see whether alignment plays a part in that. Locally flat: paired wall +0.1 ms of 11.1, within noise, S 296 -> 300.
 
 **D56.** Experiment, against T 0.0189 at M 16.5. With reads now stopping where the segment does, a larger piece throws nothing away. It has to gain 1% of T to pay for M +0.38 MB. On the box, C read T 0.0236 at 32 KiB and 0.0235 at 64 KiB, flat; A's lines are longer and its parse smaller, so try it here too.
+
+**D57.** Decided by the board. A segment's last read took a whole piece, which threw away half a piece per segment, 5% of all the copying. Each read now takes what the segment needs, and goes where its source and destination share a place in a cache line. Runs: T 0.0189 at M 16.5, K 54.20, against T 0.0193 at M 16.2, K 53.91; 64 KiB read T 0.0188 at M 17.0, K 53.91. S 300 -> 299.
 
 ## What didn't work
 

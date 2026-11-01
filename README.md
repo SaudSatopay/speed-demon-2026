@@ -1,96 +1,57 @@
-# Speed Demon 2026 starter
+# ALL STAR · Speed Demon 2026
 
-A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
+Four rewrites of the organisers' naive Python references. Each is written in Rust with only the standard library (zero dependencies) and built offline into its own Docker image. Every output matches the reference's byte for byte on all 171 datasets in our check, and on five repeated runs. You can verify that with one command ([below](#check-our-claims)). A solo entry by Saud Satopay.
 
-## Start in five steps
+| Track | What it does | Reference on the box | Ours on the box (board run) | K | Speed points | Details |
+|---|---|---|---|---|---|---|
+| A · Ingest | Per-hour, per-endpoint latency percentiles | 32.05 s · 228 MB | 0.0189 s · 16.5 MB (`run-18e65c063a24`) | 54.20 | 86.7 | [README](track-a/README.md) · [PERF.md](track-a/PERF.md) |
+| B · Index | Boolean and phrase queries over 250K documents | 56.35 s · 2,200 MB | 0.0983 s · 41.6 MB (`run-f39141d33527`) | 36.97 | 78.4 | [README](track-b/README.md) · [PERF.md](track-b/PERF.md) |
+| C · Join | A hostile CSV joined and summed in integer cents | 14.44 s · 367 MB | 0.0227 s · 10.3 MB (`run-40b0e94343ad`) | 41.19 | 80.7 | [README](track-c/README.md) · [PERF.md](track-c/PERF.md) |
+| D · Traverse | 2,000 shortest paths on a 5M-edge graph | 72.69 s · 893 MB | 0.1454 s · 42.2 MB (`run-a8cb2e6350b9`) | 27.59 | 72.0 | [README](track-d/README.md) · [PERF.md](track-d/PERF.md) |
 
-1. **Use this template** (the green button on GitHub) to create your repo. It can stay private until code freeze.
-2. **Install the [Speed Demon Board app](https://github.com/apps/speed-demon-board)** on that repo. It gets read-only access to the repos you pick and nothing else.
-3. **Register your team** on the [submission form](https://tally.so/r/Ar7g9z), with the repo URL and the tracks you are entering.
-4. **Push to the `speed-demon` branch.** It is this template's default branch, so a plain `git push` does it. The board picks up each push, builds every `track-*` folder and runs it once on the full public dataset. Results appear on speeddemon.dev.
-5. **Make it fast.** Log every step in the track's `PERF.md`, with the board run ID that measured it. At code freeze (November 2, 15:00 UTC), make the repo public.
+Every number above is from the [live board](https://speeddemon.dev/board), measured on the organisers' machine; none is a local timing. Each is the track's best run, and the same code's time varies by a few percent between runs. Each step that produced it is a numbered entry in that track's PERF.md, with its run ID, and the failed experiments are kept too.
 
-One repo per team holds all your tracks. Delete the folders of the tracks you are not entering. An unchanged folder is the reference itself, so the board reports it as unchanged and does not run it.
+## Check our claims
 
-## What is in a track folder
-
-| File | What it is |
+| Claim | How to check it |
 |---|---|
-| `Dockerfile` | Builds the folder offline, from an allowlisted image pinned by digest |
-| `.speed-demon.toml` | Track, team, language, dependency count; set `team` |
-| `PERF.md` | Your optimisation log, worth 8% of your total |
-| `README.md` | Your approach, your dependencies, your next 24 hours |
-| `run.py` + module | The reference; replace it with your code |
+| Every output matches the naive reference byte for byte | `python3 tools/verify.py`. It needs only Docker, git and Python, and takes about 16 minutes from cold. It runs the organisers' own generators and reference on 15 seeds at 2 scales, 32 answer-preserving rewrites, 19 limit cases, and 5 repeated runs per track ([tools/README.md](tools/README.md)) |
+| The times and memory above | The run IDs, on the board and in each PERF.md |
+| Zero dependencies | Each track's `Cargo.toml` has an empty `[dependencies]` |
+| Nothing is precomputed | Each program reads only `/data`, and final scoring uses a seed nobody has seen |
 
-## How your program runs
+## Limits
 
-- It reads its inputs from `/data`, which is read-only, and writes exactly one file to `/out`, then exits 0. The file is `summary.txt` for A, `results.txt` for B, `aggregates.txt` for C and `distances.txt` for D.
-- `TRACK` is set to `a`, `b`, `c` or `d`.
-- There is no network, at build time or at run time. Commit your dependencies to the repo (`cargo vendor`, `go mod vendor` and so on).
-- It runs as an unprivileged user on a read-only filesystem. `/tmp` is 1 GB of scratch space.
-- It gets 12 hardware threads (six P-cores, turbo off), 8 GB of memory with no swap, and 512 processes.
-- The live board stops a run at 3x the reference's time. Final scoring stops it at 10x.
-- Your output must match the reference's byte for byte (sha256) on every run.
+- **A:** it relies on the spec's fixed timestamps, well-formed lines and 1,842 endpoints, and aborts rather than answering wrongly past those. A line more than 1/48 of the log late restarts the run, which doubles T; no seed does this.
+- **B:** it relies on the spec's dense document ids, and stops with an assert past 1,048,575 documents. Queries anchored on a common term still store postings, most of the memory left.
+- **C:** it relies on section 2.2 of the spec: a mid-file BOM only ever starts a record, a CR only ever starts a CRLF, numbers fit in 8 bytes, and there are at most 240 countries. A file with no CRLF would still be right, but wouldn't get split across threads.
+- **D:** a guard rejects a graph whose renumbered label pages pass 16 bits. A query whose distances pass 2^32 runs twice, first in 32 bits and then in 64.
 
-## Check before you push
+## How we worked
 
-`check.py` builds a track offline and runs it with the board's Docker settings, then prints the output's sha256 and a rough time. You need Docker and Python 3.
+- **Correct first.** A bank of datasets ran on every build: generator seeds, answer-preserving rewrites of them (line endings, BOMs, quoting, order) and synthetic files at each spec's limits. It ran natively in seconds, then in the board's sandbox before every push. A pre-push gate refused any push that failed. Lock-free tables also got repeated runs at varying thread counts, as a race doesn't show on one pass, and two of them were caught that way.
+- **Measured like the box, and judged by the box.** The local scorer uses the official runner and timer, cgroup `memory.peak`, the middle-3 mean of 5 runs, and the box's huge-page setting. Hardware counters ranked changes that cut instructions. Local numbers misled us on anything to do with the kernel or with cache layout, as the dev machine is a virtual machine with smaller caches, so those went to the board as labelled `exp:` pushes.
+- **Timing phases on a machine we can't profile.** An `exp:` push runs one phase twice on throwaway state. T minus the usual T is that phase's wall time on the box. That's how we learned that reading, not parsing, was the next limit on A.
+- **One idea per push,** so each board run proves one claim. Instruction and branch-miss counts back the PERF.md entries.
 
-```
-python3 check.py a --data data/a
-```
+## Shared design choices
 
-To get data, generate it with the public generators. Seed 1 at `full` scale is the board's dataset; `sample` is 10% of it.
+- **Rust, standard library only.** `mmap`, `madvise` and a few others are declared directly against glibc, with no `libc` crate.
+- **Threads.** They run under `std::thread::scope`. The count comes from `available_parallelism()`, which respects the container's CPU set. Work is dealt out in chunks from an atomic counter, and results merge in a fixed order, so the output never depends on scheduling.
+- **Built for `x86-64-v3`** (AVX2, no AVX-512, like the box) in `.cargo/config.toml`. Track C adds carry-less multiply for its quote masks and PREFETCHW. Tracks A, B and C link glibc statically, as T counts from exec.
+- **One output file.** It's written in pieces into `/out`, never also held whole in memory.
+- **Two-stage Dockerfiles** from allowlisted, digest-pinned images.
 
-```
-git clone https://github.com/hackathon-raptors/speed-demon-2026
-python3.13 speed-demon-2026/generators/a_ingest.py --seed 1 --scale sample --out data/a
-```
+## Before the event
 
-No Python 3.13? Run the generator in the same image the reference uses:
+Reading the specs against the harness source turned up two places where the docs and the code disagreed: the dataset the board uses for Track B, and the final-scoring timeout. We reported both on Discord, and the organisers fixed them the same day ([da9d695](https://github.com/hackathon-raptors/speed-demon-2026/commit/da9d695)). No solution code was written before kickoff. `tools/` is test tooling outside the track folders, as the rules allow.
 
-```
-docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python3 speed-demon-2026/generators/a_ingest.py --seed 1 --scale sample --out data/a
-```
+Our first push came 4 minutes 50 seconds after kickoff, which deserves an explanation. GitHub's activity log shows the repo unchanged from the starter until then (15:04:50 UTC, commit `90b27c9`). The session log shows the first Rust source written at 15:02:45 UTC. What existed before kickoff was prose design notes, test tooling, and build files with no track logic (`Cargo.toml`, `.cargo/config.toml`, the `Dockerfile`), which rule 05 allows. An AI agent wrote v1 from those notes, and the bank of tests checked it in seconds. We can share the full session log with the organisers.
 
-Run the check once on the unchanged folder. The sha256 it prints is the correct answer for that data. After every change, pass it back, so the check fails on a wrong answer:
+## AI use
 
-```
-python3 check.py a --data data/a --expected <sha256>
-```
-
-The full datasets and their expected hashes are also published at kickoff, October 30, 15:00 UTC, linked from speeddemon.dev.
-
-On Colima, keep the repo and the data under your home folder, or Docker cannot mount them.
-
-## Your own language
-
-Replace the folder's contents with your code and a Dockerfile that builds it offline. A two-stage build keeps the image small. For Rust with no crates:
-
-```
-FROM rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
-WORKDIR /src
-COPY . .
-RUN cargo build --release --offline
-
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-COPY --from=build /src/target/release/solution /app/solution
-ENTRYPOINT ["/app/solution"]
-```
-
-Here `solution` is the package name in your `Cargo.toml`. Every allowlisted image and its digest is in [allowlist.json](https://speeddemon.dev/allowlist.json). Each direct runtime dependency costs a little, so count them in `.speed-demon.toml`.
-
-## What the board refuses before it builds
-
-- A `FROM` that is not in the allowlist, or not pinned by digest.
-- `ADD` of a URL or a git repo, and `COPY --from` an image (an earlier stage is fine).
-- A `# syntax=` line; cache, secret or ssh mounts; `RUN --network`, `--security` or `--device`; `ONBUILD`.
-- A build over 10 minutes, or an image over 2 GB.
-
-## Scoring, briefly
-
-Faster than the reference earns points. Using less memory helps, up to a cap. Code beyond the reference's size, and every dependency, cost a little. Each track folder is built and measured on its own: your other tracks never count toward it, and code shared between tracks is copied into each folder that uses it and counts in each. A run that fails correctness, the timeout or the sandbox scores nothing. The full formula and the judging criteria are on speeddemon.dev.
+Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). Every design decision and every number here and in the PERF.md files was checked, and can be explained, by the author.
 
 ## Licence
 
-The reference code is copyright Hackathon Raptors CIC, under the MIT licence in `LICENSE`. Your repo has to be public under an OSI-approved licence at code freeze; keeping MIT is the simplest way.
+MIT: see [LICENSE](LICENSE).

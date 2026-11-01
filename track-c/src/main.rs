@@ -17,6 +17,8 @@
 //! counts in the peak: up to 252 KB per CPU that charges anything at all. So the workers, on stacks in
 //! that mapping, never fault and never use the heap.
 
+#![no_main]
+
 use std::arch::{asm, x86_64::*};
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
@@ -667,7 +669,14 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
     )
 }
 
-fn main() -> io::Result<()> {
+/// C's entry point, not std's: std's would read `/proc/self/maps` and install handlers first, none of
+/// which this program needs, and the timer counts all of it.
+#[unsafe(no_mangle)]
+extern "C" fn main() -> i32 {
+    run().map_or(1, |()| 0)
+}
+
+fn run() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());

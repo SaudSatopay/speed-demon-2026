@@ -70,6 +70,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | pending | — | — | — |
 | 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | pending | — | — | — |
 | 50 | Read a long name's pointer only after its slot says it's complete | A Fable review found it: the pointer and length were loaded before the Acquire, so a reader could compare against a null pointer while a writer was part way through. 2 crashes in 1,900 runs on a spec-legal stress input; the generator almost never writes such a name (over 32 bytes: about 1 seed in 100,000) | pending | — | — | — |
+| 51 | C's entry point instead of std's | Std reads /proc/self/maps, installs handlers and allocates a signal stack before main: about 15 system calls the timer counts, and system calls cost far more on the box than locally. Finding from Track A | pending | — | — | — |
 
 ## Decision log
 
@@ -173,6 +174,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D49. Keep the design. S 541 -> 485, instructions +0.4 per record, cycles flat, stack use unchanged. A barrier between the phases cost 2% wall locally, so threads wait on a count of finished region jobs instead. What would change our minds: T up on the box.
 
 **D50. Acquire first. 0 crashes in 2,100 runs on the same input, hot path untouched, S +2. The same review found no wrong output in about 940 comparisons against the reference and 7,300 repeat runs.
+
+**D51.** Take it, S +6: about 0.15 ms, too small to show in one sample.
 
 ## What didn't work
 

@@ -492,7 +492,9 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
             // A byte order mark can only start a record here, and no record otherwise starts with it.
-            start += 3 * usize::from(*text.get_unchecked(start) == 0xEF);
+            if *text.get_unchecked(start) == 0xEF {
+                start = std::hint::black_box(start + 3); // Keeps it a branch: one record in 4,000.
+            }
             // Moves the digits of the field at `start` to the top of a word, with zeros below them.
             let id = load_u64(text, start) << (8 * (start + 1 - name_at) as u32 & 63);
             // At most 7 digits (spec section 2.2), and the comma below them counts as a zero.
@@ -525,8 +527,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // These hardly ever change, so branches beat conditional moves and two stores.
         (cents < row[1]).then(|| row[1] = cents);
         (cents > row[3]).then(|| row[3] = cents);
-        let name = (note_at - name_at - 1) as u32 as usize;
-        let both = region_at - name_at - 1;
+        let (name, both) = (
+            (note_at - name_at - 1) as u32 as usize,
+            region_at - name_at - 1,
+        );
         // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
         // for a count of 64.
         let (name_quotes, quotes) = if both <= 64 {
@@ -536,9 +540,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
             (below(name), below(both))
         } else {
-            let count = |field: &[u8]| field.iter().filter(|&&c| c == b'"').count();
             let tail = &text[name_at..name_at + both];
-            (count(&tail[..name]), count(tail))
+            (count_quotes(&tail[..name]), count_quotes(tail))
         };
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
@@ -568,6 +571,12 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
                 in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
         }
     }
+}
+
+/// Counts the quotes in a field too long for one block's mask, which is one record in 60.
+#[cold]
+fn count_quotes(field: &[u8]) -> usize {
+    field.iter().filter(|&&c| c == b'"').count()
 }
 
 /// Runs the numbered jobs below `count` that `next` hasn't handed out yet, sharing them with however

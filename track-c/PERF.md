@@ -96,6 +96,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 74 | exp: threads claim one 31 KiB piece at a time, each finding its own cuts in the text it read | First to last finish is about 600 us with 24 segments per thread, and each segment costs two small reads. Claiming pieces should close the gap and drop those reads; also 10 fewer lines | pending | — | — | — |
 | 75 | exp: names with no slot (long, or every window to the end of the table full) go to one locked set, so no restart and no pointers in slots; on top of the piece claims | Thirteen fewer lines with only cold paths changed, and a second sample of the piece claims | pending | — | — | — |
 | 76 | Back to segments, with the locked set for names with no slot, and line trims: BOM by arithmetic, quotes counted in a closure | Piece claims cost about 3% of T in two samples, C over D 0.141 against 0.136, so they go; the locked set changes only cold paths and is 13 lines shorter, and the trims 8 more | pending | — | — | — |
+| 77 | exp: only the locked set for names with no slot, with the BOM branch and the old quote count back | The trims gave T 0.0212 and C over D 0.146, so this takes them out to see whether the locked set alone keeps T 0.0200 | pending | — | — | — |
 
 ## Decision log
 
@@ -251,6 +252,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D75.** pending the board
 
 **D76.** pending the board
+
+**D77.** pending the board
 
 ## What didn't work
 

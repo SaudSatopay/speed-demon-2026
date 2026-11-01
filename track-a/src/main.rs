@@ -64,8 +64,8 @@ const IDS: usize = 1 << 12;
 const METHOD_LENGTHS: u64 = 0x70_0064_5003;
 
 /// The lock-free endpoint table, and what the threads share about the hours, here to spare `parse` a
-/// fifth argument. `repr(C)`, here and on the next two, keeps the fields in the order they were timed
-/// in, as that decides which of them share a cache line.
+/// fifth argument. `repr(C)` keeps the fields in the order they were timed in, as that decides which of
+/// them share a cache line.
 #[repr(C)]
 struct Table {
     /// The keys. A key has whole lines, through its closing space, so a block load of a published key
@@ -77,25 +77,19 @@ struct Table {
     slots: [AtomicU16; SLOTS],
     /// Lines reserved so far.
     used: AtomicUsize,
+    /// Hours claimed so far, or `usize::MAX` once a line came too late for its hour. It changes only
+    /// with `last_seen` locked, and is read so too until the threads are done.
+    claimed: AtomicUsize,
+    /// One more than the log position where a thread last came to each hour, or 0 if none has.
     /// `panic = "abort"` means no thread dies holding a lock, so the `expect` on a lock never fires.
-    progress: Mutex<Progress>,
+    last_seen: Mutex<[usize; HOURS]>,
     /// The latest order of the ids, kept for the hours to come.
     order: Mutex<Arc<Order>>,
-}
-
-/// How far the finishing of hours has come.
-#[repr(C)]
-struct Progress {
-    /// Hours claimed so far, or `usize::MAX` once a line came too late for its hour.
-    claimed: usize,
-    /// One more than the log position where a thread last came to each hour, or 0 if none has.
-    last_seen: [usize; HOURS],
 }
 
 /// One hour's words. All the arrays share one mapping, and each is whole pages, because a mapping per
 /// hour costs a call each, and unmapping one stalls every thread that wants the address space's lock.
 #[derive(Default)]
-#[repr(C)]
 struct Hour {
     /// An array that threads reserve blocks of. It has room for every line of the log, since a log may
     /// be lopsided, and untouched pages cost nothing. A block's unused end stays zero, which no real
@@ -110,14 +104,10 @@ struct Hour {
     ready: AtomicUsize,
 }
 
-/// The ids in use and their endpoints, in the byte order of the endpoints (`[u8]` compares as unsigned
+/// The endpoints in use and their ids, in the byte order of the endpoints (`[u8]` compares as unsigned
 /// bytes, with a proper prefix first), after id 0, which no endpoint has: it's what the unused ends of
 /// blocks hold.
-#[derive(Default)]
-struct Order {
-    keys: Vec<&'static [u8]>,
-    ids: Vec<usize>,
-}
+type Order = (Vec<&'static [u8]>, Vec<usize>);
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc.
 unsafe extern "C" {
@@ -213,8 +203,7 @@ fn order_ids(Table { slots, lines, .. }: &Table) -> Order {
     let ids = slots.iter().map(line).filter(|&line| line > 0);
     let mut ids: Vec<(&[u8], usize)> = ids.map(|l| (key_of(l), l)).chain([(&[][..], 0)]).collect();
     ids.sort_unstable();
-    let (keys, ids) = ids.into_iter().unzip();
-    Order { keys, ids }
+    ids.into_iter().unzip()
 }
 
 /// Hours since the start of the span, from bytes 6 to 13 of a line, M-DDTHH:, without parsing a date.
@@ -271,9 +260,8 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
         // A line belongs to the segment holding its first byte, so a segment after the first starts a
         // byte early, and skips the line already started. The log ends in LF, so there's an LF to find.
         let mut last_stamp = 0;
-        let mut rest = text[start.saturating_sub(1)..].iter();
-        let skip = (start > 0).then(|| rest.position(|&b| b == b'\n').expect("no LF"));
-        let mut line = start + skip.unwrap_or(0);
+        let skip = text[start.max(1) - 1..].iter().position(|&b| b == b'\n');
+        let mut line = if start > 0 { start + skip.unwrap() } else { 0 };
         while line < end {
             // Prefetch past the page's end, where the L2 streamer stops.
             // SAFETY: a prefetch needs no valid address, and never faults.
@@ -293,10 +281,10 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
                 // Before any claim of this hour, this shows the claimer that this segment holds it
                 // up, as its position is at or past the low mark. After one, it's too late, which
                 // ends the round.
-                let mut state = table.progress.lock().expect("poisoned");
-                state.last_seen[hour] = state.last_seen[hour].max(line + 1);
-                if hour < state.claimed {
-                    state.claimed = usize::MAX;
+                let mut last_seen = table.last_seen.lock().expect("poisoned");
+                last_seen[hour] = last_seen[hour].max(line + 1);
+                if hour < table.claimed.load(Relaxed) {
+                    table.claimed.store(usize::MAX, Relaxed);
                     return;
                 }
             }
@@ -411,7 +399,7 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
     let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24);
     // Each group starts where the one before it ends, and id 0's holds the unused ends of blocks.
     let mut start = ends[0] as usize;
-    for (key, &id) in order.keys.iter().zip(&order.ids).skip(1) {
+    for (key, &id) in order.0.iter().zip(&order.1).skip(1) {
         let group = &recs[replace(&mut start, ends[id] as usize)..ends[id] as usize];
         // An endpoint with no line in this hour prints nothing.
         let Some(_) = group.first() else { continue };
@@ -485,13 +473,13 @@ fn write_hour(h: usize, hour: &Hour, table: &Table, digits: &[usize], tmp: &mut 
     // An endpoint that's new since the last order was made means a new order, which is kept for
     // the hours to come. It's made from the table as it is now, so it has this hour's endpoints.
     let mut order = table.order.lock().expect("poisoned").clone();
-    if order.ids.iter().map(|&id| ends[id] as usize).sum::<usize>() != recs.len() {
+    if order.1.iter().map(|&id| ends[id] as usize).sum::<usize>() != recs.len() {
         order = Arc::new(order_ids(table));
         *table.order.lock().expect("poisoned") = order.clone();
     }
     pass(recs, tmp, &mut low, digits, |r| (r >> 1 & 511) as usize);
     pass(tmp, recs, &mut high, digits, |r| (r >> 10 & 1023) as usize);
-    pass(recs, tmp, &mut ends, &order.ids, |r| r as usize >> ID_SHIFT);
+    pass(recs, tmp, &mut ends, &order.1, |r| r as usize >> ID_SHIFT);
     big.sort_unstable();
     // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
     // this vector never reallocates, and it's leaked rather than dropped.
@@ -543,10 +531,8 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         lines: unsafe { from_raw_parts(base.add(HOURS * room * 4).cast(), IDS) },
         slots: [const { AtomicU16::new(0) }; SLOTS],
         used: AtomicUsize::new(1),
-        progress: Mutex::new(Progress {
-            claimed: 0,
-            last_seen: [0; HOURS],
-        }),
+        claimed: AtomicUsize::new(0),
+        last_seen: Mutex::new([0; HOURS]),
         order: Mutex::default(),
     };
     let digits: Vec<usize> = (0..1024).collect();
@@ -561,7 +547,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
         // one's scratch stays as large as the largest hour it has seen. It has room for 1 MiB of
         // records from the start, in pages that stay untouched until a large hour needs them.
-        let finisher = me < 5;
+        let finisher = me < 4;
         let mut scratch = Vec::with_capacity(usize::from(finisher) << 18);
         let next_segment = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
@@ -571,17 +557,17 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             let mut hour = HOURS;
             if finisher {
                 let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
-                let mut state = table.progress.lock().expect("poisoned");
-                hour = state.claimed;
-                let seen = state.last_seen.get(hour).copied();
+                let last_seen = table.last_seen.lock().expect("poisoned");
+                hour = table.claimed.load(Relaxed);
+                let seen = last_seen.get(hour).copied();
                 // An hour with no line yet has 0, and it's due only when all reading is done. Nothing
                 // waits for a thread that fell behind: on a shared machine, the others would then sit out
                 // its whole turn off the core, and that happens all the time, so a wait here turned a busy
                 // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
                 // while the box is busy.
                 if seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
-                    state.claimed += 1;
-                    drop(state);
+                    table.claimed.store(hour + 1, Relaxed);
+                    drop(last_seen);
                     // While it writes, this thread holds no hour back.
                     reached[me].store(usize::MAX, Release);
                     write_hour(hour, &hours[hour], &table, &digits, &mut scratch);
@@ -612,7 +598,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // The scope joins them all.
     thread::scope(|scope| (0..threads).for_each(|me| drop(scope.spawn(move || worker(me)))));
     append(&hours, &next_out, &file);
-    table.progress.lock().expect("poisoned").claimed == HOURS
+    table.claimed.load(Relaxed) == HOURS
 }
 
 /// The C entry point: see `#![no_main]` at the top.
@@ -634,10 +620,9 @@ extern "C" fn main() -> i32 {
     let text = unsafe {
         // Protection 1 is `PROT_READ`.
         let base = mmap(0, end + PADDING + (1 << 12), 1, MAP_SPARSE, -1, 0);
-        assert_ne!(base as isize, -1, "mmap");
-        // Flags: `MAP_PRIVATE | MAP_FIXED`.
+        // Flags: `MAP_PRIVATE | MAP_FIXED`. If the first call failed, this one does too, harmlessly.
         let mapped = mmap(base as usize, end, 1, 0x02 | 0x10, log.as_raw_fd(), 0);
-        assert!(end == 0 || mapped == base, "mmap");
+        assert!(base as isize != -1 && (end == 0 || mapped == base), "mmap");
         from_raw_parts(base, end + PADDING)
     };
     let round = |share| round(text, arg(2, "/out").as_ref(), threads, share);

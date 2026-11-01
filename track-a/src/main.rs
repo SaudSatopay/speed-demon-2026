@@ -625,7 +625,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // start on, as threads still reading are near its end, and a page taken from them just comes back.
         loop {
             let at = released.fetch_add(RELEASE, Relaxed);
-            if at >= end {
+            if at >= end || true {
                 break;
             }
             // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`

@@ -124,6 +124,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 88 | Tag windows on multiples of 32, second sample | first sample T 0.0210 K 43.18, inside the range the chosen source has shown | pending | — | — | — |
 | 89 | T0 for the slot prefetch, third sample | samples so far K 41.66 on a slow box and K 43.96 | pending | — | — | — |
 | 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | pending | — | — | — |
+| 91 | Chosen source restored | neither idea beat it over three samples | pending | — | — | — |
 
 ## Decision log
 
@@ -307,6 +308,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D89.** Third sample of T0, taken in turn with aligned homes.
 
 **D90.** T0 rejected: K 41.66, 43.96, 43.73, median 43.73 against the chosen source at 44.02. Third sample of aligned homes.
+
+**D91.** Rejected: T0 median K 43.73 (41.66, 43.96, 43.73). Rejected: homes on multiples of 32, median K 43.18 (43.18, 43.28, 41.48). The chosen source stands at median K 44.02.
 
 ## What didn't work
 

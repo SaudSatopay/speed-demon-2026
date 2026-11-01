@@ -242,7 +242,7 @@ impl<'a> NameTable<'a> {
     }
 
     fn home(hash: u32) -> usize {
-        (u64::from(hash) * (HOMES / 32) as u64 >> 32) as usize * 32
+        (u64::from(hash) * HOMES as u64 >> 32) as usize
     }
 
     /// One bit per slot of a window of tags, set where the tag is `tag`.

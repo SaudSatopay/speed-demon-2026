@@ -20,10 +20,9 @@
 
 #![no_main]
 
-use std::arch::{asm, x86_64::*};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
-use std::{collections::BTreeSet, fs::File, hint::black_box, io::BufWriter, io::Write};
-use std::{mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex, thread};
+use std::{arch::asm, arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
+use std::{io::BufWriter, io::Write, mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
@@ -95,9 +94,8 @@ unsafe fn byte_mask(at: *const u8, is: impl Fn(__m256i) -> __m256i) -> u64 {
     // SAFETY: the caller keeps both loads inside the buffer, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
-        let mask = |at| _mm256_movemask_epi8(is(_mm256_loadu_si256(at))) as u32;
-        let at = at.cast::<__m256i>();
-        u64::from(mask(at)) | u64::from(mask(at.add(1))) << 32
+        let mask = |at: *const u8| _mm256_movemask_epi8(is(_mm256_loadu_si256(at.cast()))) as u32;
+        u64::from(mask(at)) | u64::from(mask(at.add(32))) << 32
     }
 }
 
@@ -115,8 +113,7 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
         // Weights in each word: 10 and 1, and for the steps to 8 digits 10,000 or 1,000 and 1.
         let (t, l) = (0x010A_010A_010A_010A, 0x0001_2710_0001_2710);
         let h = 0x0001_03E8_0001_03E8;
-        let tens = _mm256_set_epi64x(t, 0x010A_0001_010A_010A, t, t);
-        let pairs = _mm256_maddubs_epi16(digits, tens);
+        let pairs = _mm256_maddubs_epi16(digits, _mm256_set_epi64x(t, 0x010A_0001_010A_010A, t, t));
         let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
         let packed = _mm256_packus_epi32(quads, quads);
         let eights = _mm256_madd_epi16(packed, _mm256_set_epi64x(h, h, l, l));
@@ -139,8 +136,6 @@ const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 115_000 };
 const SPARE: usize = 256;
 /// Bytes of stack per thread, enough for its rows and lists.
 const STACK: usize = 40 << 10;
-/// Threads the stacks are enough for, which is more than the box has, and more than any test asks for.
-const THREADS: usize = 64;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
 /// Names longer than this get no slot. No generated name has been seen beyond 25 bytes.
@@ -167,12 +162,12 @@ struct Memory {
     tags: [AtomicU16; HOMES + SPARE],
     regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
     index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
-    stacks: [[AtomicU64; STACK / 8]; THREADS],
+    stacks: [[AtomicU64; STACK / 8]; 64], // More threads than the box has, or any test asks for.
 }
 // SAFETY: zero is a valid value of each atomic.
 static MEMORY: Memory = unsafe { std::mem::zeroed() };
 /// What the threads change under a lock, neither of it often. First the country codes: index 0 is
-/// `_UNMATCHED`, and codes take the next as they appear, in room that `aggregate` makes. Then the names
+/// `_UNMATCHED`, and codes take the next as they appear, in room that `main` makes. Then the names
 /// with no slot, each with a country it has seen.
 static LOCKED: Mutex<(Vec<&str>, BTreeSet<(Vec<u8>, u8)>)> = Mutex::new((vec![], BTreeSet::new()));
 
@@ -210,7 +205,8 @@ fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
     // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
     // CRC32 in SSE4.2, and x86-64-v3 includes both.
     let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
-    let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
+    // One more than the length, or the empty name would hash to zero, and its tag mean a free slot.
+    let crc = unsafe { _mm_crc32_u64(len as u64 + 1, head) as u32 };
     let hash = if cfg!(sd_const_hash) { 0 } else { crc };
     ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u16)
 }
@@ -231,11 +227,8 @@ fn slots_with(window: [__m256i; 2], tag: u16) -> u32 {
 /// # Safety
 /// `home` must stay 32 below the end of the tags.
 unsafe fn window(home: usize) -> [__m256i; 2] {
-    // SAFETY: the caller keeps the loads inside the tags. x86-64-v3 has AVX2.
-    unsafe {
-        let at = MEMORY.tags.as_ptr().add(home).cast::<__m256i>();
-        [_mm256_loadu_si256(at), _mm256_loadu_si256(at.add(1))]
-    }
+    // SAFETY: the caller keeps the load inside the tags, and it needs no alignment.
+    unsafe { std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast()) }
 }
 
 /// The key of a name of at most `INLINE_BYTES`.
@@ -309,12 +302,10 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
 /// A country's totals, one cache line: its count; lowest amount; id sum; highest amount; amount sum;
 /// name bytes; how many of its records repeat a name; and note bytes. That order keeps sums apart, or
 /// the compiler pairs their additions up as vector instructions, which take more than the two would.
+/// There are 256 rows, for every country index a byte can hold, so that indexing needs no check.
 #[repr(align(64))]
 struct Row([i64; 8]);
 const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
-
-/// Enough rows for every country index a byte can hold, so that indexing needs no check.
-type Rows = [Row; 256];
 
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
@@ -341,22 +332,19 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
     unsafe {
         let mut cursor = out.as_mut_ptr();
         let mut base = _mm256_set1_epi32(scan as i32 + 1);
-        let mut odd_so_far = *odd;
-        let mut at = text.as_ptr().add(scan);
-        let end = at.add(blocks * 64);
         // A byte's low half picks what the byte would have to be, to be a separator: an LF, a comma,
         // or all ones, which only a byte with the top bit set could be, and those shuffle to zero.
         let lf_comma = 0xFFFF_FF2C_FF0A_FFFFu64 as i64;
         let separator = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
-        let quote = _mm256_set1_epi8(b'"' as i8);
-        while at < end {
+        let (quote, ones) = (_mm256_set1_epi8(b'"' as i8), _mm_set1_epi8(-1));
+        for block in 0..blocks {
+            let at = text.as_ptr().add(scan + block * 64);
             // Far enough ahead to pass where the chunk's own loads and a page's end stop the core.
             _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(1024).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
-            let ones = _mm_set1_epi8(-1);
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
-            let inside = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
-            odd_so_far = (inside as i64 >> 63) as u64;
+            let inside = _mm_cvtsi128_si64(parity) as u64 ^ *odd;
+            *odd = (inside as i64 >> 63) as u64;
             let class = |block| _mm256_shuffle_epi8(separator, block);
             let mut left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, class(block))) & !inside;
             // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
@@ -373,22 +361,19 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             let total = left.count_ones() as usize;
             if total > 8 {
                 for i in 0..total {
-                    *cursor.add(i) =
-                        at.offset_from(text.as_ptr()) as u32 + left.trailing_zeros() + 1;
+                    *cursor.add(i) = _mm256_extract_epi32::<0>(base) as u32 + left.trailing_zeros();
                     left &= left.wrapping_sub(1);
                 }
             }
             cursor = cursor.add(total);
-            at = at.add(64);
             base = _mm256_add_epi32(base, _mm256_set1_epi32(64));
         }
-        *odd = odd_so_far;
         cursor.offset_from(out.as_ptr()) as usize
     }
 }
 
 /// Parses the records in the first `len` bytes of `text`, adding each to its country's row.
-fn parse_records(text: &[u8], len: usize, rows: &mut Rows) {
+fn parse_records(text: &[u8], len: usize, rows: &mut [Row; 256]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at.
     let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
@@ -399,16 +384,12 @@ fn parse_records(text: &[u8], len: usize, rows: &mut Rows) {
         count += separators(text, scan, blocks, &mut listed[count..], &mut odd_so_far);
         scan += blocks * 64;
         if scan >= len {
-            // The last block can run on into the next segment.
+            // The last block can run on into the next segment. The file's last record always has its
+            // terminator (spec section 2.2), so every record's positions are listed.
             count = listed[..count].partition_point(|&at| at as usize <= len);
-            // The final record may have no terminator (spec section 2.1).
-            if count % 5 == 0 {
-                listed[count] = len as u32 + 1;
-                count += 1;
-            }
         }
         let records = (count - 1) / 5;
-        add_records(text, &listed[..=records * 5], &mut found, rows);
+        add_records(text, &listed[..records * 5], &mut found, rows);
         // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
         // copy moves them, where a call to copy just the right number would cost more.
         listed.copy_within(records * 5..records * 5 + 8, 0);
@@ -416,19 +397,14 @@ fn parse_records(text: &[u8], len: usize, rows: &mut Rows) {
     }
 }
 
-/// Adds up a chunk of whole records from `text`, given where they start and the positions just past
-/// each one's five separators. `found` is room for each record's guessed slot, cents, and id and region
-/// together.
-fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows: &mut Rows) {
-    let records = listed.len() / 5;
-    let positions = |record: usize| {
-        // SAFETY: the caller passes `records * 5 + 1` positions.
-        let six = unsafe { listed.as_ptr().add(record * 5).cast::<[u32; 6]>() };
-        unsafe { six.read_unaligned() }.map(|position| position as usize)
-    };
+/// Adds up a chunk of whole records from `text`, given five positions for each: where it starts, and
+/// just past its first four separators. `found` is room for each record's guessed slot, cents, and id
+/// and region together.
+fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows: &mut [Row; 256]) {
+    let (records, _) = listed.as_chunks::<5>();
     let (words, regions) = (MEMORY.words.as_ptr(), MEMORY.regions.as_ptr());
-    for record in 0..records {
-        let [mut start, name_at, note_at, region_at, amount_at, _] = positions(record);
+    for (positions, slot) in records.iter().zip(found.iter_mut()) {
+        let [mut start, name_at, note_at, region_at, amount_at] = positions.map(|at| at as usize);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
         // loads. `region` stays inside the join table, and `home` 32 below the end of the tags.
         // Prefetching has no effect on memory.
@@ -459,12 +435,11 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
-            *found.get_unchecked_mut(record) = (guess as u32, cents as u32, id_region);
+            *slot = (guess as u32, cents as u32, id_region);
         }
     }
-    for record in 0..records {
-        let [_, name_at, note_at, region_at, ..] = positions(record);
-        let (guess, cents, id_region) = found[record];
+    for (positions, &(guess, cents, id_region)) in records.iter().zip(found.iter()) {
+        let [_, name_at, note_at, region_at, _] = positions.map(|at| at as usize);
         // SAFETY: the first pass kept the region inside the table, and its writes all came before.
         let country = unsafe { regions.add((id_region >> 32) as usize).cast::<u8>().read() };
         let row = &mut rows[usize::from(country)].0;
@@ -485,9 +460,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
             (below(name), below(both))
         } else {
-            let count = |field: &[u8]| field.iter().filter(|&&c| c == b'"').count();
-            let tail = &text[name_at..name_at + both];
-            (count(&tail[..name]), count(tail))
+            let count = |to: usize| text[name_at..][..to].iter().filter(|&&c| c == b'"').count();
+            (count(name), count(both))
         };
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
@@ -517,16 +491,26 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
 
 /// Runs a closure, from a new thread's start.
 unsafe extern "C" fn start(work: *mut u8) -> *mut u8 {
-    // SAFETY: `aggregate` passes a closure that outlives the thread.
+    // SAFETY: `main` passes a closure that outlives the thread.
     unsafe { (*work.cast::<&(dyn Fn() + Sync)>())() };
     null_mut()
 }
 
-/// Parses the whole file on `threads` threads and merges their rows. Returns every index's row, index 0
-/// being `_UNMATCHED`.
-/// The threads share the regions too, and all of those are done before any record is parsed. Tying
-/// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-fn aggregate(records: &[u8], lookup: &'static [u8], threads: usize) -> Rows {
+/// C's entry point, not std's: std's would read `/proc/self/maps` and install handlers first, none of
+/// which this program needs, and the timer counts all of it.
+#[unsafe(no_mangle)]
+extern "C" fn main() -> i32 {
+    let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
+    // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
+    // box's 12 threads.
+    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
+    let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
+    let open = |name: &str| map(&File::open(arg(1, "/data") + "/" + name + ".csv").unwrap());
+    let (records, lookup) = (open("records"), open("regions"));
+
+    // The threads parse the whole file and merge their rows, every index's row, index 0 being
+    // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
+    // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
     let (base, huge) = (MEMORY.words.as_ptr().cast::<u8>(), 1 << 21);
     let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
     // SAFETY: both are only advice about pages of `MEMORY`, and a range past its end has no effect.
@@ -573,29 +557,14 @@ fn aggregate(records: &[u8], lookup: &'static [u8], threads: usize) -> Rows {
         work();
         ids.iter().for_each(|&id| _ = pthread_join(id, null_mut()));
     }
-    totals.into_inner().unwrap()
-}
-
-/// C's entry point, not std's: std's would read `/proc/self/maps` and install handlers first, none of
-/// which this program needs, and the timer counts all of it.
-#[unsafe(no_mangle)]
-extern "C" fn main() -> i32 {
-    let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
-    let (data_dir, out_dir) = (arg(1, "/data"), arg(2, "/out"));
-    // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
-    // box's 12 threads.
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
-    let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let open = |name| map(&File::open(format!("{data_dir}/{name}.csv")).unwrap());
-    let totals = aggregate(open("records"), open("regions"), threads);
+    let totals = totals.into_inner().unwrap();
     let codes = &LOCKED.lock().unwrap().0;
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
-    let mut lines: Vec<_> = codes.iter().copied().zip(&totals[1..]).collect();
-    lines.sort_by_key(|&(key, _)| key);
-    lines.push(("_UNMATCHED", &totals[0]));
-    let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt")).unwrap());
+    let keys = ["_UNMATCHED"].iter().chain(codes).copied();
+    let lines: std::collections::BTreeMap<_, _> = keys.zip(&totals).collect();
+    let mut out = BufWriter::new(File::create(arg(2, "/out") + "/aggregates.txt").unwrap());
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
         write!(out, "{key} {} {}", row[0], row[2]).unwrap();
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,

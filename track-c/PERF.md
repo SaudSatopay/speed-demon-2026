@@ -176,6 +176,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 140 | exp: tags16-h105k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 | 141 | exp: tags16-h110k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 | 142 | exp: 16 bit tags at 115000 homes, the best measured source, for handover | Median K 46.25 against 45.95 at 110000 and 45.81 at 105000 | pending | — | — | — |
+| 143 | c-c3: 28 lines cut, empty-name hash fix | S 383 to about 355 | pending | — | — | — |
 
 ## Decision log
 
@@ -463,6 +464,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D141.** Median of three decides against 46.25
 
 **D142.** Fuller tables rejected. S about 355 builds still to sample
+
+**D143.** exp: judged over 3 samples against c-t16 46.25
 
 ## What didn't work
 

@@ -6,7 +6,7 @@
 
 ## Where it loses
 
-- S is 927 code lines against the reference's 91, which costs (91/927)^0.15, K x 0.71, about 7.3 speed points. It's the most code of any of our tracks.
+- S is 1,015 code lines against the reference's 91, which costs (91/1015)^0.15, K x 0.70, about 7.9 speed points. It's the most code of any of our tracks.
 - The scan scales 4.6x on six local cores, and 6.55x on 12 threads, and we haven't found what's shared that limits it.
 - Reading a posting list walks a chain, which is slower than reading an array.
 - Printing keeps an order: threads claim batches, and each waits for the batch before it to reach the file. On an idle box that's flat against printing at known offsets, but a busy box stalls it (D26).
@@ -16,10 +16,10 @@
 | Run twice | Run | T (s) | Phase's wall time |
 |---|---|---|---|
 | The scan | `run-804bf7c7f1a1` | 0.1761 | about 77 ms |
-| Parsing the queries and planning | `run-526859a8c142` | 0.1206 | about 21 ms, 7 to 13 locally |
-| Answering and printing | `run-7baf964cdb45` | 0.1136 | about 13 ms, 6.7 locally |
+| Parsing the queries and planning | `run-526859a8c142` | 0.1206 | about 22 ms, 7 to 13 locally |
+| Answering and printing | `run-7baf964cdb45` | 0.1136 | about 15 ms, 6.7 locally |
 
-These sum to 112 ms, more than T, so they overstate: a phase run twice finds its memory already faulted and its caches colder.
+These runs timed the build before one round of threads, with T of about 0.099 as the baseline, so the rows are 77, 22 and 15 ms. They sum to 114 ms, more than T, so they overstate: a phase run a second time finds the caches full of other data.
 
 ## Where the reference spends its time
 
@@ -58,9 +58,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 24 | Back to the build before the measurements | The measurements of B's phases are done | run-b1e785532ecd | 0.1036 | 41.2 | 77.8 |
 | 25 | Answers printed at known offsets with no ordered handoffs, chained OR and NOT applied directly, ranges that shrink toward the end | Parse, plan and answers are likely 25 to 30 ms of T on the box, about twice their local time, and the print phase's 196 ordered write-and-yield steps stall on anything else running | run-3e06bf691391 | 0.1028 | 41.5 | 77.8 |
 | 26 | Back to ordered printing, without the page mapping ahead | Known offsets, direct OR and NOT, and shrinking ranges read T 0.1028 and 0.1008 at S 954, against a median of 0.1006 at S 928 | run-f39141d33527 | 0.0983 | 41.6 | 78.4 |
-| 27 | Terms found without their set's lock, one round of threads for the scan and the answers, larger print batches | Serial costs on the box are about twice local, and another ello reached T 0.077 at S 949, so there's more to find than instructions per token | pending | — | — | — |
-| 28 | exp: each thread gives back a range's pages when it has scanned it | The kernel's unmap at exit is serial, about 62K pages' mapping counts and references, cold by then, and T counts up to exit; on A, mapping lost to reading by 3.3 ms though reading copies every byte | pending | — | — | — |
-| 29 | Fifty-seven fewer lines outside the scan, `main` as the C entry point, and each range's pages left alone | Cause Of Death passed us on B at T 0.100 and S 823, so S is the cheap gain here: 100 lines is K +1.5% | pending | — | — | — |
+| 27 | Terms found without their set's lock, one round of threads for the scan and the answers, larger print batches | Serial costs on the box are about twice local, and another ello reached T 0.077 at S 949, so there's more to find than instructions per token | run-b5173908b9b3 | 0.0988 | 42.5 | 78.3 |
+| 28 | exp: each thread gives back a range's pages when it has scanned it | The kernel's unmap at exit is serial, about 62K pages' mapping counts and references, cold by then, and T counts up to exit; on A, mapping lost to reading by 3.3 ms though reading copies every byte | run-cddb558fe995 | 0.1030 | 40.8 | 77.8 |
+| 29 | Fifty-seven fewer lines outside the scan, `main` as the C entry point, and each range's pages left alone | Cause Of Death passed us on B at T 0.100 and S 823, so S is the cheap gain here: 100 lines is K +1.5% | run-d2958120f77f | 0.1100 | 41.9 | 77.3 |
+| 30 | The same machine code with named structs instead of tuples, named constants, and every comment checked against the code | A reader had to remember what `.0` and `.1` held across a dozen record types, and some comments no longer told the truth | pending | — | — | — |
 
 ## Decision log
 
@@ -108,9 +109,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D22.** Measurement only: plain page faults, no MADV_POPULATE_READ. T 0.1008, flat, for 3 fewer lines, so it goes (D27).
 
-**D23.** Measurement only: parsing the queries and planning twice. T 0.1206, so they take about 21 ms on the box, against 7 to 13 locally.
+**D23.** Measurement only: parsing the queries and planning twice. T 0.1206, so they take about 22 ms on the box, against 7 to 13 locally.
 
-**D24.** Measurement only: answering and printing twice. T 0.1136, so they take about 13 ms on the box, against 6.7 locally.
+**D24.** Measurement only: answering and printing twice. T 0.1136, so they take about 15 ms on the box, against 6.7 locally.
 
 **D25.** Revert the experiments of D21 to D24: the measurements are done.
 
@@ -123,6 +124,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D29.** Experiment, against T 0.098 to 0.102 at S 934. Each of 192 calls stops the other threads briefly for its TLB flush, which costs more here in a VM than on the box, so local timing can't judge this.
 
 **D30.** Cut lines with no loss of speed, in the plan and answer code; the scan isn't touched. Over alternating runs: cycles 2.359G flat, instructions +0.06%, M max 42.74 MB. `#![no_main]` skips std's setup before main, as on A. Giving back each range's pages after its scan read T 0.1030 against a median of 0.1013, so the serial unmap at exit isn't what limits B, and that goes. Also measured on B and dropped, locally: lookups in windows of tokens (flat), PGO (flat), an L1 table of hot terms (cycles +10 to 14%, as hot lines were already cached), new layouts for check_bools (cycles +2 to 3.5%), marks as bits (cycles +3%). Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
+
+**D31.** A trade: S 880 -> 1015, K x 0.979, for code someone else could change. Answer, Query, AnchorList, Tally, Check, Block, Chain, DocLists, Progress and Shared have named fields, with `repr(C)` where rustc would move a field. Layouts have the same size and offsets, by `offset_of!`, but for Query, which the scan doesn't read. Over 8 alternating rounds: instructions +0.03%, cycles +0.3%, mark and check_bools have identical machine code. M 40.9 to 43.07 MB, under the cap. Grid 43/43, threads 228/228, const-hash 38/38 and 114/114, stress 0 wrong in 300. `make_room` stays out of line, as inlining it into look_up costs +0.9% instructions. The README and this log were read against the code too, and 24 claims were corrected.
 
 ## What didn't work
 
@@ -141,18 +144,18 @@ This PC's wall time is noisy, so thread cycles from `perf stat`, which repeat to
 
 ## The final design
 
-- **Data layout.** A table of 64-byte sets of three terms, with a short key, a long key and a word for each; the unused fourth way's word is what a lookup that finds none gets, so no branch depends on it. Terms are numbered by what they need, those with bitmaps first and the commonest first, so what the scan touches most sits together. A document's marks are a byte per term. BOOL checks are a truth table with three or five term numbers. Postings of the rare queries' terms are chains of 32-byte blocks with 12 offsets of 2 bytes each. All heap comes from one region grown 64 MB at a time, so huge pages replace thousands of small faults.
-- **I/O.** Both files are mapped read-only, with zero padding so that block loads can run past the end. Output is written in batches of 256 queries, in order.
-- **Parallelism.** Threads claim ranges of 1/192 of the corpus in order, each rounded to 64 documents, so no two threads write the same bitmap word and each thread's postings ascend. Each thread keeps its counts and sums; summing them per answer after the scan is deterministic. The ten smallest ids of an answer sit behind a lock that only a thread's first ten hits per answer can reach.
-- **The hot loop.** Per document: `token_edges` lists where tokens start and end, from 64-byte masks and a table per byte. `look_up` takes four tokens at a time: their keys and hashes in AVX2, a prefetch of each set, then in a second pass one vector compare per set and lists of what to do, kept with no branch by a table per mask. `mark` writes a byte per term and lists each term's first occurrence. `set_row` takes 64 marks to a bit each, and 64 documents' rows are transposed into bitmap words. `check_bools` runs the short checks in one loop, as a loop per anchor mispredicts its exit. About 98 instructions per token, at IPC 1.6 per thread.
+- **Data layout.** A table of 64-byte sets of three terms, with a short key, a long key and a word for each; the unused fourth way's word is what a lookup that finds none gets, so no branch depends on it. Terms are numbered by what they need, those with bitmaps, then those with chains, then the rest, the commonest first, so what the scan touches most sits together. A document's marks are a byte per term. BOOL checks are a truth table with three or five term numbers. Queries anchored on a common term read postings: a bitmap of N bits for each of their common terms, and for their other terms a chain per thread of 32-byte blocks with 12 offsets of 2 bytes each. All heap comes from one region grown 64 MB at a time, so huge pages replace thousands of small faults.
+- **I/O.** Both files are mapped read-only, with zero padding so that block loads can run past the end. Output is written in batches of 1,024 queries, in order.
+- **Parallelism.** Threads claim ranges of the corpus in order, each 1/16 of a thread's share (1/192 at 12 threads), rounded to 64 documents, so no two threads write the same bitmap word and each thread's postings ascend. Each thread keeps a count and sum per check; summing them after the scan is deterministic. A BOOL answer's ten smallest ids sit behind a lock that only a thread's first ten hits per check can reach, and a phrase's match takes it every time, as matches are so few.
+- **The hot loop.** Per document: `token_edges` lists where tokens start and end, from 64-byte masks and a table per byte. `look_up` takes four tokens at a time: their keys and hashes in AVX2, a prefetch of each set, then in a second pass one vector compare per set and lists of what to do, kept with no branch by a table per mask. A third pass gives the unsure words a second look, and lists where phrase anchors are. `mark` writes the byte of each term with flags or no bitmap, and lists the first occurrence of those with BOOL checks or chains; a loop in `scan_ranges` writes the rest. `set_row` takes 64 marks to a bit each. `store_rows` transposes 64 documents' rows into bitmap words. `check_bools` runs the short checks in one loop, as a loop per anchor mispredicts its exit. About 98 instructions per token, at 1.5 instructions per cycle per thread.
 
 ## How we know it's correct
 
-- Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 8 answer-preserving rewrites of the input and 4 limit cases, at 1, 2, 3, 7, 12 and 64 threads.
+- Every build is checked by SHA-256 against the naive reference on 15 generator seeds at tiny and sample, 4 answer-preserving rewrites of the input and 4 limit cases, at 1, 2, 3, 7, 12 and 64 threads, and on 5 seeds at full scale at the default thread count.
 - A constant-hash test build, where every key collides, gives the same answers.
 - Repeated runs at 2 to 14 threads, since the term table is filled by all threads at once, and races don't show on one pass: 300 runs with none wrong, before any change there goes out.
-- An adversarial review of this code found no wrong answers: 960 race runs and hostile inputs against the reference. Its only limits are outside the spec, and are listed in the [README](README.md#limits).
-- **Reproduce it yourself:** `python3 tools/verify.py` (Docker, git and Python only).
+- An adversarial review of the build before D28 found no wrong answers: 960 race runs and hostile inputs against the reference. Its only limits are outside the spec, and are listed in the [README](README.md#limits).
+- **Reproduce it yourself:** `python3 tools/verify.py --full`, at the default thread count (Docker, git and Python only).
 
 ## With another 24 hours
 

@@ -71,6 +71,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | run-9c9b12a38866 | 0.0235 | 10.4 | 80.3 |
 | 50 | Read a long name's pointer only after its slot says it's complete | A Fable review found it: the pointer and length were loaded before the Acquire, so a reader could compare against a null pointer while a writer was part way through. 2 crashes in 1,900 runs on a spec-legal stress input; the generator almost never writes such a name (over 32 bytes: about 1 seed in 100,000) | run-40b0e94343ad | 0.0227 | 10.3 | 80.7 |
 | 51 | C's entry point instead of std's | Std reads /proc/self/maps, installs handlers and allocates a signal stack before main: about 15 system calls the timer counts, and system calls cost far more on the box than locally. Finding from Track A | run-55bdb13c33fe | 0.0228 | 10.4 | 80.6 |
+| 52 | exp: one pass per record, with no list: one mask from the name's start, table work a record behind | A Fable agent's test of a leaner parser. Local: cycles level, instructions 295 -> 264, S 493 -> 512, and its stall analysis says the box's larger reorder buffer should favour it | pending | — | — | — |
 
 ## Decision log
 
@@ -176,6 +177,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D50. Acquire first. 0 crashes in 2,100 runs on the same input, hot path untouched, S +2. The same review found no wrong output in about 940 comparisons against the reference and 7,300 repeat runs.
 
 **D51.** Take it, S +6: about 0.15 ms, too small to show in one sample.
+
+**D52.** Test: keep only if K clearly beats 41 over samples.
 
 ## What didn't work
 

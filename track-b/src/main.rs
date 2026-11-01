@@ -41,7 +41,7 @@
 
 #![no_main]
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::Mutex;
 use std::{arch::x86_64::*, fs::File, io::Write, mem::zeroed, os::fd::AsRawFd, thread};
 
@@ -87,7 +87,6 @@ unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
     fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
-    fn sbrk(by: isize) -> *mut u8;
 }
 
 /// Maps a file of this directory read-only for the life of the process, followed by `PADDING` readable
@@ -285,12 +284,17 @@ impl TermSet {
     }
 }
 
+/// Where a token goes that the filter says is no term, so that it doesn't take a line of the table from the
+/// cache. A quarter of the tokens are such, and they cause most of the table's misses.
+static NO_TERM: TermSet = TermSet { shorts: [0; 4], rest: [0; 8] };
+
 /// Query terms to dense ids, by open addressing with linear probing over sets. A hit always compares
 /// the whole token: for a term longer than the keys' 12 bytes, the long key says where it is in the query
 /// file, and its top bit is set.
 #[derive(Default)]
 struct TermTable<'a> {
     sets: Vec<TermSet>, // The length is a power of two.
+    filter: Vec<AtomicU16>, // For each set, a bit for each of 16 hashes among those that start at it: any term's?
     text: &'a [u8],     // Where the terms come from.
     count: usize,       // How many term numbers there are.
 }
@@ -382,6 +386,8 @@ impl TermTable<'_> {
                         let more = UNSURE | (way as u32 + 1) << WAY_SHIFT;
                         set.rest[way] = term | u32::from(has_more) * more;
                         AtomicU64::from_ptr(&raw mut set.shorts[way]).store(short, Release);
+                        let bit = (hash as usize >> (28 - self.sets.len().trailing_zeros())) & 15;
+                        self.filter[top & (self.sets.len() - 1)].fetch_or(1 << bit, Relaxed);
                     }
                 }
                 // A lookup that finds nothing in a set this term has passed has to look further.
@@ -403,6 +409,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
     // the memory peak counts.
     // SAFETY: zeros are a valid TermSet.
     (plan.terms.text, plan.terms.sets) = (text, (0..sets).map(|_| unsafe { zeroed() }).collect());
+    plan.terms.filter = (0..sets).map(|_| AtomicU16::new(0)).collect();
     let (next_part, next_term) = (AtomicUsize::new(0), AtomicUsize::new(FIRST_TERM));
     let mut parts = on_threads(threads, || {
         let part = claim(&next_part, text.len() / threads + 1, text.len()).unwrap_or_default();
@@ -945,6 +952,7 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
     // A set is 64 bytes, so these take a hash to a set's distance from the first.
     let shift = 32 - 6 - terms.sets.len().trailing_zeros() as i32;
     let distances = (terms.sets.len() as i64 - 1) << 6;
+    let (filter, no_term) = (&terms.filter[..], std::ptr::from_ref(&NO_TERM) as u64);
     // First pass: each token's key, and its set's address, prefetched, as far as the next pass reads.
     for at in (0..count.next_multiple_of(2 * LANES)).step_by(LANES) {
         // SAFETY: `edges` has eight pairs more than there are tokens, each at or before a token's start,
@@ -968,13 +976,22 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             let lower = _mm256_or_si256(bytes, _mm256_set1_epi8(CASE_BITS as i8));
             let more = _mm256_slli_epi64(_mm256_cmpgt_epi32(lens, _mm256_set1_epi64x(8)), 63);
             let key = _mm256_or_si256(_mm256_and_si256(held, lower), more);
-            let distance = _mm256_srl_epi64(hashes(key), _mm_cvtsi32_si128(shift));
+            let hash = hashes(key);
+            let distance = _mm256_srl_epi64(hash, _mm_cvtsi32_si128(shift));
             let distance = _mm256_and_si256(distance, _mm256_set1_epi64x(distances));
             let place = _mm256_add_epi64(distance, _mm256_set1_epi64x(sets));
             _mm256_storeu_si256(keys.as_mut_ptr().add(at).cast(), key);
             _mm256_storeu_si256(places.as_mut_ptr().add(at).cast(), place);
+            // A 1 in the filter's bit keeps the place, and a 0 gives `NO_TERM`.
+            let bits = _mm256_srl_epi64(hash, _mm_cvtsi32_si128(shift + 2));
+            let bits = _mm256_and_si256(bits, _mm256_set1_epi64x((distances >> 2) | 15));
+            let bits = std::mem::transmute::<__m256i, [u64; LANES]>(bits);
             for i in 0..LANES {
-                _mm_prefetch(*places.get_unchecked(at + i) as *const i8, _MM_HINT_T0);
+                let word = filter.get_unchecked(bits[i] as usize >> 4).load(Relaxed);
+                let keep = (u64::from(word) >> (bits[i] & 15) & 1).wrapping_neg();
+                let place = places.get_unchecked_mut(at + i);
+                *place = no_term ^ ((*place ^ no_term) & keep);
+                _mm_prefetch(*place as *const i8, _MM_HINT_T0);
             }
         }
     }
@@ -1463,10 +1480,6 @@ pub extern "C" fn main() -> i32 {
     // All of the heap comes from one contiguous region, grown a lot at a time, so that the kernel can
     // back it with huge pages, in far fewer page faults than threads' arenas and small mappings take.
     // These are M_ARENA_MAX (1), M_MMAP_THRESHOLD (1 GiB) and M_TOP_PAD (64 MiB).
-    // It starts at a huge page, or the part before the heap's first 2 MiB boundary, a random distance on,
-    // gets small pages, and the term table sits there.
-    // SAFETY: nothing has allocated yet, and malloc takes the break as it finds it.
-    unsafe { sbrk((sbrk(0) as usize).next_multiple_of(1 << 21) as isize - sbrk(0) as isize) };
     let (arenas, mmap_above, top_pad) = (-8, -3, -2);
     for (param, value) in [(arenas, 1), (mmap_above, 1 << 30), (top_pad, 1 << 26)] {
         // SAFETY: no thread has started, and these only tune the allocator.

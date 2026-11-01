@@ -87,6 +87,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 51 | exp: short checks filtered into a list before any write to hits, and group collects its items once | About half of 8.9M short checks are false, and each still wrote its hit word. Local: instructions -1.58%, cycles -2.9 to -4.7%, misses -3.4%, S -8 at first measure. group's second pass over its items was serial work in the plan | run-d5eeb62467e4 | 0.0751 | 28.1 | K median 41.59 over 3 runs: kept |
 | 52 | A term's own tally becomes an always-true check, dropping the separate add in check_bools | S -2 net, misses -6.75% locally, instructions +1% | pending | — | — | — |
 | 53 | Back to the kept source, cb's K 40.81 lost, plus the heap starting at a 2 MiB boundary | Up to 2 MiB of the heap, with the term table, otherwise gets small pages by a random amount per run | pending | — | — | — |
+| 54 | Back to the kept source, the aligned heap tied at 41.59, plus a filter of 16 bits per set that sends tokens of no query to an empty set | A quarter of tokens are in no query and simulate as 70% of the table's L2 misses; 128 KB is memory that scores nothing | pending | — | — | — |
 
 ## Decision log
 
@@ -197,6 +198,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D53.** Judged on the board by median K over 3 against the current source
 
 **D54.** Judged on the board by median K over 3 or more against 41.59
+
+**D55.** Local cycles +15%, so the board decides, by median K against 41.59
 
 ## What didn't work
 

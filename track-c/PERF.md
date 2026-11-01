@@ -189,6 +189,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 153 | c-pack2 sample 2 | second sample | pending | — | — | — |
 | 154 | c64f sample 2 | second sample | pending | — | — | — |
 | 155 | c64f sample 3 | third sample | pending | — | — | — |
+| 156 | c-f40 table freed before output, sample 1 | local peak steady at 9.44 MB, worst of 5 sets M | pending | — | — | — |
 
 ## Decision log
 
@@ -502,6 +503,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D154.** exp: judged over 3 samples against c-c3
 
 **D155.** exp: judged over 3 samples against c64f 46.87
+
+**D156.** exp: judged over 3 samples against c64f 46.87
 
 ## What didn't work
 

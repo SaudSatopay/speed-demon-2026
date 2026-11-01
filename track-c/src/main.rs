@@ -556,13 +556,16 @@ extern "C" fn main() -> i32 {
         work();
         ids.iter().for_each(|&id| _ = pthread_join(id, null_mut()));
     }
-    let totals = totals.into_inner().unwrap();
+    let totals = totals.lock().unwrap();
     let codes = &LOCKED.lock().unwrap().0;
+    // SAFETY: nothing reads the table again. The output can charge a new batch to this CPU, if the
+    // scheduler has moved this thread: now that can't set the peak. 4 is `MADV_DONTNEED`.
+    unsafe { madvise(base, huge, 4) };
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
     let keys = ["_UNMATCHED"].iter().chain(codes).copied();
-    let lines: std::collections::BTreeMap<_, _> = keys.zip(&totals).collect();
+    let lines: std::collections::BTreeMap<_, _> = keys.zip(totals.iter()).collect();
     let mut out = BufWriter::new(File::create(arg(2, "/out") + "/aggregates.txt").unwrap());
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
         write!(out, "{key} {} {}", row[0], row[2]).unwrap();

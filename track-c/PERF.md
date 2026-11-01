@@ -178,6 +178,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 142 | exp: 16 bit tags at 115000 homes, the best measured source, for handover | Median K 46.25 against 45.95 at 110000 and 45.81 at 105000 | pending | — | — | — |
 | 143 | c-c3: 28 lines cut, empty-name hash fix | S 383 to about 355 | pending | — | — | — |
 | 144 | c-c4 parts shrink geometrically, 8 per thread, sample 1 | less idle at the end | pending | — | — | — |
+| 145 | c-c3 sample 2 | second sample | pending | — | — | — |
 
 ## Decision log
 
@@ -469,6 +470,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D143.** exp: judged over 3 samples against c-t16 46.25
 
 **D144.** exp: judged over 3 samples each, c-c3 against c-c4
+
+**D145.** exp: judged over 3 samples each, c-c3 against c-c4
 
 ## What didn't work
 

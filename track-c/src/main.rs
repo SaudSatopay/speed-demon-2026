@@ -60,8 +60,7 @@ fn map(file: &File) -> &'static [u8] {
 }
 
 /// Claims the next part of `parts` of a mapped file from the counter `job`, and returns where it starts
-/// and ends, or nothing if none is left. Each part takes the same share of what's left, so they shrink:
-/// large ones need few system calls, and small ones at the end leave no thread long alone. Parts end at line boundaries: just past
+/// and ends, or nothing if none is left. Parts end at line boundaries: just past
 /// the next `terminator`, or at the end of the file. In the records, a CR can only be the first byte
 /// of a CRLF terminator (spec section 2.2), so it's never inside quotes, and about half the records
 /// end in one, so it's never far. A file without one simply doesn't get split. The first boundary in
@@ -70,8 +69,7 @@ fn part(text: &[u8], job: &AtomicUsize, parts: usize, terminator: &[u8]) -> Opti
     let at = job.fetch_add(1, Relaxed);
     let bytes = text.len() - PADDING;
     let cut = |at: usize| {
-        let left = |at| (1.0 - 6.0 / parts as f64).powi(at as i32);
-        let from = (bytes as f64 * (1.0 - left(at)) / (1.0 - left(parts))) as usize;
+        let from = (at * bytes.div_ceil(parts)).min(bytes);
         let found = text[from..bytes].iter().position(|&c| c == terminator[0]);
         found.map_or(bytes, |to| from + to + terminator.len())
     };
@@ -534,8 +532,9 @@ extern "C" fn main() -> i32 {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        // Each segment costs two small reads and a short piece: not too many.
-        while let Some((pos, end)) = part(records, &segments, threads * 8, b"\r\n") {
+        // Three segments per thread: when they run out, each thread still has its last to finish, and
+        // the threads done first sit idle. Each costs two small reads and a short piece: not too many.
+        while let Some((pos, end)) = part(records, &segments, threads * 3, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
             let (from, to) = (pos & !4095, end & !4095); // Whole pages.
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.

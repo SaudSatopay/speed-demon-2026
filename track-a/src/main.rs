@@ -602,8 +602,12 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             unsafe { madvise(page, RELEASE.min(end - at), MADV_DONTNEED) };
         }
     };
-    // The scope joins them all.
-    thread::scope(|scope| (0..threads).for_each(|me| drop(scope.spawn(move || worker(me)))));
+    // This thread is one of them, so that no more threads than CPUs ever want to run: one that starts
+    // on a busy CPU can wait there for a whole tick, and then it holds every hour up.
+    thread::scope(|scope| {
+        (1..threads).for_each(|me| drop(scope.spawn(move || worker(me))));
+        worker(0);
+    });
     append(&hours, &next_out, &file);
     table.claimed.load(Relaxed) == HOURS
 }

@@ -1,24 +1,24 @@
 //! Track B (Index): boolean and phrase queries over a 254 MB corpus.
 //!
-//! One scan of the corpus answers most queries as it goes, so their postings are never stored. The
-//! threads share every phase but the plan's decisions, which take one thread. In order:
+//! One scan of the corpus answers every query as it goes, so no postings are ever stored. The threads
+//! share every phase but the plan's decisions, which take one thread. In order:
 //!
 //! 1. **Parse** (`parse_queries`). The queries are read first, into one table of their terms, so that
 //!    only those terms are ever looked up.
 //! 2. **Plan** (`make_plan`). A sample of about 1% of the corpus says which terms are common. Every
 //!    document matching a BOOL query contains one of a few anchor terms (the rarest AND of its last
-//!    run, or its OR terms), and for nine queries in ten the anchors are rare, so the query is answered
-//!    during the scan: at each anchor's first occurrence in a document, the marks of what the document
-//!    holds index a truth table, and the query needs no postings. Only queries anchored on a common
-//!    term read postings afterwards: bitmaps for their common terms, set during the scan, and chains
-//!    of 2-byte offsets for their other terms. A phrase is anchored on its rarest term.
+//!    run, or its OR terms). For nine queries in ten the anchors are rare: at each anchor's first
+//!    occurrence in a document, the marks of what the document holds index a truth table. A query whose
+//!    anchors are common goes by blocks instead: each thread keeps a bit per document of a block for each
+//!    term of such queries, and runs them in vectors when the block is full. A phrase is anchored on its
+//!    rarest term.
 //! 3. **Scan** (`scan_ranges`). Threads claim ranges of the corpus in order and take a document at a
 //!    time, in stages without a branch per token: `token_edges` finds the tokens, `look_up` finds their
-//!    terms, `mark` marks them, and the later stages act on what those listed: `store_rows` fills the
-//!    bitmaps, `extend_chains` the chains, `check_phrases` tries each phrase around its anchor's
-//!    occurrences once the document's tokens are known, and `check_bools` runs the truth tables.
-//! 4. **Answer** (`scan_and_answer`). Threads add up what they counted, answer the queries that read
-//!    postings (`run_steps`, `answer_of`), and print all the answers in order.
+//!    terms, `mark` marks them, and the later stages act on what those listed: `check_phrases` tries each
+//!    phrase around its anchor's occurrences once the document's tokens are known, `check_bools` runs
+//!    the truth tables, and `store_rows` and `answer_block` fill the columns and run the block queries.
+//! 4. **Answer** (`scan_and_answer`). Threads add up what they counted, and print all the answers in
+//!    order.
 //!
 //! The words used throughout:
 //!
@@ -32,8 +32,9 @@
 //! - A *check* is a BOOL query's truth table at one of its anchors.
 //! - An *answer* is what a query's line prints. A *tally* is where each thread adds up the documents
 //!   for one check, or for one term alone, before they go into an answer.
-//! - A *chain* is one thread's posting list of a term, as linked blocks of offsets.
-//! - A *row* is one document's marks of terms with bitmaps, as bits.
+//! - A *block* is up to 256 documents in a row, which one thread takes together.
+//! - A *column* is a term's bits over a block: which of its documents hold the term.
+//! - A *row* is one document's marks of the commonest terms, as bits, which become their columns.
 
 #![no_main]
 
@@ -43,8 +44,8 @@ use std::{arch::x86_64::*, fs::File, io::Write, mem::zeroed, os::fd::AsRawFd, th
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
 /// table doesn't depend on a slot that no term took, so this term also fills the unused slots of a
-/// BOOL check, whatever its mark says. Real terms start here: those with bitmaps first, then those with
-/// chains, then the rest.
+/// BOOL check, whatever its mark says. Real terms start here: those with rows first, then the others with
+/// columns, then the rest.
 const FIRST_TERM: usize = 1;
 /// The low bits of a term table's word are its term's number...
 const TERM_BITS: u32 = (1 << 24) - 1;
@@ -55,8 +56,8 @@ const UNSURE: u32 = 1 << 31;
 const PHRASE_ANCHOR: u32 = 1 << 30;
 /// ...and its BOOL queries are checked for each document that contains it...
 const BOOL_ANCHOR: u32 = 1 << 29;
-/// ...and its chain gets each document that contains it.
-const CHAINED: u32 = 1 << 28;
+/// ...and its column gets each document that holds it, one bit at a time.
+const SPARSE: u32 = 1 << 28;
 /// A step of a query is a term's number with its operator in the top bits. OR is 0, as it is for the
 /// first term: starting from the empty set, "OR t1" gives S(t1). A phrase's steps have no operator.
 const AND: u32 = 1 << 30;
@@ -281,7 +282,7 @@ struct TermTable<'a> {
     sets: Vec<TermSet>, // The length is a power of two.
     text: &'a [u8],     // Where the terms come from.
     count: usize,       // How many term numbers there are.
-    plain_top: i32,     // Terms up to this have bitmaps.
+    plain_top: i32,     // Terms up to this have rows.
 }
 
 impl TermTable<'_> {
@@ -428,30 +429,22 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
 /// `look_up` takes this many tokens at a time.
 const LANES: usize = 4;
 
-/// Visits the documents of the range `start..end` of the corpus, passing each one's id, its text and what
-/// follows, and its tokens' edges in that, then `LANES` empty pairs of edges, so that `look_up` can read
-/// that many pairs at a time. The range is rounded to whole words of 64 documents: it starts at its first
-/// document whose id is a multiple of 64 and runs to the next range's, so threads never share a bitmap
-/// word.
+/// Visits the documents that start in the range `start..end` of the corpus, passing each one's id, its text
+/// and what follows, and its tokens' edges in that, then `LANES` empty pairs of edges, so that `look_up` can
+/// read that many pairs at a time.
 fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32, &[u8], &[u32])) {
     let mut line = start;
-    while line > 0 && docs[line - 1] != b'\n' {
+    while line > 0 && line < end && docs[line - 1] != b'\n' {
         line += 1;
     }
-    let (mut aligned, mut edges) = (false, Vec::new());
-    while line < docs.len() {
+    let mut edges = Vec::new();
+    while line < end {
         // The id is the line's first token.
         let next = token_edges(docs, line, &mut edges) + 1;
         let digits = docs[line..line + edges[1] as usize].iter();
         let id = digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
-        if id % 64 == 0 && line >= end {
-            return;
-        }
-        aligned |= id % 64 == 0;
         edges.extend([0; 2 * LANES]);
-        if aligned {
-            visit(id, &docs[line..], &edges[2..]);
-        }
+        visit(id, &docs[line..], &edges[2..]);
         line = next;
     }
 }
@@ -589,17 +582,15 @@ struct Plan<'a> {
     terms: TermTable<'a>,
     queries: Vec<Query>,
     steps: Vec<u32>,        // All the queries' steps, one query after another.
-    bitmap_count: usize,    // How many terms have bitmaps...
-    chain_count: usize,     // ...and how many have chains.
-    last_doc: u32,          // The last document's id.
-    bitmap_words: usize,    // A bitmap's length.
-    bitmaps: Vec<u64>,      // One bitmap after another, in the order of the terms.
+    rowed_count: usize,     // How many terms have rows...
+    sparse_count: usize,    // ...and how many have columns without them.
     phrase_start: Vec<u32>, // A term's phrases are `phrases[phrase_start[t]..phrase_start[t + 1]]`...
     phrases: Vec<u32>, // ...each its query, the anchor's position in it, its length, its terms.
     anchor_lists: Vec<AnchorList>,
     short_checks: Vec<Check<3>>,
     long_checks: Vec<Check<5>>,
-    posting_queries: Vec<u32>, // The queries anchored on a common term.
+    block_steps: Vec<Vec<u32>>, // The steps of the queries that go by blocks, by how many steps they have.
+    block_queries: usize,       // How many there are. Their tallies are the last.
     shared_answer: Vec<u32>, // For each query, the answer of the term's tally that adds to it, or NONE.
     // The answers: the queries', in order, then one for each term with a tally, then a spare.
     answers: Vec<Mutex<Answer>>,
@@ -629,7 +620,7 @@ fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
 
 /// How many times each term occurs, among pieces of the corpus 2 MiB in all, about 1%, and in place of
 /// term 0, which is no real term, about how many documents those pieces have. A term's occurrences stand
-/// in for the documents holding it: this only guides the plan's choices. No term has a bitmap yet, so
+/// in for the documents holding it: this only guides the plan's choices. No term has a row yet, so
 /// `look_up` lists every term it finds in `marks`.
 fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> Vec<u32> {
     let df: Vec<AtomicU32> = (0..terms.count).map(|_| AtomicU32::new(0)).collect();
@@ -649,26 +640,26 @@ fn sample_terms(docs: &[u8], terms: &TermTable, threads: usize) -> Vec<u32> {
 }
 
 /// How a term is stored, in the order of the numbers terms get.
-const BITMAP: usize = 0;
-const CHAIN: usize = 1;
+const ROWED: usize = 0;
+const COLUMN_ONLY: usize = 1;
 const NEITHER: usize = 2;
 /// How far the sample's counts tell the terms with neither apart, when numbering them.
 const DF_CAP: u32 = 255;
 
-/// Numbers the terms: those with bitmaps, then those with chains, then the rest, the commonest first
+/// Numbers the terms: those with rows, then the others with columns, then the rest, the commonest first
 /// so that what the scan touches most sits together. Puts the numbers in the term table and the steps,
 /// and returns them.
 fn number_terms(plan: &mut Plan, df: &[u32], store_of: &[usize], flags: &mut [u32]) -> Vec<u32> {
-    // One bucket for bitmaps, one for chains, and for the rest one per count, the largest first.
+    // One bucket for rows, one for the other columns, and for the rest one per count, the largest first.
     let rank = |t: usize| (DF_CAP - df[t].min(DF_CAP)) as usize;
     let bucket = |t: usize| store_of[t] + store_of[t] / NEITHER * rank(t);
     let keyed = (FIRST_TERM..df.len()).map(|t| (bucket(t) as u32, t));
     let (start, ordered) = group(NEITHER + DF_CAP as usize + 1, keyed);
-    (plan.bitmap_count, plan.chain_count) = (start[1] as usize, (start[2] - start[1]) as usize);
+    (plan.rowed_count, plan.sparse_count) = (start[1] as usize, (start[2] - start[1]) as usize);
     let mut new_number = vec![0; df.len()];
     for (at, &term) in ordered.iter().enumerate() {
         new_number[term] = (FIRST_TERM + at) as u32;
-        flags[term] |= new_number[term] | (u32::from(store_of[term] == CHAIN) * CHAINED);
+        flags[term] |= new_number[term] | (u32::from(store_of[term] == COLUMN_ONLY) * SPARSE);
     }
     // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
     for word in plan.terms.sets.iter_mut().flat_map(|set| &mut set.words) {
@@ -677,7 +668,7 @@ fn number_terms(plan: &mut Plan, df: &[u32], store_of: &[usize], flags: &mut [u3
     for step in &mut plan.steps {
         *step = (*step & !TERM_BITS) | new_number[(*step & TERM_BITS) as usize];
     }
-    plan.terms.plain_top = (FIRST_TERM + plan.bitmap_count) as i32 - 1;
+    plan.terms.plain_top = (FIRST_TERM + plan.rowed_count) as i32 - 1;
     new_number
 }
 
@@ -700,17 +691,21 @@ fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u
 /// check at each term's occurrences.
 fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let df = sample_terms(docs, &plan.terms, threads);
-    // A query anchored on a common term, with df above about N/24, is answered from postings: bitmaps
-    // for its common terms and chains for the others. On memory alone, a bitmap (N/8 bytes) and a
-    // chain (about 3 bytes per posting) cross near df = N/24. Any choice gives the same answers.
-    // `df[0]` is about how many documents the sample has.
-    let common = |term: u32| df[term as usize] * 24 >= df[0];
+    // A query goes by blocks if its anchors hold about N/96 documents in all, where running it on every
+    // block starts to cost less than its checks at all those documents. A term in such a query has a row
+    // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
+    // cost less than listing its first occurrence in each document that holds it. Any choice gives
+    // the same answers. `df[0]` is about how many documents the sample has.
+    let by_blocks =
+        |anchors: &[u32]| anchors.iter().map(|&t| df[t as usize]).sum::<u32>() * 96 >= df[0];
+    let rowed = |term: u32| df[term as usize] * 48 >= df[0];
     // How each term is stored, and what its word holds beyond its number.
     let (mut store_of, mut flags) = (vec![NEITHER; df.len()], vec![0; df.len()]);
     // Which of the terms' own tallies each term has, if it has one, and how many there are.
     let (mut term_tally, mut term_tallies) = (vec![NONE; df.len()], 0);
     // Each phrase and its anchor term, each check and its anchor term, and one query's anchors.
     let (mut anchored, mut checks, mut query_anchors) = (vec![], vec![], vec![]);
+    let mut block_queries = vec![];
     let query_count = plan.queries.len() as u32;
     plan.shared_answer.resize(query_count as usize, NONE);
 
@@ -727,10 +722,10 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         }
         query_anchors.clear();
         anchors(steps, &df, &mut query_anchors);
-        if query_anchors.iter().any(|&term| common(term)) {
-            plan.posting_queries.push(query);
+        if by_blocks(&query_anchors) {
+            block_queries.push(query);
             for term in steps.iter().map(|step| step & TERM_BITS) {
-                store_of[term as usize] = if common(term) { BITMAP } else { CHAIN };
+                store_of[term as usize] = if rowed(term) { ROWED } else { COLUMN_ONLY };
             }
             continue;
         }
@@ -775,9 +770,30 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     plan.short_checks = short.iter().map(narrow).collect();
     plan.long_checks = long.iter().map(|&(_, check)| check).collect();
 
-    // Then a tally for each check, for each term with one of its own, and a spare; and the answers.
+    // Then the queries that go by blocks, those of the same length together, so that the loop over a
+    // query's steps rarely mispredicts its exit. A step there holds a column's number for its term.
+    let length = |query: &u32| {
+        let Query { from, to, .. } = plan.queries[*query as usize];
+        to - from
+    };
+    let longest = block_queries.iter().map(length).max().unwrap_or(0) as usize;
+    let keyed = block_queries.iter().map(|query| (length(query), *query));
+    let (_, block_queries) = group(longest + 1, keyed);
+    plan.block_steps = vec![vec![]; longest + 1];
+    for &query in &block_queries {
+        let Query { from, to, .. } = plan.queries[query as usize];
+        let steps = plan.steps[from as usize..to as usize].iter();
+        let columns = steps.map(|step| step - FIRST_TERM as u32);
+        plan.block_steps[(to - from) as usize].extend(columns);
+    }
+    plan.block_queries = block_queries.len();
+
+    // Then a tally for each check, for each term with one of its own, a spare, and each block query; and
+    // the answers.
     let check_queries = checks.iter().map(|&(query, _)| query);
-    let tally_answers = check_queries.chain(query_count..answers);
+    let tally_answers = check_queries
+        .chain(query_count..answers)
+        .chain(block_queries);
     let tally = |answer| Tally {
         answer,
         limit: AtomicU32::new(NONE),
@@ -803,46 +819,15 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
 
 // ---- The scan: what each thread keeps, and the stages of a document ----
 
-/// Postings per chain block: 32 bytes hold a link, a base and 12 document offsets.
-const BLOCK_POSTINGS: usize = 12;
-
-/// A piece of one term's posting list. Chains run from the newest block back to the oldest.
-#[repr(C)]
-struct Block {
-    offsets: [u16; BLOCK_POSTINGS], // Its postings, as offsets from `base`.
-    link: u32,                      // The previous block's number, or NONE if this is the first.
-    base: u32,                      // Its first document.
-}
-
 // What the comments and the scan's cache behaviour rely on.
-const _: () = assert!(size_of::<TermSet>() == 64 && size_of::<Block>() == 32);
-
-/// How many blocks are allocated at a time. Growing one Vec would hold twice the memory for a while.
-const CHUNK_BLOCKS: usize = 1 << 10;
-
-/// A block by its number, in a thread's chunks of them, which never move.
-fn block_at(chunks: &[Vec<Block>], number: u32) -> &Block {
-    &chunks[number as usize / CHUNK_BLOCKS][number as usize % CHUNK_BLOCKS]
-}
-
-/// One thread's end of a posting list. Only the newest block can be part full, and an empty list counts
-/// as full. With the first document here, adding a document only writes to the block, and doesn't wait
-/// for the block to reach the cache: 2.5% of all cycles.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Chain {
-    tail: u32, // The newest block's number, or NONE.
-    fill: u32, // How full it is.
-    base: u32, // Its first document.
-}
+const _: () = assert!(size_of::<TermSet>() == 64);
 
 /// One thread's results, and its list of short checks for the document in hand. A thread claims ranges
 /// in document order, so the documents it counts ascend, which is why only its first ten for each tally
 /// can be among an answer's smallest.
 #[derive(Default)]
 struct Scan {
-    blocks: Vec<Vec<Block>>,
-    chains: Vec<Chain>,
+    columns: Vec<Column>, // For each term with one, which documents of the block in hand hold it.
     hits: Vec<u64>, // For each tally: documents, above `SUM_BITS`, and the sum of their ids, below.
     counted: Vec<u32>, // The phrases that the document in hand has counted in.
     short_list: Vec<u32>, // The short checks to run for the document in hand.
@@ -853,11 +838,11 @@ struct Scan {
 struct DocLists {
     tokens: Vec<u32>,    // Every token's word.
     later: Vec<u32>,     // The positions of those to look at again.
-    marks: Vec<u32>,     // The words to mark one at a time: terms with flags or with no bitmap.
+    marks: Vec<u32>,     // The words to mark one at a time: terms with flags or with no row.
     phrase_at: Vec<u32>, // The positions of phrase anchors.
     bools: Vec<u32>,     // The terms with BOOL checks, once each.
-    chains: Vec<u32>,    // The terms with chains, once each.
-    plain: Vec<u32>,     // The words of terms with bitmaps and no flags.
+    sparse: Vec<u32>,    // The terms with columns and no rows, once each.
+    plain: Vec<u32>,     // The words of terms with rows and no flags.
     keys: Vec<u64>,      // Every token's short key...
     places: Vec<u64>,    // ...and its set's address.
 }
@@ -871,11 +856,17 @@ fn make_room(lists: &mut DocLists, room: usize) {
     lists.marks.resize(room, 0);
     lists.phrase_at.resize(room, 0);
     lists.bools.resize(room, 0);
-    lists.chains.resize(room, 0);
+    lists.sparse.resize(room, 0);
     lists.plain.resize(room, 0);
     lists.keys.resize(room, 0);
     lists.places.resize(room, 0);
 }
+
+/// How many documents a thread answers the common queries over at a time: a vector's worth.
+const BLOCK_DOCS: u32 = 256;
+
+/// A term's bits over a block of documents.
+type Column = [u64; 4];
 
 /// The bits of `hits` that hold the sum of ids, which `main` checks has room.
 const SUM_BITS: u32 = 40;
@@ -892,7 +883,7 @@ fn insert_smallest(smallest: &mut [u32; SMALLEST], mut doc: u32) {
 
 /// Looks the tokens up: first finding each one's key and prefetching its set, so that cache misses
 /// overlap, then comparing the keys without a branch on what that finds. Only a word marked `UNSURE`
-/// needs a full look, and few are. Lists the words that are terms, those of terms with bitmaps and no
+/// needs a full look, and few are. Lists the words that are terms, those of terms with rows and no
 /// flags apart, and the positions of phrase anchors, and returns how long those lists are. This stage stays
 /// out of line, like `mark` and `check_bools`, because measurements say so: inlining this one costs 1.7%
 /// of all cycles, and those two 1.9% together.
@@ -954,7 +945,7 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             let mask = |of| _mm_movemask_ps(_mm_castsi128_ps(of)) as usize;
             let order = |m| _mm_cvtepu8_epi32(_mm_loadl_epi64(POSITIONS.as_ptr().add(m).cast()));
             // A word that is surely a term's is positive as a signed number, and one of a term with a
-            // bitmap and no flags is also below the others. The table's row moves such words to the
+            // row and no flags is also below the others. The table's row moves such words to the
             // front, and as many as there are stay in the list.
             let sure = mask(_mm_cmpgt_epi32(words, _mm_setzero_si128()));
             let rest = mask(_mm_cmpgt_epi32(words, _mm_set1_epi32(terms.plain_top)));
@@ -997,10 +988,10 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
 }
 
 /// Marks what a document holds, with a byte per term, and lists what to do about it: the terms with BOOL
-/// checks or chains, once each. Returns how long the lists are.
+/// checks or sparse columns, once each. Returns how long the lists are.
 #[inline(never)]
-fn mark(words: &[u32], present: &mut [u8], bools: &mut [u32], chains: &mut [u32]) -> [usize; 2] {
-    let (mut bool_count, mut chain_count) = (0, 0);
+fn mark(words: &[u32], present: &mut [u8], bools: &mut [u32], sparse: &mut [u32]) -> [usize; 2] {
+    let (mut bool_count, mut sparse_count) = (0, 0);
     for &word in words {
         let term = word & TERM_BITS;
         // SAFETY: `present` has a mark for every term, and each list has room for every token.
@@ -1010,14 +1001,14 @@ fn mark(words: &[u32], present: &mut [u8], bools: &mut [u32], chains: &mut [u32]
             *held = 1;
             *bools.get_unchecked_mut(bool_count) = term;
             bool_count += (word >> BOOL_ANCHOR.trailing_zeros() & 1) as usize & first;
-            *chains.get_unchecked_mut(chain_count) = term;
-            chain_count += (word >> CHAINED.trailing_zeros() & 1) as usize & first;
+            *sparse.get_unchecked_mut(sparse_count) = term;
+            sparse_count += (word >> SPARSE.trailing_zeros() & 1) as usize & first;
         }
     }
-    [bool_count, chain_count]
+    [bool_count, sparse_count]
 }
 
-/// Keeps which terms with bitmaps a document holds, each 64 of them a word of its row.
+/// Keeps which terms with rows a document holds, each 64 of them a word of its row.
 fn set_row(present: &[u8], rows: &mut [[u64; 64]], doc: u32) {
     for (row, marks) in rows.iter_mut().zip(present.as_chunks::<64>().0) {
         // SAFETY: a chunk has these 64 bytes, and the build targets x86-64-v3, which has AVX2. The shift
@@ -1030,10 +1021,10 @@ fn set_row(present: &[u8], rows: &mut [[u64; 64]], doc: u32) {
     }
 }
 
-/// Turns 64 documents' rows into these documents' word of each bitmap, the `word`th of a bitmap's `words`,
-/// by swapping ever smaller squares across the diagonal. No other thread writes these words, so a plain
-/// store will do. A last row's marks of terms past the bitmaps have no bitmap to go to.
-fn store_rows(rows: &mut [[u64; 64]], bitmaps: &[AtomicU64], words: usize, word: usize) {
+/// Turns 64 documents' rows into these documents' word of each column, the `word`th, by swapping ever
+/// smaller squares across the diagonal. A last row's marks of terms past those with rows have no column to
+/// go to.
+fn store_rows(rows: &mut [[u64; 64]], columns: &mut [Column], word: usize) {
     for (index, row) in rows.iter_mut().enumerate() {
         for width in [32, 16, 8, 4, 2, 1] {
             let low_bits = !0u64 / ((1 << width) + 1);
@@ -1045,35 +1036,10 @@ fn store_rows(rows: &mut [[u64; 64]], bitmaps: &[AtomicU64], words: usize, word:
                 }
             }
         }
-        for (&column, bitmap) in row.iter().zip(bitmaps[index * 64 * words..].chunks(words)) {
-            bitmap[word].store(column, Relaxed);
+        for (&bits, column) in row.iter().zip(&mut columns[index * 64..]) {
+            column[word] = bits;
         }
         *row = [0; 64];
-    }
-}
-
-/// Adds a document to the chains of these terms.
-fn extend_chains(chained: &[u32], chain_from: usize, scan: &mut Scan, doc: u32) {
-    for &term in chained {
-        let chain = &mut scan.chains[term as usize - chain_from];
-        let blocks = &mut scan.blocks;
-        if chain.fill as usize == BLOCK_POSTINGS || doc - chain.base > u32::from(u16::MAX) {
-            if blocks.last().is_none_or(|c| c.len() == CHUNK_BLOCKS) {
-                blocks.push(Vec::with_capacity(CHUNK_BLOCKS));
-            }
-            let chunk = blocks.len() - 1;
-            blocks[chunk].push(Block {
-                offsets: [0; BLOCK_POSTINGS],
-                link: chain.tail,
-                base: doc,
-            });
-            chain.tail = (chunk * CHUNK_BLOCKS + blocks[chunk].len() - 1) as u32;
-            (chain.fill, chain.base) = (0, doc);
-        }
-        let tail = chain.tail as usize;
-        let block = &mut blocks[tail / CHUNK_BLOCKS][tail % CHUNK_BLOCKS];
-        block.offsets[chain.fill as usize] = (doc - chain.base) as u16;
-        chain.fill += 1;
     }
 }
 
@@ -1158,6 +1124,119 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
     }
 }
 
+/// What a step does to the set so far with its term's set, by its operator: flips that set, ands, then ors
+/// that set in if asked. The step's top two bits index this: OR, AND, NOT.
+#[repr(align(32))]
+struct StepMasks([[u64; 8]; 3]);
+static STEP_MASKS: StepMasks = StepMasks([
+    [!0, !0, !0, !0, !0, !0, !0, !0],
+    [0; 8],
+    [!0, !0, !0, !0, 0, 0, 0, 0],
+]);
+
+/// Puts documents of a block's result among the smallest of a tally's answer, up to the first past its limit.
+#[cold]
+fn add_smallest_of_block(plan: &Plan, at: usize, set: __m256i, first_doc: u32) -> u64 {
+    // SAFETY: a vector has the layout of four words.
+    let words = unsafe { std::mem::transmute::<__m256i, Column>(set) };
+    for (word, &bits) in words.iter().enumerate() {
+        let mut rest = bits;
+        while rest != 0 {
+            let doc = first_doc + 64 * word as u32 + rest.trailing_zeros();
+            if add_smallest(plan, at, doc) != 0 {
+                return TOO_BIG;
+            }
+            rest &= rest - 1;
+        }
+    }
+    0
+}
+
+/// Runs each query that goes by blocks over one block of documents, in vectors, and adds what it finds to
+/// the query's tally. Each query's steps apply in order from the first term's set. Then each nibble's count
+/// of set bits and sum of their positions are table lookups, so a byte gets them at once. A position is the
+/// word's first document, plus 8 times the byte's number in the word, plus its place in the byte. The
+/// bytes' numbers times their counts stay below 256 for each pair of bytes, so that SAD can add those too.
+#[inline(never)]
+fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u32) {
+    let mut at = plan.tallies.len() - plan.block_queries;
+    // SAFETY: a step's number is a column's, its top two bits index `STEP_MASKS`, the tallies include `at`,
+    // and the build targets x86-64-v3, which has AVX2.
+    unsafe {
+        let table = |t: [u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
+        let count_of = table([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
+        let low_sum = table([0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
+        let high_sum = table([0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22]);
+        let (nibble, zero) = (_mm256_set1_epi8(15), _mm256_setzero_si256());
+        let look = |table, at| _mm256_shuffle_epi8(table, at);
+        let byte_numbers = _mm256_set1_epi64x(0x0706_0504_0302_0100);
+        let doc = i64::from(first_doc);
+        let starts = _mm256_setr_epi64x(doc, doc + 64, doc + 128, doc + 192);
+        let column = |step: u32| {
+            let at = (step & TERM_BITS) as usize;
+            _mm256_loadu_si256(columns.as_ptr().add(at).cast())
+        };
+        for (length, steps) in plan.block_steps.iter().enumerate().skip(1) {
+            for query in steps.chunks_exact(length) {
+                let mut set = column(*query.get_unchecked(0));
+                for &step in query.get_unchecked(1..) {
+                    let with = column(step);
+                    let masks = STEP_MASKS
+                        .0
+                        .as_ptr()
+                        .add((step >> 30) as usize)
+                        .cast::<__m256i>();
+                    let kept = _mm256_xor_si256(with, _mm256_load_si256(masks));
+                    let added = _mm256_and_si256(with, _mm256_load_si256(masks.add(1)));
+                    set = _mm256_or_si256(_mm256_and_si256(set, kept), added);
+                }
+                let low = _mm256_and_si256(set, nibble);
+                let high = _mm256_and_si256(_mm256_srli_epi16(set, 4), nibble);
+                let ones = _mm256_add_epi8(look(count_of, low), look(count_of, high));
+                let places = _mm256_add_epi8(look(low_sum, low), look(high_sum, high));
+                let in_word = _mm256_sad_epu8(ones, zero);
+                let by_pair = _mm256_maddubs_epi16(ones, byte_numbers);
+                let sums = _mm256_add_epi64(
+                    _mm256_add_epi64(
+                        _mm256_sad_epu8(places, zero),
+                        _mm256_mul_epu32(in_word, starts),
+                    ),
+                    _mm256_slli_epi64(_mm256_sad_epu8(by_pair, zero), 3),
+                );
+                let found = _mm256_add_epi64(sums, _mm256_slli_epi64(in_word, SUM_BITS as i32));
+                let half = _mm_add_epi64(
+                    _mm256_castsi256_si128(found),
+                    _mm256_extracti128_si256(found, 1),
+                );
+                let found =
+                    _mm_cvtsi128_si64(_mm_add_epi64(half, _mm_unpackhi_epi64(half, half))) as u64;
+                let hit = hits.get_unchecked_mut(at);
+                // Fewer than ten so far, and more now, in a way the compiler can't turn into a coin-toss
+                // branch. A thread's hits ascend, so only its first ten can be among the smallest.
+                let open = (*hit).wrapping_sub((SMALLEST as u64) << SUM_BITS) >> 63;
+                if open & u64::from(found != 0) != 0 {
+                    *hit |= add_smallest_of_block(plan, at, set, first_doc);
+                }
+                *hit += found;
+                at += 1;
+            }
+        }
+    }
+}
+
+/// Finishes a block: the last row if it's part full, its queries, and clean columns for the next.
+fn finish_block(plan: &Plan, scan: &mut Scan, rows: &mut [[u64; 64]], first_doc: u32, docs: u32) {
+    if docs % 64 != 0 {
+        store_rows(
+            rows,
+            &mut scan.columns[..plan.rowed_count],
+            docs as usize / 64,
+        );
+    }
+    answer_block(plan, &scan.columns, &mut scan.hits, first_doc);
+    scan.columns.fill([0; 4]);
+}
+
 /// Claims the next `size` of the numbers below `len`, if any are left.
 fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<usize>> {
     let from = next.fetch_add(size, Relaxed);
@@ -1168,18 +1247,17 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
 fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicUsize) -> Scan {
     let mut scan = Scan::default();
     scan.hits.resize(plan.tallies.len(), 0);
-    let (tail, fill, base) = (NONE, BLOCK_POSTINGS as u32, 0);
-    scan.chains = vec![Chain { tail, fill, base }; plan.chain_count];
+    scan.columns = vec![[0; 4]; plan.rowed_count + plan.sparse_count];
     scan.short_list = vec![0; plan.short_checks.len() + 4];
     // With a row's worth more, as `set_row` reads whole rows of marks.
     let mut present = vec![0u8; plan.terms.count + 64];
-    let chain_from = FIRST_TERM + plan.bitmap_count;
-    // SAFETY: AtomicU64 has the layout of u64, and nothing else uses the bitmaps during the scan.
-    let bitmaps = unsafe { &*(&plan.bitmaps[..] as *const [u64] as *const [AtomicU64]) };
+    let sparse_from = FIRST_TERM + plan.rowed_count;
     let mut lists = DocLists::default();
-    let mut rows = vec![[0; 64]; plan.bitmap_count.div_ceil(64)];
+    let mut rows = vec![[0; 64]; plan.rowed_count.div_ceil(64)];
     while let Some(range) = claim(next_range, range_size, docs.len()) {
+        let (mut first_doc, mut in_block) = (0, 0);
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
+            first_doc = if in_block == 0 { doc } else { first_doc };
             let [marked, phrases, plains] = look_up(&plan.terms, text, edges, &mut lists);
             for &word in &lists.plain[..plains] {
                 // SAFETY: `present` has a mark for every term, and these words have no flags.
@@ -1187,13 +1265,20 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
             }
             let in_doc = &lists.tokens[..edges.len() / 2 - LANES];
             let marked = &lists.marks[..marked];
-            let [bools, chains] = mark(marked, &mut present, &mut lists.bools, &mut lists.chains);
-            set_row(&present[FIRST_TERM..], &mut rows, doc);
-            // Only the corpus's last 64 documents can be fewer.
-            if doc % 64 == 63 || doc == plan.last_doc {
-                store_rows(&mut rows, bitmaps, plan.bitmap_words, doc as usize / 64);
+            let [bools, sparse] = mark(marked, &mut present, &mut lists.bools, &mut lists.sparse);
+            set_row(&present[FIRST_TERM..], &mut rows, in_block);
+            in_block += 1;
+            let word = (in_block - 1) as usize / 64;
+            if in_block % 64 == 0 {
+                store_rows(&mut rows, &mut scan.columns[..plan.rowed_count], word);
             }
-            extend_chains(&lists.chains[..chains], chain_from, &mut scan, doc);
+            for &term in &lists.sparse[..sparse] {
+                // SAFETY: a term with this list's flag has a column, and a block has four words.
+                unsafe {
+                    let column = scan.columns.get_unchecked_mut(term as usize - FIRST_TERM);
+                    *column.get_unchecked_mut(word) |= 1 << ((in_block - 1) % 64);
+                }
+            }
             let ats = &lists.phrase_at[..phrases];
             check_phrases(ats, in_doc, plan, doc, &mut scan.counted);
             check_bools(&lists.bools[..bools], &present, plan, doc, &mut scan);
@@ -1201,103 +1286,20 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
                 // SAFETY: `present` has a mark for every term.
                 unsafe { *present.get_unchecked_mut((word & TERM_BITS) as usize) = 0 };
             }
-            present[FIRST_TERM..chain_from].fill(0);
+            present[FIRST_TERM..sparse_from].fill(0);
+            if in_block == BLOCK_DOCS {
+                finish_block(plan, &mut scan, &mut rows, first_doc, in_block);
+                in_block = 0;
+            }
         });
+        if in_block != 0 {
+            finish_block(plan, &mut scan, &mut rows, first_doc, in_block);
+        }
     }
     scan
 }
 
-// ---- After the scan: the queries that read postings, and the output ----
-
-/// Sets the bits of a posting list's documents. Threads' chains are walked in turn, a block of each, with
-/// the next block prefetched, so that cache misses overlap.
-fn set_bits_of_list(scans: &[&Scan], list: usize, bits: &mut [u64]) {
-    let chains = scans.iter().map(|scan| (scan, scan.chains[list]));
-    let mut walks: Vec<_> = chains.filter(|walk| walk.1.tail != NONE).collect();
-    while !walks.is_empty() {
-        walks.retain_mut(|(scan, chain)| {
-            let block = block_at(&scan.blocks, chain.tail);
-            for &offset in &block.offsets[..chain.fill as usize] {
-                let doc = block.base + u32::from(offset);
-                bits[doc as usize / 64] |= 1 << (doc % 64);
-            }
-            (chain.tail, chain.fill) = (block.link, BLOCK_POSTINGS as u32);
-            if chain.tail != NONE {
-                let next: *const Block = block_at(&scan.blocks, chain.tail);
-                // SAFETY: a prefetch has no other effect.
-                unsafe { _mm_prefetch(next.cast(), _MM_HINT_T0) };
-            }
-            chain.tail != NONE
-        });
-    }
-}
-
-/// Finds a BOOL query's result as a bitmap: applies its steps in order, from the empty set, with each
-/// term's set as a bitmap.
-fn run_steps(query: u32, plan: &Plan, scans: &[&Scan], bits: &mut [u64], other: &mut [u64]) {
-    bits.fill(0);
-    let Query { from, to, .. } = plan.queries[query as usize];
-    for step in &plan.steps[from as usize..to as usize] {
-        // Terms with bitmaps come first, then those with chains.
-        let stored = (step & TERM_BITS) as usize - FIRST_TERM;
-        let term_set = if stored < plan.bitmap_count {
-            &plan.bitmaps[stored * plan.bitmap_words..(stored + 1) * plan.bitmap_words]
-        } else {
-            other.fill(0);
-            set_bits_of_list(scans, stored - plan.bitmap_count, other);
-            &*other
-        };
-        for (word, &with) in bits.iter_mut().zip(term_set) {
-            *word = apply(step & !TERM_BITS, *word, with);
-        }
-    }
-}
-
-/// What a query's result, as a bitmap, prints.
-fn answer_of(bits: &[u64]) -> Answer {
-    let (mut ids, mut found, mut at) = ([NONE; SMALLEST], 0, 0);
-    while found < SMALLEST && at < bits.len() {
-        let mut rest = bits[at];
-        while rest != 0 && found < SMALLEST {
-            ids[found] = 64 * at as u32 + rest.trailing_zeros();
-            found += 1;
-            rest &= rest - 1;
-        }
-        at += 1;
-    }
-    // How many bits are set in these words, a multiple of 4 of them, and the sum of their positions. Each
-    // nibble's count and sum of positions are table lookups, so a byte gets them at once. A position is
-    // the word's start, plus 8 times the byte's number in the word, plus its place in the byte. The bytes'
-    // numbers times their counts stay below 256 for each pair of bytes, so that SAD can add those too.
-    // SAFETY: the loads have the length they say, and the build targets x86-64-v3, which has AVX2.
-    unsafe {
-        let table = |t: [u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast()));
-        let count_of = table([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
-        let low_sum = table([0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
-        let high_sum = table([0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22]);
-        let (nibble, zero) = (_mm256_set1_epi8(15), _mm256_setzero_si256());
-        let look = |table, at| _mm256_shuffle_epi8(table, at);
-        let byte_numbers = _mm256_set1_epi64x(0x0706_0504_0302_0100);
-        let (mut counts, mut sums, mut starts) = (zero, zero, _mm256_setr_epi64x(0, 64, 128, 192));
-        for four in bits.as_chunks::<4>().0 {
-            let words = _mm256_loadu_si256(four.as_ptr().cast());
-            let low = _mm256_and_si256(words, nibble);
-            let high = _mm256_and_si256(_mm256_srli_epi16(words, 4), nibble);
-            let ones = _mm256_add_epi8(look(count_of, low), look(count_of, high));
-            let places = _mm256_add_epi8(look(low_sum, low), look(high_sum, high));
-            let in_word = _mm256_sad_epu8(ones, zero);
-            counts = _mm256_add_epi64(counts, in_word);
-            sums = _mm256_add_epi64(sums, _mm256_sad_epu8(places, zero));
-            sums = _mm256_add_epi64(sums, _mm256_mul_epu32(in_word, starts));
-            let by_pair = _mm256_maddubs_epi16(ones, byte_numbers);
-            sums = _mm256_add_epi64(sums, _mm256_slli_epi64(_mm256_sad_epu8(by_pair, zero), 3));
-            starts = _mm256_add_epi64(starts, _mm256_set1_epi64x(256));
-        }
-        let total = |v: __m256i| std::mem::transmute::<_, [u64; 4]>(v).iter().sum::<u64>();
-        let (count, sum) = (total(counts), total(sums));
-        Answer { count, sum, ids }
-    }
-}
+// ---- After the scan: the output ----
 
 /// Prints a query's line: each number with a space after it, the last of which becomes the line's end.
 fn print_line(out: &mut Vec<u8>, answer: &Answer) {
@@ -1322,7 +1324,6 @@ struct Progress {
     next_range: AtomicUsize,     // In bytes of the corpus.
     next_scan_slot: AtomicUsize, // In `Shared::scans`.
     next_total: AtomicUsize,     // The next tally to add up.
-    next_query: AtomicUsize,     // In `Plan::posting_queries`.
     next_batch: AtomicUsize,     // In queries, as is...
     written: AtomicUsize,        // ...how many of them have reached the file.
 }
@@ -1336,10 +1337,9 @@ struct Shared {
 }
 
 /// One thread's part of the scan and the answers. Its scan goes into its slot, for every thread to read
-/// once all are done. Then the totals, and the queries that read postings, which take most of the time,
-/// before any printing, so that no batch waits for another's postings. Then threads claim batches of
-/// queries in order, and each waits for the batch before it to reach the file. The wait is short,
-/// because batches cost about the same.
+/// once all are done. Then the totals, before any printing. Then threads claim batches of queries in order,
+/// and each waits for the batch before it to reach the file. The wait is short, because batches cost about
+/// the same.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
     let (progress, barrier) = (&shared.progress, &shared.barrier);
     // 48 ranges per thread: enough that a thread slowed for a while holds no one up, and that all
@@ -1364,14 +1364,6 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
         answer.sum += hits & ((1 << SUM_BITS) - 1);
     }
 
-    // The queries that read postings.
-    let mut bits = vec![0; plan.bitmap_words.next_multiple_of(4)];
-    let mut other = vec![0; plan.bitmap_words];
-    let next_query = &progress.next_query;
-    while let Some(&query) = plan.posting_queries.get(next_query.fetch_add(1, Relaxed)) {
-        run_steps(query, plan, &scans, &mut bits, &mut other);
-        *lock(&plan.answers[query as usize]) = answer_of(&bits);
-    }
     barrier.wait();
 
     // Printing, each query's answer with what its term's tally adds to it.
@@ -1426,13 +1418,9 @@ pub extern "C" fn main() -> i32 {
     let last_line = docs.trim_ascii_end().rsplit(|&byte| byte == b'\n').next();
     let last_line = last_line.unwrap_or_default();
     let digits = last_line.iter().take_while(|&&byte| byte != b'\t');
-    plan.last_doc = digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
-    plan.bitmap_words = plan.last_doc as usize / 64 + 1;
+    let last_doc = digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
     // The ids sum to under N * N / 2, which `SUM_BITS` must hold.
-    assert!(plan.bitmap_words * 64 < 1 << (SUM_BITS / 2), "too many ids");
-    // Filled with zeros by this thread, as threads that fault in the same huge page each allocate one, which
-    // the memory peak counts.
-    plan.bitmaps = vec![0; plan.bitmap_count * plan.bitmap_words];
+    assert!((last_doc as usize) < 1 << (SUM_BITS / 2), "too many ids");
     let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
     // One round of threads scans, then answers, as starting threads again costs more than a barrier.
     let shared = Shared {

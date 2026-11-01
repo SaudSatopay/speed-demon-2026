@@ -63,6 +63,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 29 | Fifty-seven fewer lines outside the scan, `main` as the C entry point, and each range's pages left alone | Cause Of Death passed us on B at T 0.100 and S 823, so S is the cheap gain here: 100 lines is K +1.5% | run-d2958120f77f | 0.1100 | 41.9 | 77.3 |
 | 30 | The same machine code with named structs instead of tuples, named constants, and every comment checked against the code | A reader had to remember what `.0` and `.1` held across a dozen record types, and some comments no longer told the truth | pending | — | — | — |
 | 31 | 48 ranges per thread instead of 16, and tuning meant for older CPUs lifted | With 16 ranges a thread's last one takes about 5 ms of the box's time, so threads finish that far apart and wait; C gained 2 to 4% from the same change. For the generic target LLVM also clears the output of TZCNT and POPCNT first, against a false dependency the box's cores don't have | pending | — | — | — |
+| 32 | Queries with common anchors answered in the scan, 256 documents at a time, in vectors, with no bitmaps of the corpus and no chains | Bitmaps and chains held 18 of 42 MB, and were only read after the scan. A pass over a query's terms costs the same in vectors over a block's columns, which a thread reuses, and M is K^0.20 | pending | — | — | — |
 
 ## Decision log
 
@@ -129,6 +130,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D31.** A trade: S 880 -> 1015, K x 0.979, for code someone else could change. Answer, Query, AnchorList, Tally, Check, Block, Chain, DocLists, Progress and Shared have named fields, with `repr(C)` where rustc would move a field. Layouts have the same size and offsets, by `offset_of!`, but for Query, which the scan doesn't read. Over 8 alternating rounds: instructions +0.03%, cycles +0.3%, mark and check_bools have identical machine code. M 40.9 to 43.07 MB, under the cap. Grid 43/43, threads 228/228, const-hash 38/38 and 114/114, stress 0 wrong in 300. `make_room` stays out of line, as inlining it into look_up costs +0.9% instructions. The README and this log were read against the code too, and 24 claims were corrected.
 
 **D32.** No lines. Local paired wall -1.0 ms of 57, and wall's spread fell from about 7% to 2%, with cycles flat. Instructions: 3.572G -> 3.539G from the tuning, then 3.563G with more ranges. Hits stay ascending within a thread, as ranges are claimed in order.
+
+**D33.** Local, seed 1, 12 threads: memory peak 42 to 27 MB, cycles 2.35G to 2.11G, instructions 3.56G to 3.34G, S 1015 to 1004. Each block query is now cheap beside checks at its anchors' documents, so a query goes by blocks at anchors holding N/96 documents in all, where N/24 of any one was the line, and rows start at N/48. Ranges need no rounding, since threads share no bitmap words, which also ends tokenizing up to 63 documents again at each range's start. Grid, threads and const-hash by the gate, stress 0 wrong in 300.
 
 ## What didn't work
 

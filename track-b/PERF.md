@@ -85,10 +85,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 49 | Back to the corpus prefetched 16 blocks ahead | 8 blocks ahead: median K 40.40 over 3 runs. 32 blocks ahead: 41.44 over 3. 16 blocks: 41.49 over 14 | pending | — | — | — |
 | 50 | Line cuts with no change of behaviour: a helper for locks and one for ids inlined, and a few statements shortened | A fresh read of the code found them. S -16 by rustfmt's count, instructions flat at +0.07% | run-ac65e7ce25d1 | 0.0762 | 26.8 | K 41.33, one run |
 | 51 | exp: short checks filtered into a list before any write to hits, and group collects its items once | About half of 8.9M short checks are false, and each still wrote its hit word. Local: instructions -1.58%, cycles -2.9 to -4.7%, misses -3.4%, S -8 at first measure. group's second pass over its items was serial work in the plan | run-d5eeb62467e4 | 0.0751 | 28.1 | K median 41.59 over 3 runs: kept |
-| 52 | A term's own tally becomes an always-true check, dropping the separate add in check_bools | S -2 net, misses -6.75% locally, instructions +1% | pending | — | — | — |
-| 53 | Back to the kept source, cb's K 40.81 lost, plus the heap starting at a 2 MiB boundary | Up to 2 MiB of the heap, with the term table, otherwise gets small pages by a random amount per run | pending | — | — | — |
-| 54 | Back to the kept source, the aligned heap tied at 41.59, plus a filter of 16 bits per set that sends tokens of no query to an empty set | A quarter of tokens are in no query and simulate as 70% of the table's L2 misses; 128 KB is memory that scores nothing | pending | — | — | — |
-| 55 | Back to the kept source, the filter lost at K 39.8, with the term table's zeros from the kernel, not written serially | Ends a serial clear of 4 MB before the parse; the memory it might add is below 44 MB | pending | — | — | — |
+| 52 | A term's own tally becomes an always-true check, dropping the separate add in check_bools | S -2 net, misses -6.75% locally, instructions +1% | run-b24d70ad5a74 | 0.0780 | 27.7 | K median 40.81 over 3 runs, against 41.59: reverted |
+| 53 | Back to the kept source, cb's K 40.81 lost, plus the heap starting at a 2 MiB boundary | Up to 2 MiB of the heap, with the term table, otherwise gets small pages by a random amount per run | run-eac18b24459b | 0.0734 | 28.0 | K median 41.59 over 4 runs, a tie for 2 more lines: reverted |
+| 54 | Back to the kept source, the aligned heap tied at 41.59, plus a filter of 16 bits per set that sends tokens of no query to an empty set | A quarter of tokens are in no query and simulate as 70% of the table's L2 misses; 128 KB is memory that scores nothing | run-5fd27e6c3b21 | 0.0824 | 27.1 | K 39.59 and 39.97; local instructions +13%, cycles +15%, misses flat: reverted |
+| 55 | Back to the kept source, the filter lost at K 39.8, with the term table's zeros from the kernel, not written serially | Ends a serial clear of 4 MB before the parse; the memory it might add is below 44 MB | run-84be12a7d568 | 0.0743 | 27.0 | K median 41.80 over 3 runs, against 41.59: kept |
 
 ## Decision log
 
@@ -229,6 +229,8 @@ This PC's wall time is noisy, so thread cycles from `perf stat`, which repeat to
 | The corpus prefetched 8 or 32 blocks ahead, not 16 | A better lead on the box's slower cores | K 40.40 and 41.44, 3 runs each, against 41.49 over 14 | `run-5a72af8af7da`, `run-ac2c393d3cb9` | reverted |
 | The corpus prefetched at other distances: see above. Phrase-only terms sharing one mark, BOOL anchors first in the numbering | Fewer misses | Misses -0.95% for S +8; flat | local | not kept |
 | One round of threads for parse and scan, the plan on threads, a prefault of the heap, mapped output, skipping the empty sets (12% of them), clearing only the columns used | Shorter serial parts and fewer misses | One round +1 ms, skipping empty sets +1.5%; the others no gain | local, D38 | not kept |
+| The heap starting at a 2 MiB boundary, so the term table is all on huge pages; a filter of 16 bits per set before the table, as 24% of tokens are in no query and simulate as about 70% of the table's L2 misses; own tallies as always-true checks; vectors sized ahead | Fewer TLB and cache misses, for memory that scores nothing | K 41.59 (tie), 39.8 (the filter costs 11 instructions a token and saves no time, so instructions limit the scan, not misses), 40.81; sizing ahead flat in parse and plan over 25 local runs | `run-eac18b24459b`, `run-5fd27e6c3b21`, `run-b24d70ad5a74`, local | not kept |
+| Fewer scan threads, the mappers as the limit | CPU for the 12 scan threads | Local T falls steadily up to 12 threads, and the mappers finish in 3 ms, before the plan does | local | not tried on the board |
 
 ## The final design
 

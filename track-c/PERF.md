@@ -123,6 +123,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 87 | T0 for the slot prefetch, second sample | first sample ran while the box was slow, A slowed 10 percent in the same run with no code change | pending | — | — | — |
 | 88 | Tag windows on multiples of 32, second sample | first sample T 0.0210 K 43.18, inside the range the chosen source has shown | pending | — | — | — |
 | 89 | T0 for the slot prefetch, third sample | samples so far K 41.66 on a slow box and K 43.96 | pending | — | — | — |
+| 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | pending | — | — | — |
 
 ## Decision log
 
@@ -304,6 +305,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D88.** Second sample of aligned homes, taken in turn with T0.
 
 **D89.** Third sample of T0, taken in turn with aligned homes.
+
+**D90.** T0 rejected: K 41.66, 43.96, 43.73, median 43.73 against the chosen source at 44.02. Third sample of aligned homes.
 
 ## What didn't work
 

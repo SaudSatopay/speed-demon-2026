@@ -604,6 +604,7 @@ struct AnchorList(u32, u32, u32); // Where its short checks start, where its lon
 /// documents when this last saw them, which only falls, so that the documents past it need no lock. Those
 /// fill first, as threads work through the corpus together, and only a thread's own first ten ever get this
 /// far. What each thread has counted is in `Scan::hits`.
+#[repr(align(64))]
 struct Tally(u32, AtomicU32);
 
 /// The queries, and what the sample decided: how each term is stored, and what to check at each term's

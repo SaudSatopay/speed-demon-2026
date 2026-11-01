@@ -154,6 +154,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 118 | exp: 3seg, sample 7 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
 | 119 | exp: h115k, sample 1 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
 | 120 | exp: 3seg, sample 8 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
+| 121 | exp: h115k, sample 2 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
 
 ## Decision log
 
@@ -397,6 +398,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D119.** Median of three decides against 45.90
 
 **D120.** Median of three decides against 45.90
+
+**D121.** Median of three decides against 45.90
 
 ## What didn't work
 

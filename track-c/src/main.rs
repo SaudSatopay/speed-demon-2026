@@ -21,10 +21,9 @@
 #![no_main]
 
 use std::arch::{asm, x86_64::*};
-use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::{collections::BTreeSet, fs::File, os::fd::AsRawFd};
-use std::{mem::offset_of, ptr::null_mut, sync::Mutex, thread};
+use std::{collections::BTreeSet, fs::File, hint::black_box, io::BufWriter, io::Write};
+use std::{mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex, thread};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
@@ -42,8 +41,6 @@ unsafe extern "C" {
 
 /// Zero bytes after a mapped file, so that block loads can run past its end.
 const PADDING: usize = 128;
-/// Bytes between a mapped page and the next.
-const PAGE: usize = 4096;
 
 /// Maps a file for reading, followed by `PADDING` zeros. Returns the file's bytes with those after
 /// them. Touches one page in every 2 MiB, so that this thread allocates the page tables: a worker
@@ -58,25 +55,26 @@ fn map(file: &File) -> &'static [u8] {
         mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // Private, at this address.
         std::slice::from_raw_parts(base, len + PADDING)
     };
-    (0..len + (1 << 21)).step_by(1 << 21).for_each(|at| {
-        std::hint::black_box(text[at.min(len)]);
-    });
+    let pages = (0..len + (1 << 21)).step_by(1 << 21);
+    pages.for_each(|at| _ = black_box(text[at.min(len)]));
     text
 }
 
-/// Where part `at` of `parts` of a mapped file starts and ends. Parts end at line boundaries: just past
+/// Claims the next part of `parts` of a mapped file from the counter `job`, and returns where it starts
+/// and ends, or nothing if none is left. Parts end at line boundaries: just past
 /// the next `terminator`, or at the end of the file. In the records, a CR can only be the first byte
 /// of a CRLF terminator (spec section 2.2), so it's never inside quotes, and about half the records
 /// end in one, so it's never far. A file without one simply doesn't get split. The first boundary in
 /// a file ends its header.
-fn part(text: &[u8], parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
+fn part(text: &[u8], job: &AtomicUsize, parts: usize, terminator: &[u8]) -> Option<(usize, usize)> {
+    let at = job.fetch_add(1, Relaxed);
     let bytes = text.len() - PADDING;
     let cut = |at: usize| {
         let from = (at * bytes.div_ceil(parts)).min(bytes);
         let found = text[from..bytes].iter().position(|&c| c == terminator[0]);
         found.map_or(bytes, |to| from + to + terminator.len())
     };
-    (cut(at), cut(at + 1))
+    (at < parts).then(|| (cut(at), cut(at + 1)))
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
@@ -176,12 +174,11 @@ static MEMORY: Memory = unsafe { std::mem::zeroed() };
 /// What the threads change under a lock, neither of it often. First the country codes: index 0 is
 /// `_UNMATCHED`, and codes take the next as they appear, in room that `aggregate` makes. Then the names
 /// with no slot, each with a country it has seen.
-static LOCKED: Mutex<(Vec<[u8; 3]>, BTreeSet<(Vec<u8>, u8)>)> =
-    Mutex::new((Vec::new(), BTreeSet::new()));
+static LOCKED: Mutex<(Vec<&str>, BTreeSet<(Vec<u8>, u8)>)> = Mutex::new((vec![], BTreeSet::new()));
 
 /// Fills the join table from `len` bytes of whole region lines. Ids have at most 8 digits (spec
 /// section 2.3): digits have bit 4 set, and commas don't, so the first clear bit marks the end.
-fn parse_regions(text: &[u8], len: usize) {
+fn parse_regions(text: &'static [u8], len: usize) {
     let mut pos = 0;
     while pos < len {
         // SAFETY: `pos` is inside the text, and the padding covers the load.
@@ -194,7 +191,7 @@ fn parse_regions(text: &[u8], len: usize) {
         if index.load(Relaxed) == 0 {
             let keys = &mut LOCKED.lock().unwrap().0;
             if index.load(Relaxed) == 0 {
-                keys.push([text[pos], text[pos + 1], text[pos + 2]]);
+                keys.push(std::str::from_utf8(&text[pos..pos + 3]).unwrap());
                 index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
             }
         }
@@ -224,13 +221,6 @@ fn slots_with(tags: __m256i, tag: u8) -> u32 {
     unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, _mm256_set1_epi8(tag as i8))) as u32 }
 }
 
-/// The tags of the 32 slots from `home`.
-fn window(home: usize) -> __m256i {
-    // SAFETY: `home` stays 32 below the end of the tags.
-    // x86-64-v3 has AVX2.
-    unsafe { _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast()) }
-}
-
 /// The key of a name of at most `INLINE_BYTES`.
 fn key(text: &[u8], start: usize, len: usize) -> __m256i {
     // SAFETY: the name starts inside the text and the padding covers the load. Its length keeps
@@ -250,9 +240,8 @@ fn key(text: &[u8], start: usize, len: usize) -> __m256i {
 unsafe fn holds(at: usize, text: &[u8], start: usize, len: usize) -> bool {
     // SAFETY: the slot is inside the table. x86-64-v3 has AVX2.
     unsafe {
-        let key = key(text, start, len);
         let stored = MEMORY.words.as_ptr().byte_add(at);
-        let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));
+        let differ = _mm256_xor_si256(key(text, start, len), _mm256_loadu_si256(stored.cast()));
         _mm256_testz_si256(differ, differ) == 1
     }
 }
@@ -269,7 +258,8 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
         // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
         // two threads insert one name, whichever saw the other's slot as taken saw its tag too,
         // and if neither did, they both want the same byte and one loses the exchange.
-        let window = window(home);
+        // SAFETY: `home` stays 32 below the end of the tags. x86-64-v3 has AVX2.
+        let window = unsafe { _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast()) };
         let mut hits = slots_with(window, tag);
         while hits != 0 {
             let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
@@ -291,9 +281,8 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
         if slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
             // SAFETY: both are 32 bytes. x86-64-v3 has AVX2.
             let key: [u64; 4] = unsafe { std::mem::transmute(key(text, start, len)) };
-            let stored = &MEMORY.words[at * SLOT_WORDS..][..4];
-            (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
-            stored[3].store(key[3], Release);
+            let words = &MEMORY.words[at * SLOT_WORDS..];
+            words.iter().zip(key).for_each(|(w, k)| w.store(k, Release));
             return Some(at * SLOT_WORDS * 8);
         }
     }
@@ -309,16 +298,9 @@ const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
-/// A record's guessed slot, cents, and id and region together.
-type Found = [(u32, u32, u64); LISTED / 5];
 
-/// Segments per thread: when the segments run out, each thread still has its last to finish, and the
-/// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
-const SEGMENTS: usize = 3;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
-/// Bytes ahead of a block to prefetch: past where the chunk's own loads and a page's end stop the core.
-const AHEAD: usize = 1024;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 /// Bit `k` of each of the 64 positions in a block, at that position.
@@ -334,7 +316,7 @@ static PLANES: [u64; 6] = [plane(0), plane(1), plane(2), plane(3), plane(4), pla
 #[inline(never)]
 fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mut u64) -> usize {
     // Read once here, since the compiler would otherwise rebuild them in every block.
-    let planes = std::hint::black_box(&PLANES);
+    let planes = black_box(&PLANES);
     // SAFETY: the blocks are inside the text, or the padding covers them. PCLMULQDQ is in the
     // build's target features. The carry-less multiply by all ones gives each bit the parity of the
     // quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels out. The
@@ -351,7 +333,8 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         let separator = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
         let quote = _mm256_set1_epi8(b'"' as i8);
         while at < end {
-            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(AHEAD).cast());
+            // Far enough ahead to pass where the chunk's own loads and a page's end stop the core.
+            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(1024).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let ones = _mm_set1_epi8(-1);
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
@@ -417,8 +400,9 @@ fn parse_records(text: &[u8], len: usize, rows: &mut Rows) {
 }
 
 /// Adds up a chunk of whole records from `text`, given where they start and the positions just past
-/// each one's five separators.
-fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) {
+/// each one's five separators. `found` is room for each record's guessed slot, cents, and id and region
+/// together.
+fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows: &mut Rows) {
     let records = listed.len() / 5;
     let positions = |record: usize| {
         // SAFETY: the caller passes `records * 5 + 1` positions.
@@ -429,11 +413,12 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) 
     for record in 0..records {
         let [mut start, name_at, note_at, region_at, amount_at, _] = positions(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
-        // loads. `region` stays inside the join table. Prefetching has no effect on memory.
+        // loads. `region` stays inside the join table, and `home` 32 below the end of the tags.
+        // Prefetching has no effect on memory.
         unsafe {
             // A byte order mark can only start a record here, and no record otherwise starts with it.
             // The black box keeps it a branch: one record in 4,000.
-            (*text.get_unchecked(start) == 0xEF).then(|| start = std::hint::black_box(start + 3));
+            (*text.get_unchecked(start) == 0xEF).then(|| start = black_box(start + 3));
             // Moves the digits of the field at `start` to the top of a word, with zeros below them.
             let id = load_u64(text, start) << (8 * (start + 1 - name_at) as u32 & 63);
             // At most 7 digits (spec section 2.2), and the comma below them counts as a zero.
@@ -453,7 +438,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) 
             // guess costs a search. A name's tag is the low byte of its hash, or 1 for zero, which
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
             // name in 256 less than a check.
-            let hits = slots_with(window(home), tag);
+            let window = _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast());
+            let hits = slots_with(window, tag);
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
@@ -524,7 +510,7 @@ unsafe extern "C" fn start(work: *mut u8) -> *mut u8 {
 /// being `_UNMATCHED`.
 /// The threads share the regions too, and all of those are done before any record is parsed. Tying
 /// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
+fn aggregate(records: &[u8], lookup: &'static [u8], threads: usize) -> Rows {
     let (base, huge) = (MEMORY.words.as_ptr().cast::<u8>(), 1 << 21);
     let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
     // SAFETY: both are only advice about pages of `MEMORY`, and a range past its end has no effect.
@@ -534,14 +520,10 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
         madvise(base, bytes, 23);
     }
     LOCKED.lock().unwrap().0.reserve(256);
-    let (records, lookup) = (map(records), map(lookup));
-    // The next numbered job below `count` from this counter, if any is left.
-    let claim = |job: &AtomicUsize, count| Some(job.fetch_add(1, Relaxed)).filter(|&at| at < count);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
-        while let Some(at) = claim(&lines, line_parts) {
-            let (pos, end) = part(lookup, line_parts, at, b"\n");
+        while let Some((pos, end)) = part(lookup, &lines, line_parts, b"\n") {
             parse_regions(&lookup[pos..], end - pos);
             parsed.fetch_add(1, Release);
         }
@@ -550,17 +532,16 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        while let Some(at) = claim(&segments, threads * SEGMENTS) {
-            let (pos, end) = part(records, threads * SEGMENTS, at, b"\r\n");
+        // Three segments per thread: when they run out, each thread still has its last to finish, and
+        // the threads done first sit idle. Each costs two small reads and a short piece: not too many.
+        while let Some((pos, end)) = part(records, &segments, threads * 3, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
-            let (from, to) = (pos / PAGE * PAGE, end / PAGE * PAGE);
+            let (from, to) = (pos & !4095, end & !4095); // Whole pages.
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
             unsafe { madvise(records.as_ptr().add(from), to - from, 4) };
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
-            for i in [0, 2, 4, 5, 6, 7] {
-                total[i] += row[i];
-            }
+            [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);
             (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
         }
     };
@@ -574,9 +555,7 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
             assert!(pthread_create(id, &attr, start, &raw const work as *mut u8) == 0);
         }
         work();
-        for id in ids {
-            pthread_join(id, null_mut());
-        }
+        ids.iter().for_each(|&id| _ = pthread_join(id, null_mut()));
     }
     totals.into_inner().unwrap()
 }
@@ -591,14 +570,13 @@ extern "C" fn main() -> i32 {
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let open = |name| File::open(format!("{data_dir}/{name}.csv")).unwrap();
-    let totals = aggregate(&open("records"), &open("regions"), threads);
+    let open = |name| map(&File::open(format!("{data_dir}/{name}.csv")).unwrap());
+    let totals = aggregate(open("records"), open("regions"), threads);
     let codes = &LOCKED.lock().unwrap().0;
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
-    let keys = codes.iter().map(|code| std::str::from_utf8(code).unwrap());
-    let mut lines: Vec<_> = keys.zip(&totals[1..]).collect();
+    let mut lines: Vec<_> = codes.iter().copied().zip(&totals[1..]).collect();
     lines.sort_by_key(|&(key, _)| key);
     lines.push(("_UNMATCHED", &totals[0]));
     let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt")).unwrap());

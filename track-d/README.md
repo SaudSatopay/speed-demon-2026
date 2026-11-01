@@ -20,7 +20,7 @@ Exact shortest paths for 2,000 queries on a directed road network of 1.74M nodes
 
 ## Approach
 
-The mapped graph file is parsed twice by up to 12 threads, in batches of 32 edges with prefetching, so no temporary edge list is ever held. The first pass counts each node's edges and keeps up to 3 neighbours, packed into a 12-byte record. Threads then number the nodes from those neighbours, in round patches made of 64-node clusters grown breadth first, so neighbours sit close in memory. The second pass places each edge into a compressed adjacency array, in new numbers. Each arc packs its neighbour and weight into 32 bits, with a small side table for the rare heavy weight.
+The mapped graph file is parsed twice by up to 12 threads, in batches of 64 edges with prefetching, so no temporary edge list is ever held. The first pass counts each node's edges and keeps up to 3 neighbours, packed into a 12-byte record. Threads then number the nodes from those neighbours, in round patches made of 64-node clusters grown breadth first, so neighbours sit close in memory. The second pass places each edge into a compressed adjacency array, in new numbers. Each arc packs its neighbour and weight into 32 bits, with a small side table for the rare heavy weight.
 
 The queries come next. With them known, low-degree nodes that none of them starts or ends at are removed, joining their neighbours by shortcuts: each thread works alone on a region of 8,192 nodes, and a node with an arc to or from another region stays. The remaining nodes get dense numbers and the arrays close up. Sweeping the smaller forward array then fills the reverse one, with few cache misses because neighbours are close by then.
 

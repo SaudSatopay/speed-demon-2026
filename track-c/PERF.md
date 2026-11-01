@@ -90,6 +90,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 68 | Back on the build without the extra locked operation | The experiment has run | pending | — | — | — |
 | 69 | Per-record path: 27 fewer instructions (home and tag kept from the first loop, byte offsets for slots, branch for the BOM, CMP/SBB sign, shuffle classifier, PEXT directly on the mask, ADC-style empty-field fix, locked write's table pointers held in registers) | The box is a 2.5 GHz Golden Cove near its rename limit, so instructions set T: last time -7% instructions gave -5% T | pending | — | — | — |
 | 70 | Fewer instructions again: saturating byte counts as before, a name's length in 32 bits, a real branch for the byte order mark | ef4eba8's first sample showed no gain, in a run where A was 15% slow: this one also gives a second sample | pending | — | — | — |
+| 71 | No lock per record: marks wait in batches per part of the bits, and a batch is written under one lock. Keys and bits in separate tables | An extra lock per record cost T +9% on the box, while removing 10% of the instructions gave -2% | pending | — | — | — |
 
 ## Decision log
 
@@ -233,6 +234,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D69.** Instructions 258 -> 229 per record, cycles -8% locally, S 492. Keep if the board's T falls
 
 **D70.** Instructions 229 -> 227. Judge both builds over several samples
+
+**D71.** exp: local wall +10%, which hides the lock's cost. The box decides; revert unless T falls
 
 ## What didn't work
 

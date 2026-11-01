@@ -134,6 +134,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 98 | exp: back to PEXT and GFNI positions on the mapped file | TZCNT gave T 0.0208 and C over D 0.143 against 0.134, for 14 lines, so the box agrees with local here | pending | — | — | — |
 | 99 | exp: mapped file without the prefetch per block | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway. Two lines | pending | — | — | — |
 | 100 | exp: text prefetch back on the mapped file | Without it four samples gave median T 0.0201 and K 45.04 | pending | — | — | — |
+| 101 | exp: 12 segments per thread on the mapped file | Each segment now costs one release with a TLB shootdown to every thread, not two reads, so fewer may pay | pending | — | — | — |
 
 ## Decision log
 
@@ -337,6 +338,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D99.** Compare C over D and T with the mapped samples
 
 **D100.** No-prefetch rejected, two lines do not pay
+
+**D101.** Follow up only if clearly above the mapped samples
 
 ## What didn't work
 

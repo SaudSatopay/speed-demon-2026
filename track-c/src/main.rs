@@ -2,8 +2,9 @@
 //!
 //! Threads claim segments of the file from a shared cursor. Segments are cut just after a CRLF,
 //! because the spec promises that a CR appears nowhere else, so that is always a record boundary, and
-//! no quote counting is needed. A thread reads its segment in small pieces into its own buffer, which
-//! stays in its caches and needs no page mapped. Inside a piece the parser has two stages, because a
+//! no quote counting is needed. The file is mapped, because a copy of it would take as long as much of
+//! the parse, and a thread gives a segment's pages back when it's done, because the exit would
+//! otherwise release them all on one thread, on the clock. The parser has two stages, because a
 //! parser that finds each field from the end of the last one is limited by that chain of loads, not
 //! by its instructions. The first stage walks fixed 64-byte blocks, and lists every comma and line end
 //! outside quotes. The second reads each record's fields from its five listed positions, and no record
@@ -22,7 +23,7 @@
 use std::arch::{asm, x86_64::*};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
-use std::{collections::BTreeSet, fs::File, os::unix::fs::FileExt};
+use std::{collections::BTreeSet, fs::File, os::fd::AsRawFd};
 use std::{mem::offset_of, ptr::null_mut, sync::Mutex, thread};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
@@ -30,7 +31,8 @@ type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 // Declared by hand to keep the crate at zero dependencies; std already links glibc. A `pthread_attr_t`
 // is 56 bytes, so the word array holds it.
 unsafe extern "C" {
-    fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
     fn _exit(status: i32) -> !;
     fn pthread_attr_init(attr: *mut [u64; 8]) -> i32;
     fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
@@ -38,44 +40,45 @@ unsafe extern "C" {
     fn pthread_join(id: u64, result: *mut *mut u8) -> i32;
 }
 
-/// Zero bytes after the text in a buffer, so that block loads can run past its end.
+/// Zero bytes after a mapped file, so that block loads can run past its end.
 const PADDING: usize = 128;
-/// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
-const PIECE: usize = 1 << 15;
+/// Bytes between a mapped page and the next.
+const PAGE: usize = 4096;
 
-/// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
-/// file. In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2),
-/// so it's never inside quotes, and about half the records end in one, so it's never far. A file
-/// without one simply doesn't get split.
-fn boundary(file: &File, mut pos: usize, terminator: &[u8]) -> usize {
-    let mut bytes = [0; 512];
-    while let read @ 1.. = file.read_at(&mut bytes, pos as u64).unwrap() {
-        if let Some(at) = bytes[..read].iter().position(|&c| c == terminator[0]) {
-            return pos + at + terminator.len();
-        }
-        pos += read;
-    }
-    pos
+/// Maps a file for reading, followed by `PADDING` zeros. Returns the file's bytes with those after
+/// them. Touches one page in every 2 MiB, so that this thread allocates the page tables: a worker
+/// that did would charge a batch of pages to its CPU, and a batch counts in the peak (see above).
+fn map(file: &File) -> &'static [u8] {
+    let len = file.metadata().unwrap().len() as usize;
+    // SAFETY: the first mapping is new, and the second replaces its start. Read-only private file
+    // pages stay valid for the run, since nothing changes the data files.
+    let text = unsafe {
+        let base = mmap(null_mut(), len + PADDING, 1, 0x22, -1, 0); // Private and anonymous.
+        assert_ne!(base as isize, -1);
+        mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // Private, at this address.
+        std::slice::from_raw_parts(base, len + PADDING)
+    };
+    (0..len + (1 << 21)).step_by(1 << 21).for_each(|at| {
+        std::hint::black_box(text[at.min(len)]);
+    });
+    text
+}
+
+/// The first line boundary at or after `pos` in `text`: just past the next `terminator`, or the end
+/// of the file, `bytes`. In the records, a CR can only be the first byte of a CRLF terminator (spec
+/// section 2.2), so it's never inside quotes, and about half the records end in one, so it's never
+/// far. A file without one simply doesn't get split.
+fn boundary(text: &[u8], pos: usize, bytes: usize, terminator: &[u8]) -> usize {
+    let found = text[pos..bytes].iter().position(|&c| c == terminator[0]);
+    found.map_or(bytes, |at| pos + at + terminator.len())
 }
 
 /// Where part `at` of `parts` of a file of `bytes` starts and ends. The first boundary in a file ends
 /// its header.
-fn part(file: &File, bytes: usize, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
+fn part(text: &[u8], bytes: usize, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
     let size = bytes.div_ceil(parts).max(1);
-    let cut = |at: usize| boundary(file, (at * size).min(bytes), terminator);
+    let cut = |at: usize| boundary(text, (at * size).min(bytes), bytes, terminator);
     (cut(at), cut(at + 1))
-}
-
-/// Reads `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
-/// (no generated record comes near that), with `PADDING` zeros after them.
-fn read<'a>(file: &File, at: usize, len: usize, room: &'a mut [u8]) -> &'a [u8] {
-    // The kernel's copy runs fastest when source and destination agree within a cache line.
-    let skew = at.wrapping_sub(room.as_ptr() as usize) % 64;
-    let fits = room.get_mut(skew..skew + len + PADDING);
-    let text = fits.unwrap_or_else(|| Vec::leak(vec![0; len + PADDING]));
-    file.read_exact_at(&mut text[..len], at as u64).unwrap();
-    text[len..].fill(0);
-    text
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
@@ -138,8 +141,8 @@ const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Slots past the last home, where the names of the last homes can spill: more than a table this full
 /// can need, for a generated file.
 const SPARE: usize = 256;
-/// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 68 << 10;
+/// Bytes of stack per thread, enough for its rows and lists.
+const STACK: usize = 40 << 10;
 /// Threads the stacks are enough for, which is more than the box has, and more than any test asks for.
 const THREADS: usize = 64;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
@@ -316,6 +319,8 @@ type Found = [(u32, u32, u64); LISTED / 5];
 const SEGMENTS: usize = 24;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
+/// Bytes ahead of a block to prefetch: past where the chunk's own loads and a page's end stop the core.
+const AHEAD: usize = 1024;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 /// Bit `k` of each of the 64 positions in a block, at that position.
@@ -348,6 +353,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         let separator = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
         let quote = _mm256_set1_epi8(b'"' as i8);
         while at < end {
+            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(AHEAD).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let ones = _mm_set1_epi8(-1);
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
@@ -383,38 +389,32 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
     }
 }
 
-/// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(file: &File, mut pos: usize, end: usize, rows: &mut Rows, room: &mut [u8]) {
+/// Parses the records in the first `len` bytes of `text`, adding each to its country's row.
+fn parse_records(text: &[u8], len: usize, rows: &mut Rows) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
-    // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
+    // record's five come after the position it starts at.
     let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
-    let mut piece = PIECE;
-    while pos < end {
-        let len = piece.min(end - pos);
-        let text = read(file, pos, len, room);
-        // A piece starts at a record's start, so outside quotes.
-        let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
-        listed[0] = 0;
-        while scan < len {
-            let blocks = BLOCKS.min((len - scan).div_ceil(64));
-            count += separators(text, scan, blocks, &mut listed[count..], &mut odd_so_far);
-            scan += blocks * 64;
-            // The final record may have no terminator (spec section 2.1). This costs little to ask.
-            if scan >= len && pos + len == end && count % 5 == 0 {
+    // The text starts at a record's start, so outside quotes.
+    let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
+    while scan < len {
+        let blocks = BLOCKS.min((len - scan).div_ceil(64));
+        count += separators(text, scan, blocks, &mut listed[count..], &mut odd_so_far);
+        scan += blocks * 64;
+        if scan >= len {
+            // The last block can run on into the next segment.
+            count = listed[..count].partition_point(|&at| at as usize <= len);
+            // The final record may have no terminator (spec section 2.1).
+            if count % 5 == 0 {
                 listed[count] = len as u32 + 1;
                 count += 1;
             }
-            let records = (count - 1) / 5;
-            add_records(text, &listed[..=records * 5], &mut found, rows);
-            // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
-            // copy moves them, where a call to copy just the right number would cost more.
-            listed.copy_within(records * 5..records * 5 + 8, 0);
-            count -= records * 5;
         }
-        // What's left is the start of a record the piece cut short. A record longer than a piece gets
-        // a longer piece.
-        piece = if listed[0] > 0 { PIECE } else { 2 * piece };
-        pos += listed[0] as usize;
+        let records = (count - 1) / 5;
+        add_records(text, &listed[..=records * 5], &mut found, rows);
+        // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
+        // copy moves them, where a call to copy just the right number would cost more.
+        listed.copy_within(records * 5..records * 5 + 8, 0);
+        count -= records * 5;
     }
 }
 
@@ -545,7 +545,7 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize) {
 /// The threads share the regions too, and all of those are done before any record is parsed. Tying
 /// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
 fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
-    let (base, huge) = (MEMORY.words.as_ptr() as *mut u8, 1 << 21);
+    let (base, huge) = (MEMORY.words.as_ptr().cast::<u8>(), 1 << 21);
     let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
     // SAFETY: both are only advice about pages of `MEMORY`, and a range past its end has no effect.
     unsafe {
@@ -554,17 +554,16 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
         madvise(base, bytes, 23);
     }
     LOCKED.lock().unwrap().0.reserve(256);
-    let record_bytes = records.metadata().unwrap().len() as usize;
-    let lookup_bytes = lookup.metadata().unwrap().len() as usize;
+    let (records, lookup) = (map(records), map(lookup));
+    let (record_bytes, lookup_bytes) = (records.len() - PADDING, lookup.len() - PADDING);
     // The next numbered job below `count` from this counter, if any is left.
     let claim = |job: &AtomicUsize, count| Some(job.fetch_add(1, Relaxed)).filter(|&at| at < count);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
-        let mut room = [0u8; PIECE + PADDING + 64];
         while let Some(at) = claim(&lines, line_parts) {
             let (pos, end) = part(lookup, lookup_bytes, line_parts, at, b"\n");
-            parse_regions(read(lookup, pos, end - pos, &mut room), end - pos);
+            parse_regions(&lookup[pos..], end - pos);
             parsed.fetch_add(1, Release);
         }
         // Not a barrier: nobody should wait for a thread that hasn't started, or be woken up.
@@ -574,7 +573,10 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
         let mut rows = [EMPTY_ROW; 256];
         while let Some(at) = claim(&segments, threads * SEGMENTS) {
             let (pos, end) = part(records, record_bytes, threads * SEGMENTS, at, b"\r\n");
-            parse_records(records, pos, end, &mut rows, &mut room);
+            parse_records(&records[pos..], end - pos, &mut rows);
+            let (from, to) = (pos / PAGE * PAGE, end / PAGE * PAGE);
+            // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
+            unsafe { madvise(records.as_ptr().add(from), to - from, 4) };
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             for i in [0, 2, 4, 5, 6, 7] {

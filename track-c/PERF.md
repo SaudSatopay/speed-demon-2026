@@ -128,6 +128,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 92 | Twenty line cuts on cold paths: the input files as plain functions, main does its own work, one job claim call, one miss chain, one BOM line | S 446 to 426 is worth about 0.7 percent of K, and instructions fall 302.5 to 300.7 per record, so nothing hot pays for it | pending | — | — | — |
 | 93 | All memory is one zeroed 2 MiB aligned static in the image: no mmap, no NameTable struct, table functions are free functions, and the run ends in _exit | S 426 to 407 is worth about 0.7 percent of K. Local: instructions 300.7 to 289.7 per record in the counting build, paired T -2.5 percent, M flat at 9.70 | pending | — | — | — |
 | 94 | Helper merges: one function gives a name's home and tag, one closure for arguments and one for claiming a job, a full block uses up its own mask | S 407 to 399 is worth about 0.3 percent of K. Instructions per record unchanged at 289.7 in the counting build | pending | — | — | — |
+| 95 | exp: records file mapped, pages released per segment, page tables touched first, one prefetch per block | Mapped lost in D19 to D24 when exit tore pages down serially on the clock; A found that worth 2.7 ms. No copy, smaller stacks | pending | — | — | — |
 
 ## Decision log
 
@@ -319,6 +320,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D93.** All memory is one zeroed static aligned to 2 MiB, so the mapping's setup, the `NameTable` struct and `self` go. `.bss` starts on a 2 MiB boundary too, and `exit` writes its first byte, which cost one whole huge page (local peak 9.70 to 12.06 MB), so the run ends in `_exit`, and the locked state is a static that isn't all zeros, which keeps it out of that extent. The box's kernel, 6.12, honours the alignment for a static PIE. Local: instructions 300.7 to 289.7 per record, paired T -2.5%, peak 9.70 MB. Board `run-0766e5fe11fd`: T 0.0203, M 10.25, S 407, K 44.68. Outcome: kept, with D94 on top.
 
 **D94.** Helpers merged: one function gives a name's home and tag, closures for the arguments and for claiming a job. Instructions per record unchanged. Board: K 45.42, 45.29, 45.56 at S 399, median 45.42 against 44.00. Outcome: kept.
+
+**D95.** Keep only if median K over 3 runs beats the current source
 
 ## What didn't work
 

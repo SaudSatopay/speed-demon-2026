@@ -74,6 +74,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 38 | exp: block queries at anchors holding N/32 documents, not N/48 | A common sure term's tally now runs by blocks, which changes what a block query costs, so the line may have moved | run-e2271da97952 | 0.0786 | 26.5 | 80.4 |
 | 39 | exp: all threads share the release of the corpus's pages before exit | The clock runs to exit, and exit takes 59,000 mapped pages out one by one on one thread. The same change helped A on the box. Local paired wall is flat, -0.8% inside 28% noise | pending | — | — | — |
 | 40 | exp: each thread lists its own first ten ids per tally, added up after the scan, with no lock during it | 322,000 lock takes and 524,000 reads of a shared limit on seed 1, each a likely cache-line transfer. Spends memory that scores nothing below 44 MB; this build is about 51 MB locally, so it measures T first | pending | — | — | — |
+| 41 | Back to the build where threads share the release of the corpus's pages | First ten ids per thread: T 0.0804, M 46.5 MB, K 39.73 over 3 runs, against K 41.46 over 4 for this source | pending | — | — | — |
 
 ## Decision log
 
@@ -158,6 +159,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D40.** Experiment: judged by median K over at least 3 board runs against the current source
 
 **D41.** Experiment: T decides whether to trim M
+
+**D42.** Reverted: locks in the scan were not the limit
 
 ## What didn't work
 

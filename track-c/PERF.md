@@ -174,6 +174,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 138 | exp: tags16-h105k, sample 1 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 | 139 | exp: tags16-h110k, sample 1 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 | 140 | exp: tags16-h105k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
+| 141 | exp: tags16-h110k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 
 ## Decision log
 
@@ -457,6 +458,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D139.** Median of three decides against 46.25
 
 **D140.** Median of three decides against 46.25
+
+**D141.** Median of three decides against 46.25
 
 ## What didn't work
 

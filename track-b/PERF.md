@@ -79,6 +79,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 43 | exp: each tally's shared limit in a cache line of its own | A limit that one thread lowers throws out seven neighbours from the other threads' caches, 322,000 times on seed 1. This spends 2.6 MB that scores nothing, and M stays under 44 MB. Local cycles are flat, but they rank cache changes wrongly here | pending | — | — | — |
 | 44 | Back to the build without a cache line per tally's limit | A line per limit: median K 41.37 over 3 runs at M 29.6 MB, against 41.63 over 4 for this source | pending | — | — | — |
 | 45 | exp: a prefetch of a term's first hit word, beside the one of its checks | check_bools writes hits with no prefetch, and it has 24% of the cache misses. The box has half this PC's L2 per thread. Local cycles flat | pending | — | — | — |
+| 46 | Back to the build without the prefetch of hits | Prefetch of hits: median K 41.10 over 3 runs, against 41.80 over 5 for this source | pending | — | — | — |
 
 ## Decision log
 
@@ -173,6 +174,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D45.** Reverted: no gain from the false sharing it removed
 
 **D46.** Experiment: judged by median K over at least 3 board runs
+
+**D47.** Reverted
 
 ## What didn't work
 

@@ -186,6 +186,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 150 | c-c3 restored | populate sample T 0.0196 K 45.92, no gain in one run, not proven worse | pending | — | — | — |
 | 151 | c-pack2 48-byte short slots packed across lines, 64-byte long ones, sample 1 | memory: local peak 10.22 to 8.65 MB | pending | — | — | — |
 | 152 | c64f 64-byte slots at 104500 homes, sample 1 | memory: local peak 10.26 to 9.47 MB, S -3 | pending | — | — | — |
+| 153 | c-pack2 sample 2 | second sample | pending | — | — | — |
 
 ## Decision log
 
@@ -493,6 +494,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D151.** exp: judged over 3 samples against c-c3
 
 **D152.** exp: judged over 3 samples against c-c3
+
+**D153.** exp: judged over 3 samples against c-c3
 
 ## What didn't work
 

@@ -14,9 +14,8 @@
 
 use std::arch::x86_64::*;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex};
 use std::thread;
@@ -999,21 +998,14 @@ fn check_bools(anchors: &[u32], present: &[u8], plan: &Plan, doc: u32, scan: &mu
     }
 }
 
-/// Claims the next of the numbers below `len`, if any are left: a `parts`th of what's left, so that the
-/// claims shrink towards the end and threads finish together, but at least `least` of them.
-fn claim(
-    next: &AtomicUsize,
-    len: usize,
-    parts: usize,
-    least: usize,
-) -> Option<std::ops::Range<usize>> {
-    let size = ((len - next.load(Relaxed).min(len)) / parts).max(least);
+/// Claims the next `size` of the numbers below `len`, if any are left.
+fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<usize>> {
     let from = next.fetch_add(size, Relaxed);
     (from < len).then(|| from..(from + size).min(len))
 }
 
 /// Claims ranges of the corpus until none is left, and scans them.
-fn scan_ranges(docs: &[u8], plan: &Plan, threads: usize, next_range: &AtomicUsize) -> Scan {
+fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicUsize) -> Scan {
     let mut scan = Scan::default();
     scan.hits.resize(plan.slots.len(), 0);
     scan.chains = vec![(NONE, BLOCK_POSTINGS as u32, 0); plan.list_count];
@@ -1025,7 +1017,8 @@ fn scan_ranges(docs: &[u8], plan: &Plan, threads: usize, next_range: &AtomicUsiz
     let bitmaps = unsafe { &*(&plan.bitmaps[..] as *const [u64] as *const [AtomicU64]) };
     let mut lists = Lists::default();
     let mut rows = vec![[0; 64]; plan.bitmap_count.div_ceil(64)];
-    while let Some(range) = claim(next_range, docs.len(), 4 * threads, 1 << 17) {
+    while let Some(range) = claim(next_range, range_size, docs.len()) {
+        // exp: plain page faults instead of MADV_POPULATE_READ per range.
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
             let [marked, phrases, plains] = look_up(&plan.terms, text, edges, &mut lists);
             let [tokens, _, marks, phrase_at, bool_terms, chained, plain] = &mut lists.0;
@@ -1053,8 +1046,8 @@ fn scan_ranges(docs: &[u8], plan: &Plan, threads: usize, next_range: &AtomicUsiz
     scan
 }
 
-/// Applies a posting list's documents to a set, a bit each: an OR sets them, and a NOT clears them.
-fn set_bits_of_list(scans: &[Scan], list: usize, bits: &mut [u64], op: u32) {
+/// Sets the bits of a posting list's documents.
+fn set_bits_of_list(scans: &[Scan], list: usize, bits: &mut [u64]) {
     let chains = scans.iter().map(|scan| (scan, scan.chains[list]));
     let mut walks: Vec<_> = chains.filter(|walk| walk.1.0 != NONE).collect();
     while !walks.is_empty() {
@@ -1062,7 +1055,7 @@ fn set_bits_of_list(scans: &[Scan], list: usize, bits: &mut [u64], op: u32) {
             let block = block_at(&scan.blocks, *tail);
             for &offset in &block.2[..*fill as usize] {
                 let doc = block.1 + u32::from(offset);
-                bits[doc as usize / 64] = apply(op, bits[doc as usize / 64], 1 << (doc % 64));
+                bits[doc as usize / 64] |= 1 << (doc % 64);
             }
             (*tail, *fill) = (block.0, BLOCK_POSTINGS as u32);
             if *tail != NONE {
@@ -1081,20 +1074,16 @@ fn run_steps(query: u32, plan: &Plan, scans: &[Scan], bits: &mut [u64], other: &
     bits.fill(0);
     let (_, from, to) = plan.list[query as usize];
     for step in &plan.steps[from as usize..to as usize] {
-        let (op, number) = (step & !TERM_BITS, (step & TERM_BITS) as usize - FIRST_TERM);
+        let number = (step & TERM_BITS) as usize - FIRST_TERM;
         let term_set = if number < plan.bitmap_count {
             &plan.bitmaps[number * plan.words..(number + 1) * plan.words]
-        } else if op == AND {
-            other.fill(0);
-            set_bits_of_list(scans, number - plan.bitmap_count, other, 0);
-            &*other
         } else {
-            // An OR or a NOT of a chained term touches only its documents' words.
-            set_bits_of_list(scans, number - plan.bitmap_count, bits, op);
-            continue;
+            other.fill(0);
+            set_bits_of_list(scans, number - plan.bitmap_count, other);
+            &*other
         };
         for (word, &with) in bits.iter_mut().zip(term_set) {
-            *word = apply(op, *word, with);
+            *word = apply(step & !TERM_BITS, *word, with);
         }
     }
 }
@@ -1161,42 +1150,18 @@ fn print_line(out: &mut Vec<u8>, (count, sum, smallest): &Answer) {
     *out.last_mut().unwrap() = b'\n';
 }
 
-/// A query's answer: its own, plus the count of the term that is its first anchor, if it has one.
-fn query_answer(plan: &Plan, number: usize) -> Answer {
-    let mut answer = *plan.answers[number].lock().unwrap();
-    // NONE is no answer's number.
-    if let Some(shared) = plan.answers.get(plan.shared[number] as usize) {
-        let shared = *shared.lock().unwrap();
-        (answer.0, answer.1) = (answer.0 + shared.0, answer.1 + shared.1);
-        for doc in shared.2 {
-            insert_smallest(&mut answer.2, doc);
-        }
-    }
-    answer
-}
-
-/// How long a query's line is: each number's digits, and the space or line feed after it.
-fn line_len((count, sum, smallest): &Answer) -> usize {
-    let docs = smallest.iter().take(*count as usize).map(|&d| u64::from(d));
-    let digits = |value: u64| value.checked_ilog10().unwrap_or(0) as usize + 2;
-    [*count, *sum].into_iter().chain(docs).map(digits).sum()
-}
-
 /// First the totals, then the queries that read postings, as they take most of the time. Then, by the
-/// same threads, as starting more costs more than waiting at a barrier, threads claim batches of queries:
-/// first to measure each batch's lines, then to print them, each batch going where it belongs in the
-/// file without waiting for the batches before it.
+/// same threads, as starting more costs more than waiting at a barrier, threads claim batches of queries
+/// in order, and each waits for the batch before it to reach the file. The wait is short, because batches
+/// cost about the same.
 fn answer_queries(file: File, plan: &Plan, scans: &[Scan], threads: usize) {
-    let [next_slot, next_query, next_batch, next_print]: [AtomicUsize; 4] = Default::default();
+    let [next_slot, next_query, next_batch, written]: [AtomicUsize; 4] = Default::default();
     let (query_count, barrier) = (plan.list.len(), Barrier::new(threads));
-    let lengths: Vec<AtomicU32> = (0..query_count.div_ceil(BATCH))
-        .map(|_| AtomicU32::new(0))
-        .collect();
     on_threads(threads, || {
         // Sums the threads' counts and ids into each scan-answered query's and term's count and sum of
         // ids, visiting each answer once, as they are many cache lines and the threads' counts are in
         // order. Threads claim parts of this.
-        while let Some(slots) = claim(&next_slot, plan.slots.len(), usize::MAX, BATCH) {
+        while let Some(slots) = claim(&next_slot, BATCH, plan.slots.len()) {
             for at in slots {
                 let hits: u64 = scans.iter().map(|scan| scan.hits[at] & !TOO_BIG).sum();
                 let mut answer = plan.answers[plan.slots[at].0 as usize].lock().unwrap();
@@ -1210,27 +1175,28 @@ fn answer_queries(file: File, plan: &Plan, scans: &[Scan], threads: usize) {
             *plan.answers[number as usize].lock().unwrap() = answer_of(&bits);
         }
         barrier.wait();
-        // Each batch's length first, so that every thread then knows where its batches go in the file.
-        while let Some(batch) = claim(&next_batch, query_count, usize::MAX, BATCH) {
-            let len: usize = batch
-                .clone()
-                .map(|number| line_len(&query_answer(plan, number)))
-                .sum();
-            lengths[batch.start / BATCH].store(len as u32, Relaxed);
-        }
-        barrier.wait();
         let mut text = Vec::new();
-        while let Some(batch) = claim(&next_print, query_count, usize::MAX, BATCH) {
+        while let Some(batch) = claim(&next_batch, BATCH, query_count) {
             text.clear();
             for number in batch.clone() {
-                print_line(&mut text, &query_answer(plan, number));
+                let mut answer = *plan.answers[number].lock().unwrap();
+                // NONE is no answer's number.
+                if let Some(shared) = plan.answers.get(plan.shared[number] as usize) {
+                    let shared = *shared.lock().unwrap();
+                    (answer.0, answer.1) = (answer.0 + shared.0, answer.1 + shared.1);
+                    for doc in shared.2 {
+                        insert_smallest(&mut answer.2, doc);
+                    }
+                }
+                print_line(&mut text, &answer);
             }
-            let at = lengths[..batch.start / BATCH]
-                .iter()
-                .map(|len| u64::from(len.load(Relaxed)))
-                .sum();
-            // `panic = "abort"`: a failed write ends the process.
-            file.write_all_at(&text, at).expect("writing the results");
+            while written.load(Acquire) != batch.start {
+                thread::yield_now();
+            }
+            // `panic = "abort"`: a failed write ends the process rather than leaving the other
+            // threads waiting for their turn.
+            (&file).write_all(&text).expect("writing the results");
+            written.store(batch.end, Release);
         }
     });
 }
@@ -1268,8 +1234,9 @@ fn main() -> io::Result<()> {
     // the memory peak counts.
     plan.bitmaps = vec![0; plan.bitmap_count * plan.words];
     let file = File::create(format!("{out_dir}/results.txt"))?;
-    let claimed = AtomicUsize::new(0);
-    let scans = on_threads(threads, || scan_ranges(docs, &plan, threads, &claimed));
+    // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
+    let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
+    let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
     answer_queries(file, &plan, &scans, threads);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)

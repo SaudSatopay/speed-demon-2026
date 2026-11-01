@@ -45,6 +45,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 22 | exp: parse and plan twice | Where B's time goes on the box | pending | — | — | — |
 | 23 | exp: the answer phase twice | Where B's time goes on the box | pending | — | — | — |
 | 24 | Back to the build before the measurements | The measurements of B's phases are done | pending | — | — | — |
+| 25 | Answers printed at known offsets with no ordered handoffs, chained OR and NOT applied directly, ranges that shrink toward the end | Parse, plan and answers are likely 25 to 30 ms of T on the box, about twice their local time, and the print phase's 196 ordered write-and-yield steps stall on anything else running | pending | — | — | — |
 
 ## Decision log
 
@@ -97,6 +98,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D24. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **D25. Revert the experiments.
+
+**D26. Cut the serial side. Printing takes two passes: batch lengths first, then each thread pwrites its batches at known offsets, so no thread waits for another: under load the answer phase stayed at 5 to 6 ms against 31 to 546. Chained OR and NOT steps go straight to the set, which skips two 31 KB passes for 3,283 of 5,528 posting steps. Scan ranges shrink toward the end, so the last thread finishes sooner. MADV_POPULATE_READ goes, as the board showed it flat. Local: flat within noise, as this PC hides these costs; expected on the box. M 42.2 to 42.9 MB, S 928 -> 947. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 ## What didn't work
 

@@ -64,20 +64,18 @@ fn map(file: &File) -> &'static [u8] {
     text
 }
 
-/// The first line boundary at or after `pos` in `text`: just past the next `terminator`, or the end
-/// of the file, `bytes`. In the records, a CR can only be the first byte of a CRLF terminator (spec
-/// section 2.2), so it's never inside quotes, and about half the records end in one, so it's never
-/// far. A file without one simply doesn't get split.
-fn boundary(text: &[u8], pos: usize, bytes: usize, terminator: &[u8]) -> usize {
-    let found = text[pos..bytes].iter().position(|&c| c == terminator[0]);
-    found.map_or(bytes, |at| pos + at + terminator.len())
-}
-
-/// Where part `at` of `parts` of a file of `bytes` starts and ends. The first boundary in a file ends
-/// its header.
-fn part(text: &[u8], bytes: usize, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
-    let size = bytes.div_ceil(parts).max(1);
-    let cut = |at: usize| boundary(text, (at * size).min(bytes), bytes, terminator);
+/// Where part `at` of `parts` of a mapped file starts and ends. Parts end at line boundaries: just past
+/// the next `terminator`, or at the end of the file. In the records, a CR can only be the first byte
+/// of a CRLF terminator (spec section 2.2), so it's never inside quotes, and about half the records
+/// end in one, so it's never far. A file without one simply doesn't get split. The first boundary in
+/// a file ends its header.
+fn part(text: &[u8], parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
+    let bytes = text.len() - PADDING;
+    let cut = |at: usize| {
+        let from = (at * bytes.div_ceil(parts)).min(bytes);
+        let found = text[from..bytes].iter().position(|&c| c == terminator[0]);
+        found.map_or(bytes, |to| from + to + terminator.len())
+    };
     (cut(at), cut(at + 1))
 }
 
@@ -516,28 +514,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) 
 }
 
 /// Runs a closure, from a new thread's start.
-unsafe extern "C" fn start<F: Fn()>(work: *mut u8) -> *mut u8 {
-    // SAFETY: `run_threads` passes a closure that outlives the thread.
-    unsafe { (*work.cast::<F>())() };
+unsafe extern "C" fn start(work: *mut u8) -> *mut u8 {
+    // SAFETY: `aggregate` passes a closure that outlives the thread.
+    unsafe { (*work.cast::<&(dyn Fn() + Sync)>())() };
     null_mut()
-}
-
-/// Calls `work` on `threads` threads, this one and others on the given stacks.
-fn run_threads<F: Fn() + Sync>(work: &F, threads: usize) {
-    let mut ids = vec![0u64; threads - 1];
-    // SAFETY: each thread has its own stack, inside `MEMORY`, and is joined before `work` ends.
-    unsafe {
-        let mut attr = [0u64; 8];
-        for (at, id) in ids.iter_mut().enumerate() {
-            pthread_attr_init(&mut attr);
-            pthread_attr_setstack(&mut attr, MEMORY.stacks[at].as_ptr() as *mut u8, STACK);
-            assert!(pthread_create(id, &attr, start::<F>, work as *const F as *mut u8) == 0);
-        }
-        work();
-        for id in ids {
-            pthread_join(id, null_mut());
-        }
-    }
 }
 
 /// Parses the whole file on `threads` threads and merges their rows. Returns every index's row, index 0
@@ -555,14 +535,13 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
     }
     LOCKED.lock().unwrap().0.reserve(256);
     let (records, lookup) = (map(records), map(lookup));
-    let (record_bytes, lookup_bytes) = (records.len() - PADDING, lookup.len() - PADDING);
     // The next numbered job below `count` from this counter, if any is left.
     let claim = |job: &AtomicUsize, count| Some(job.fetch_add(1, Relaxed)).filter(|&at| at < count);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
         while let Some(at) = claim(&lines, line_parts) {
-            let (pos, end) = part(lookup, lookup_bytes, line_parts, at, b"\n");
+            let (pos, end) = part(lookup, line_parts, at, b"\n");
             parse_regions(&lookup[pos..], end - pos);
             parsed.fetch_add(1, Release);
         }
@@ -572,7 +551,7 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
         }
         let mut rows = [EMPTY_ROW; 256];
         while let Some(at) = claim(&segments, threads * SEGMENTS) {
-            let (pos, end) = part(records, record_bytes, threads * SEGMENTS, at, b"\r\n");
+            let (pos, end) = part(records, threads * SEGMENTS, at, b"\r\n");
             parse_records(&records[pos..], end - pos, &mut rows);
             let (from, to) = (pos / PAGE * PAGE, end / PAGE * PAGE);
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
@@ -585,7 +564,20 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
             (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
         }
     };
-    run_threads(&work, threads);
+    let (work, mut ids): (&(dyn Fn() + Sync), _) = (&work, vec![0u64; threads - 1]);
+    // SAFETY: each thread has its own stack, inside `MEMORY`, and is joined before `work` ends.
+    unsafe {
+        let mut attr = [0u64; 8];
+        for (at, id) in ids.iter_mut().enumerate() {
+            pthread_attr_init(&mut attr);
+            pthread_attr_setstack(&mut attr, MEMORY.stacks[at].as_ptr() as *mut u8, STACK);
+            assert!(pthread_create(id, &attr, start, &raw const work as *mut u8) == 0);
+        }
+        work();
+        for id in ids {
+            pthread_join(id, null_mut());
+        }
+    }
     totals.into_inner().unwrap()
 }
 

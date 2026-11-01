@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex};
+use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
 
 /// Term 0 is every token that no query uses, and an empty slot of the term table holds it. No token is
@@ -41,8 +41,9 @@ const AND: u32 = 1 << 30;
 const NOT: u32 = 2 << 30;
 /// No query or document has this number.
 const NONE: u32 = u32::MAX;
-/// How many queries a thread claims at a time.
-const BATCH: usize = 256;
+/// How many queries a thread claims at a time: few enough batches (49 at full) that the threads waiting
+/// for their turn to write hardly spin, and each batch's text is about 30 KB.
+const BATCH: usize = 1024;
 /// How many of a query's matching documents are printed.
 const SMALLEST: usize = 10;
 
@@ -285,7 +286,9 @@ impl TermTable<'_> {
     /// Adds this query term, if it's new, and returns its number, which is too big for a table with no room
     /// for it, which the caller then drops. Threads do this at once: each holds the lock of the set it's
     /// looking at, the fourth short key, which no key equals. So threads adding one term get the same
-    /// number, as sets only fill, and the first set with room is where it goes.
+    /// number, as sets only fill, and the first set with room is where it goes. A term that's in already
+    /// is found without the lock, as a way's key is stored after its word, so a key that's there has its
+    /// word: most of the tokens are common terms, which every thread meets.
     fn intern(&self, token: &[u8], next_term: &AtomicUsize) -> u32 {
         let (short, long) = keys_of(token);
         // SAFETY: the build targets x86-64-v3, which has AVX2.
@@ -295,6 +298,10 @@ impl TermTable<'_> {
             // SAFETY: the set is in the table, and its lock gives it to this thread alone.
             unsafe {
                 let set = self.sets.as_ptr().add(index).cast_mut();
+                let ways = self.ways_of(&*set, token, short, long);
+                if ways != 0 {
+                    return (*set).word(ways) & TERM_BITS;
+                }
                 let lock = AtomicU64::from_ptr((&raw mut (*set).shorts).cast::<u64>().add(3));
                 while lock.swap(1, Acquire) != 0 {
                     std::hint::spin_loop();
@@ -308,8 +315,9 @@ impl TermTable<'_> {
                         let way = set.ways(0).trailing_zeros() as usize;
                         let at = (token.as_ptr() as usize - self.text.as_ptr() as usize) as u32;
                         let held = if long >> 31 != 0 { 1 << 31 | at } else { long };
-                        let word = term | u32::from(token.len() > 8) * UNSURE;
-                        (set.shorts[way], set.longs[way], set.words[way]) = (short, held, word);
+                        (set.longs[way], set.words[way]) =
+                            (held, term | u32::from(token.len() > 8) * UNSURE);
+                        AtomicU64::from_ptr(&raw mut set.shorts[way]).store(short, Release);
                     }
                 } else if ways == 0 {
                     // A lookup that finds nothing in a set this term has passed has to look further.
@@ -458,8 +466,12 @@ fn apply(op: u32, set: u64, term_set: u64) -> u64 {
 /// is a mask over the 64 possible documents, so the steps give the truth table directly, and its top half
 /// is what's left with the last term, the anchor, present.
 fn pack(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check<5> {
-    // The positions in a word that have this one of their 6 index bits set.
-    let index_bit_mask = |bit: usize| !(!0u64 / ((1 << (1 << bit)) + 1));
+    // The positions in a word that have this one of their 6 index bits set: a period of twice 2 to the
+    // bit, doubled up to 64 bits. (A division by a variable here would cost more than the rest of the plan.)
+    let index_bit_mask = |bit: usize| {
+        let first = ((1u64 << (1 << bit)) - 1) << (1 << bit);
+        (bit + 1..6).fold(first, |mask, wider| mask | mask << (1 << wider))
+    };
     let (mut truth, mut blocked, mut terms, mut others) = (0, 0, [0; 5], 0);
     for step in steps {
         let term = step & TERM_BITS;
@@ -627,8 +639,9 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         let (number, steps) = (number as u32, &plan.steps[from as usize..to as usize]);
         if is_bool == 0 {
             // Any term of a phrase would be correct as its anchor. The rarest triggers the fewest checks.
-            let rarest = (0..steps.len()).min_by_key(|&at| df[steps[at] as usize]);
-            let rarest = rarest.unwrap_or(0);
+            let rarest = (0..steps.len())
+                .min_by_key(|&at| df[steps[at] as usize])
+                .unwrap_or(0);
             flags[steps[rarest] as usize] |= PHRASE_ANCHOR;
             anchored.push((steps[rarest], (number, rarest as u32)));
             continue;
@@ -888,8 +901,7 @@ fn store_rows(rows: &mut [[u64; 64]], bitmaps: &[AtomicU64], words: usize, word:
                 let (first, second) = square.split_at_mut(width);
                 for (a, b) in first.iter_mut().zip(second) {
                     let swapped = (*a >> width ^ *b) & low_bits;
-                    *a ^= swapped << width;
-                    *b ^= swapped;
+                    (*a, *b) = (*a ^ swapped << width, *b ^ swapped);
                 }
             }
         }
@@ -1018,7 +1030,6 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
     let mut lists = Lists::default();
     let mut rows = vec![[0; 64]; plan.bitmap_count.div_ceil(64)];
     while let Some(range) = claim(next_range, range_size, docs.len()) {
-        // exp: plain page faults instead of MADV_POPULATE_READ per range.
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
             let [marked, phrases, plains] = look_up(&plan.terms, text, edges, &mut lists);
             let [tokens, _, marks, phrase_at, bool_terms, chained, plain] = &mut lists.0;
@@ -1047,7 +1058,7 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
 }
 
 /// Sets the bits of a posting list's documents.
-fn set_bits_of_list(scans: &[Scan], list: usize, bits: &mut [u64]) {
+fn set_bits_of_list(scans: &[&Scan], list: usize, bits: &mut [u64]) {
     let chains = scans.iter().map(|scan| (scan, scan.chains[list]));
     let mut walks: Vec<_> = chains.filter(|walk| walk.1.0 != NONE).collect();
     while !walks.is_empty() {
@@ -1070,7 +1081,7 @@ fn set_bits_of_list(scans: &[Scan], list: usize, bits: &mut [u64]) {
 
 /// Finds a BOOL query's result as a bitmap: applies its steps in order, from the empty set, with each
 /// term's set as a bitmap.
-fn run_steps(query: u32, plan: &Plan, scans: &[Scan], bits: &mut [u64], other: &mut [u64]) {
+fn run_steps(query: u32, plan: &Plan, scans: &[&Scan], bits: &mut [u64], other: &mut [u64]) {
     bits.fill(0);
     let (_, from, to) = plan.list[query as usize];
     for step in &plan.steps[from as usize..to as usize] {
@@ -1137,68 +1148,74 @@ fn answer_of(bits: &[u64]) -> Answer {
 /// Prints a query's line: each number with a space after it, the last of which becomes the line's end.
 fn print_line(out: &mut Vec<u8>, (count, sum, smallest): &Answer) {
     let docs = smallest.iter().take(*count as usize).map(|&d| u64::from(d));
-    for mut value in [*count, *sum].into_iter().chain(docs) {
-        let (mut digits, mut start) = ([b' '; 21], 19);
-        while value >= 10 {
-            digits[start] = b'0' + (value % 10) as u8;
-            value /= 10;
+    for value in [*count, *sum].into_iter().chain(docs) {
+        let (mut digits, mut start) = ([b' '; 21], 20);
+        for value in std::iter::successors(Some(value), |&v| (v >= 10).then(|| v / 10)) {
             start -= 1;
+            digits[start] = b'0' + (value % 10) as u8;
         }
-        digits[start] = b'0' + value as u8;
         out.extend_from_slice(&digits[start..]);
     }
     *out.last_mut().unwrap() = b'\n';
 }
 
-/// First the totals, then the queries that read postings, as they take most of the time. Then, by the
-/// same threads, as starting more costs more than waiting at a barrier, threads claim batches of queries
-/// in order, and each waits for the batch before it to reach the file. The wait is short, because batches
-/// cost about the same.
-fn answer_queries(file: File, plan: &Plan, scans: &[Scan], threads: usize) {
-    let [next_slot, next_query, next_batch, written]: [AtomicUsize; 4] = Default::default();
-    let (query_count, barrier) = (plan.list.len(), Barrier::new(threads));
-    on_threads(threads, || {
-        // Sums the threads' counts and ids into each scan-answered query's and term's count and sum of
-        // ids, visiting each answer once, as they are many cache lines and the threads' counts are in
-        // order. Threads claim parts of this.
-        while let Some(slots) = claim(&next_slot, BATCH, plan.slots.len()) {
-            for at in slots {
-                let hits: u64 = scans.iter().map(|scan| scan.hits[at] & !TOO_BIG).sum();
-                let mut answer = plan.answers[plan.slots[at].0 as usize].lock().unwrap();
-                answer.0 += hits >> SUM_BITS;
-                answer.1 += hits & ((1 << SUM_BITS) - 1);
-            }
+/// What the threads of the scan and answer round share: what they claim next (the next range, slot, total,
+/// query that reads postings, and batch to print, and how far the file has got), a barrier between phases,
+/// and a slot for each thread's scan.
+type Shared = ([AtomicUsize; 6], Barrier, Vec<OnceLock<Scan>>);
+
+/// One thread's part of the scan and the answers. Its scan goes into its slot, for every thread to read
+/// once all are done. Then the totals, then the queries that read postings, as they take most of the time.
+/// Then threads claim batches of queries in order, and each waits for the batch before it to reach the
+/// file. The wait is short, because batches cost about the same.
+fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
+    let ([ranges, threads, totals, queries, batches, written], barrier, slots) = shared;
+    // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
+    let scan = scan_ranges(docs, plan, docs.len() / (slots.len() * 16) + 1, ranges);
+    assert!(slots[threads.fetch_add(1, Relaxed)].set(scan).is_ok());
+    barrier.wait();
+    let scans: Vec<&Scan> = slots.iter().map(|slot| slot.get().unwrap()).collect();
+    // Sums the threads' counts and ids into each scan-answered query's and term's count and sum of
+    // ids, visiting each answer once, as they are many cache lines and the threads' counts are in
+    // order. Threads claim parts of this.
+    while let Some(slots) = claim(totals, BATCH, plan.slots.len()) {
+        for at in slots {
+            let hits: u64 = scans.iter().map(|scan| scan.hits[at] & !TOO_BIG).sum();
+            let mut answer = plan.answers[plan.slots[at].0 as usize].lock().unwrap();
+            answer.0 += hits >> SUM_BITS;
+            answer.1 += hits & ((1 << SUM_BITS) - 1);
         }
-        let (mut bits, mut other) = (vec![0; plan.words.next_multiple_of(4)], vec![0; plan.words]);
-        while let Some(&number) = plan.posting_queries.get(next_query.fetch_add(1, Relaxed)) {
-            run_steps(number, plan, scans, &mut bits, &mut other);
-            *plan.answers[number as usize].lock().unwrap() = answer_of(&bits);
-        }
-        barrier.wait();
-        let mut text = Vec::new();
-        while let Some(batch) = claim(&next_batch, BATCH, query_count) {
-            text.clear();
-            for number in batch.clone() {
-                let mut answer = *plan.answers[number].lock().unwrap();
-                // NONE is no answer's number.
-                if let Some(shared) = plan.answers.get(plan.shared[number] as usize) {
-                    let shared = *shared.lock().unwrap();
-                    (answer.0, answer.1) = (answer.0 + shared.0, answer.1 + shared.1);
-                    for doc in shared.2 {
-                        insert_smallest(&mut answer.2, doc);
-                    }
-                }
-                print_line(&mut text, &answer);
+    }
+    let (mut bits, mut other) = (vec![0; plan.words.next_multiple_of(4)], vec![0; plan.words]);
+    while let Some(&number) = plan.posting_queries.get(queries.fetch_add(1, Relaxed)) {
+        run_steps(number, plan, &scans, &mut bits, &mut other);
+        *plan.answers[number as usize].lock().unwrap() = answer_of(&bits);
+    }
+    barrier.wait();
+    let mut text = Vec::new();
+    while let Some(batch) = claim(batches, BATCH, plan.list.len()) {
+        text.clear();
+        for number in batch.clone() {
+            let mut answer = *plan.answers[number].lock().unwrap();
+            // NONE is no answer's number.
+            if let Some(shared) = plan.answers.get(plan.shared[number] as usize) {
+                let shared = *shared.lock().unwrap();
+                (answer.0, answer.1) = (answer.0 + shared.0, answer.1 + shared.1);
+                shared
+                    .2
+                    .into_iter()
+                    .for_each(|doc| insert_smallest(&mut answer.2, doc));
             }
-            while written.load(Acquire) != batch.start {
-                thread::yield_now();
-            }
-            // `panic = "abort"`: a failed write ends the process rather than leaving the other
-            // threads waiting for their turn.
-            (&file).write_all(&text).expect("writing the results");
-            written.store(batch.end, Release);
+            print_line(&mut text, &answer);
         }
-    });
+        while written.load(Acquire) != batch.start {
+            thread::yield_now();
+        }
+        // `panic = "abort"`: a failed write ends the process rather than leaving the other
+        // threads waiting for their turn.
+        file.write_all(&text).expect("writing the results");
+        written.store(batch.end, Release);
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -1220,13 +1237,13 @@ fn main() -> io::Result<()> {
     let docs = map_file(&format!("{data_dir}/docs.txt"))?;
     let mut plan = parse_queries(map_file(&format!("{data_dir}/queries.txt"))?, threads);
     make_plan(&mut plan, docs, threads);
-    // The last document's id is on the last line.
-    let last_line = docs
-        .trim_ascii_end()
-        .rsplit(|&c| c == b'\n')
-        .next()
-        .unwrap();
-    let digits = last_line.iter().take_while(|&&byte| byte != b'\t');
+    // The last document's id starts the last line, after the LF before it, if any, at `at`.
+    let at = docs[..docs.len().saturating_sub(1)]
+        .iter()
+        .rposition(|&c| c == b'\n');
+    let digits = docs[at.map_or(0, |at| at + 1)..]
+        .iter()
+        .take_while(|&&byte| byte != b'\t');
     plan.last_doc = digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
     plan.words = plan.last_doc as usize / 64 + 1;
     assert!(plan.words * 64 < 1 << (SUM_BITS / 2), "too many documents");
@@ -1234,10 +1251,10 @@ fn main() -> io::Result<()> {
     // the memory peak counts.
     plan.bitmaps = vec![0; plan.bitmap_count * plan.words];
     let file = File::create(format!("{out_dir}/results.txt"))?;
-    // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
-    let (range_size, claimed) = ((docs.len() / (threads * 16)).max(1), AtomicUsize::new(0));
-    let scans = on_threads(threads, || scan_ranges(docs, &plan, range_size, &claimed));
-    answer_queries(file, &plan, &scans, threads);
+    // One round of threads scans, then answers, as starting threads again costs more than a barrier.
+    let slots = (0..threads).map(|_| OnceLock::new()).collect();
+    let shared: Shared = (Default::default(), Barrier::new(threads), slots);
+    on_threads(threads, || scan_and_answer(docs, &plan, &file, &shared));
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)
 }

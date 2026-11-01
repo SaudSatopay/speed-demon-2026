@@ -183,6 +183,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 147 | c-c3 sample 3 | third sample | pending | — | — | — |
 | 148 | c-c4 sample 3 | third sample | pending | — | — | — |
 | 149 | c-p1 populate each segment before parsing, sample 1 | faults per 16 pages cost kernel time, and text prefetch stops at unmapped pages | pending | — | — | — |
+| 150 | c-c3 restored | populate sample T 0.0196 K 45.92, no gain in one run, not proven worse | pending | — | — | — |
 
 ## Decision log
 
@@ -484,6 +485,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D148.** exp: judged over 3 samples each, c-c3 against c-c4
 
 **D149.** exp: judged over 3 samples against c-c3 46.40
+
+**D150.** c-c3 is the chosen source, median K 46.40 over 4
 
 ## What didn't work
 

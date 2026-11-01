@@ -535,9 +535,6 @@ extern "C" fn main() -> i32 {
         // Three segments per thread: when they run out, each thread still has its last to finish, and
         // the threads done first sit idle. Each costs two small reads and a short piece: not too many.
         while let Some((pos, end)) = part(records, &segments, threads * 3, b"\r\n") {
-            // SAFETY: only advice about mapped pages. 22 is `MADV_POPULATE_READ`: one call maps them all,
-            // instead of a fault per 16 pages, and prefetches past a page's end then find it mapped.
-            unsafe { madvise(records.as_ptr().add(pos & !4095), end - (pos & !4095), 22) };
             parse_records(&records[pos..], end - pos, &mut rows);
             let (from, to) = (pos & !4095, end & !4095); // Whole pages.
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.

@@ -1,14 +1,14 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D68), at S 388. Our best run is `run-ffdf093fc51b`: **0.0162 s / 16.3 MB**, K = **56.45** and **87.6 speed points**. Over eight board runs of this build, T read 0.0162 to 0.0207, mean 0.0176, K 48.7 to 56.2. It has a slow mode on identical code, which we haven't explained (below). The pread build it replaced read T 0.0185 to 0.0188 over five runs, mean 0.0186, K 52.7 to 52.9, at S 377.
+**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D74), at S 365. Our best run of it is `run-b4d09aa68674`: **0.0157 s / 15.5 MB**, K = **57.78**. Over seven board runs of this build, T read 0.0157 to 0.0159, M 15.5 to 16.3, K 57.0 to 57.8. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
 ## Where it loses
 
-- S is 388 code lines against the reference's 56, which costs (56/388)^0.15, K x 0.75; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
-- M is 16.3 MB in the best run, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup. In the slow mode below, M is about 2 MB higher.
-- **T has a slow mode on identical code, and we don't know why.** About 0.0205 against 0.0163, and 2 of the 8 board runs of the final build (D68), usually with M about 2 MB higher. It did not reproduce locally: over 40 local runs the mapped build's median was 10.14 ms and pread's 10.37, with similar tails. Both guesses are untested: a straggler thread holds the low mark so that records pile up, or the TLB-shootdown interrupts of `MADV_DONTNEED` slow the threads still parsing.
+- S is 365 code lines against the reference's 56, which costs (56/365)^0.15, K x 0.75; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
+- M is 15.5 to 16.3 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.
+- **T had a slow mode on identical code, about 0.0205 against 0.0163, which we believe is fixed (D74).** It hit 2 of 8 runs of D68's build. Thirteen runnable threads on 12 CPUs could leave one worker waiting a tick behind another. With the main thread as worker 0, seven runs read T 0.0157 to 0.0159. Seven runs can't prove it gone.
 - The log is mapped, so the parse's loads wait on memory instead of a copy done earlier. One prefetch per line, 1,536 bytes ahead, covers some of that. Mapping lost on the board three times before D65, because exit took the log's pages down one at a time on one thread, and the clock runs to exit. Threads that are done now share that release. What the release alone is worth is not established (D66).
 - A line for an hour already claimed restarts the whole run. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. No seed does this, but the spec doesn't rule it out.
 - Finishing limits T on the box: it is about 30% of all thread time there, against 17% locally, and with three finishers in place of four T read 0.0226 against 0.0192 (D58). D48 timed it at 8.5 ms, before D60 cut the text step from 40M to 26M ticks summed over threads. We haven't timed finishing again since, and found no cheaper scatter.
@@ -101,6 +101,14 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 65 | exp: the log mapped with one prefetch per line, and all threads sharing the release of its pages before exit | The clock runs to exit, and exit releases a mapped log's pages one by one on one thread. Earlier mapped builds carried that cost, and they lost to pread by 1 ms or more, so test mapping without it. The kernel's pread path is about 45% of thread time on the box | run-593ca047d16d | 0.0182 | 16.9 | 86.0 |
 | 66 | exp: the same mapped log with no release before exit | The control for step 65: a mapped log that exit takes apart on one thread. The code is the same but for the release | run-3e897e1dc737 (with `38079ba`) | 0.0209 | 16.5 | 84.6 |
 | 67 | exp: the mapped log and its release in 14 fewer lines | Same work as step 65, S 402 -> 388, as the cost of lines is in K | run-ffdf093fc51b | 0.0162 | 16.3 | 87.6 |
+| 68 | exp: each thread pinned to a CPU | `memory.peak` counts per-CPU charges, so the slow mode's +2 MB could be threads moving between CPUs, with T slowed by the same moves | run-00042dbc942e | 0.0176 | 15.7 | 53.7 |
+| 69 | exp: only finishers take the progress lock per segment | A thread asleep on a futex wakes late and maybe elsewhere, and its segment holds up the rest | run-4b389b530f75 | 0.0160 | 15.6 | 56.7 |
+| 70 | exp: 20 lines cut | S against the same T, as the cost of lines is in K | run-2867e50b9ce0 | 0.0161 | 15.4 | 57.1 |
+| 71 | exp: release only once all threads are done | Testing whether the release's interrupts cause the slow mode | run-b116269f1f4f | 0.0169 | 15.3 | 55.6 |
+| 72 | exp: a fifth finisher | Finishing is where the box's time goes | run-6de4f26d3299 | 0.0161 | 15.9 | 56.6 |
+| 73 | exp: 14 more lines cut | S again, with `Progress` merged into `Table`, `Order` a tuple alias and `Hour` without `repr(C)` | run-4d5653e54057 | 0.0159 | 15.4 | 57.7 |
+| 74 | exp: whole-MiB segments on big logs | Locally, threads sleep on the page cache's folio lock in `filemap_fault`; 1 MiB aligned segments cut those sleeps 98% | run-b67cdb83207a | 0.0157 | 15.6 | 57.8 |
+| 75 | exp: the main thread is worker 0 | No thirteenth runnable thread while main spawns the others, as one tick behind another thread is about +4 ms | run-b4d09aa68674 | 0.0157 | 15.5 | 57.8 |
 
 ## Decision log
 
@@ -244,6 +252,19 @@ Open: T has a slow mode on identical code, about 0.0205 against 0.0163. It hit 2
 
 Checks on the mapped build: grid 44/44, threads 234/234, stress 0 wrong in 300, constant-hash 39/39, late logs pass. Address sanitizer reports nothing on seeds 1 and 2, tiny and sample, with the right hashes. Thread sanitizer gives the right hashes; we classified its reports only for the most common types, around `Arc<Order>` and the allocator's calls in `write_hour`, where the standard mutex is not instrumented, and believe them false alarms. We have not examined them all. `hammer.py`, seed 5150: 149,916 runs, 0 bad.
 
+
+**D69.** Pinning each thread to a CPU (`56f9d535`, S 401). Four runs: T 17.6, 18.9, 18.4, 20.9 ms, M 15.4 to 15.7 (`run-00042dbc942e`, `run-3b0f03978933`, `run-07c0203bb8ff`, `run-6394b234389b`). The +2 MB went away, which fits threads moving between CPUs, but so did the fast runs. Rejected.
+
+**D70.** Only finishers take the progress lock per segment (`b3eafdad`, S 391). Nine runs, T 16.0 to 18.8, none at 19.5 or over. That was luck: the next build, with the same change, read 20.7 and 20.2. Kept as a cut in lock traffic, not as a cure. `hammer.py`: 140,763 runs, 0 bad.
+
+**D71.** Two rounds of real line cuts, with instructions per record level at 259: S 391 -> 371 (`982db0af`, `hammer.py` 97,943 runs, 0 bad) and S 371 -> 357 (`fb0d049a`, `hammer.py` 77,854 runs, 0 bad). `Progress` merged into `Table`, `Order` became a tuple alias, and `Hour` lost `repr(C)`. This undoes part of D61's trade.
+
+**D72.** Two suspects for the slow mode ruled out on the board. Releasing the log only once all threads were done (`07d18f04`, S 376, 8 runs): T 16.8 to 20.6, so the release's interrupts don't cause the slow T, though the +1 to 2 MB does go, and fast runs were about 0.7 ms slower. A fifth finisher (`9e140018`, S 371, 8 runs): T up to 24.6. Both rejected.
+
+**D73.** Whole-MiB segments on big logs (`ee1e2193`, S 362). Locally, mapped threads slept on the page cache's folio lock about 16 times per run, and 1 MiB aligned segments cut that 98%. Nine board runs: T 15.7 to 16.1 when fast, better by about 0.3 ms, and 18.3, 20.4, 20.5 otherwise. Kept for the fast runs. Folio sleeps are not the slow mode's cause.
+
+**D74.** Decision: the main thread is worker 0 (`9d2b5385`, S 365), the final build. Before, 13 threads were runnable on 12 CPUs while main spawned and then waited, so one worker could queue behind another for a tick. We can't read the box's tick; the +4 ms of the slow mode would fit HZ 250. A local trace showed one thread starting about 10 ms late. Seven board runs: T 15.7 to 15.9, M 15.5 to 16.3, K 57.0 to 57.8, none slow (`run-b4d09aa68674`, `run-b15362140adf`, `run-86ba557a7c6e`, `run-6d02b967fb0c`, `run-f0ba105756b9`, `run-eb25afb9fd6d`, `run-685ed1ae058c`). A bootstrap of the final's rule (T the mean of the middle 3 of 5, M the worst of 5) puts it 4.6% above D73's build, and its 10th percentile about equals its mean. Seven runs can't prove the mode gone, as earlier builds also looked clean by luck, but this spread is far tighter than any of theirs.
+
 ## What didn't work
 
 Local timing misled us often on this track, because this PC has a smaller L1 and a virtual machine's costly kernel entries, so the board judged anything that wasn't a plain cut in instructions.
@@ -279,18 +300,18 @@ Local timing misled us often on this track, because this PC has a smaller L1 and
 
 ## How we know it's correct
 
-- Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 4 answer-preserving rewrites of the input and 5 limit cases. The tiny and sample seeds, the rewrites and the limit cases run at 1, 2, 3, 7, 12 and 64 threads. The final build (D68) passed the grid 44/44, threads 234/234, 0 wrong in 300 stress runs, and constant-hash 39/39.
+- Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 4 answer-preserving rewrites of the input and 5 limit cases. The tiny and sample seeds, the rewrites and the limit cases run at 1, 2, 3, 7, 12 and 64 threads. The final build (D74) passed the grid 44/44, threads 234/234, 0 wrong in 300 stress runs, and constant-hash 39/39.
 - A constant-hash test build, where every key collides, gives the same answers.
 - A lock-free table's races don't show up on one pass. D26 tells how one passed the whole grid, and 300 repeated runs at 2 to 14 threads now run before any change to the table goes out.
 - Logs in other orders: shuffled, reversed, rotated, and with lines moved just past the margin, pass with no restart. Four more kinds restart on nearly every run: 2% chunks in random order, the first and last lines swapped, and all of one endpoint's lines moved to the end, for a rare key and for the longest.
-- Sanitizers on the final build. Address sanitizer: no reports on seeds 1 and 2, tiny and sample, with the right hashes. Thread sanitizer: the right hashes. We classified its reports only for the most common types, around `Arc<Order>` and the allocator's calls in `write_hour`, with an uninstrumented standard mutex, and believe them false alarms. We haven't examined them all.
-- `hammer.py`, seed 5150: 149,916 runs at 1 to 64 threads, 0 bad.
+- Sanitizers, last run on D68's build, before D70 to D74 changed its threads and locks. Address sanitizer: no reports on seeds 1 and 2, tiny and sample, with the right hashes. Thread sanitizer: the right hashes. We classified its reports only for the most common types, around `Arc<Order>` and the allocator's calls in `write_hour`, with an uninstrumented standard mutex, and believe them false alarms. We haven't examined them all.
+- `hammer.py` on the final build, seed 20261102: 106,243 runs at 1 to 64 threads, 0 bad.
 - An adversarial review of the final code found no wrong answer on input the spec allows. It found one crash that the generator can't reach: a hand-built log of 1,842 keys of two 64-byte lines each, in the same order on every thread, makes `id_of` abort, as lost compare-and-swaps waste lines until the ids run out. Its other limits are outside the spec too, and are in the [README](README.md#limits).
 - **Reproduce it yourself:** `python3 tools/verify.py --full` (Docker, git and Python only).
 
 ## With another 24 hours
 
-- **Find the slow mode.** T reads 0.0205 instead of 0.0163 on identical code in 2 of 8 board runs (D68). We have two guesses, a straggler holding the low mark and TLB-shootdown interrupts from `MADV_DONTNEED`, and tested neither. Counting records held at the end of the read, and timing the build with the release cut to one thread, would tell them apart.
+- **Confirm the slow mode is gone.** Seven clean runs (D74) aren't many.
 - **Settle the release.** D66's pair ran in a slow stretch, so what the release is worth alone is unknown. Alternating board runs with and without it would show.
 - **Fix the abort in `id_of`.** A rare case: lost compare-and-swaps waste lines of the key table, and 1,842 two-line keys in the same order on every thread can use up the ids. No generated input does this.
 - **Time finishing again.** The 8.5 ms is from before D60. With three finishers T read 0.0226, so finishing is where the box's time is; what is left to cut there is not known. The radix variants we tried lost (D63).

@@ -71,8 +71,7 @@ const NOT: u32 = 2 << 30;
 /// No query, document, block or answer has this number.
 const NONE: u32 = u32::MAX;
 /// How many queries a thread claims at a time to print, and how many tallies to add up: few enough
-/// batches (49 at full) that the threads waiting for their turn to write hardly spin, and each batch's
-/// text is about 30 KB.
+/// batches (49 at full) that a call to write takes them all at once, and each batch's text is about 30 KB.
 const BATCH: usize = 1024;
 /// How many of a query's matching documents are printed.
 const SMALLEST: usize = 10;
@@ -1325,8 +1324,7 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
 
 // ---- After the scan: the output ----
 
-/// How far each job that the threads share has got: the next of each to claim, and how far the file has
-/// got.
+/// How far each job that the threads share has got: the next of each to claim, and what's printed.
 #[derive(Default)]
 struct Progress {
     next_range: AtomicUsize,                        // In bytes of the corpus.
@@ -1352,8 +1350,8 @@ fn wait_for_all(here: &AtomicUsize, threads: usize) {
 }
 
 /// One thread's part of the scan and the answers. What it counted goes where every thread can read it once
-/// all are done. Then the totals, before any printing. Then threads claim batches of queries in order, and
-/// each waits for the batch before it to reach the file.
+/// all are done. Then the totals, before any printing. Then threads claim batches of queries, and the last
+/// to finish writes them to the file in order.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progress, threads: usize) {
     // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();

@@ -131,6 +131,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 95 | exp: records file mapped, pages released per segment, page tables touched first, one prefetch per block | Mapped lost in D19 to D24 when exit tore pages down serially on the clock; A found that worth 2.7 ms. No copy, smaller stacks | pending | — | — | — |
 | 96 | exp: mapped file, part and boundary merged, thread start without generics | Same design as d4f32c1, whose T and M tied the read design; these cold cuts cost nothing at run time | pending | — | — | — |
 | 97 | exp: positions by a fixed count of eight TZCNT steps instead of PEXT and GFNI | 14 lines. Local says T up 9 percent but local has misranked this track repeatedly and this was never run on the box | pending | — | — | — |
+| 98 | exp: back to PEXT and GFNI positions on the mapped file | TZCNT gave T 0.0208 and C over D 0.143 against 0.134, for 14 lines, so the box agrees with local here | pending | — | — | — |
 
 ## Decision log
 
@@ -328,6 +329,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D96.** Keep only if median K over 3 runs beats the current source
 
 **D97.** Keep only if median K over 3 runs beats the current source
+
+**D98.** TZCNT rejected. Mapped file sampled again
 
 ## What didn't work
 

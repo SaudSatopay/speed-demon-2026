@@ -118,13 +118,13 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | run-34c6a4bf2815 | 0.0215 | 10.4 | 81.6 |
 | 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | run-4b4240212d91 | 0.0211 | 10.3 | 81.8 |
 | 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | run-918ea96eea72 | 0.0200 | 10.7 | 82.2 |
-| 85 | T0 for the slot prefetch | ask to read the line first, it might queue less on a contended line | pending | — | — | — |
-| 86 | Tag windows on multiples of 32 | homes aligned so a window never straddles a line, at the cost of more names outside their first window | pending | — | — | — |
-| 87 | T0 for the slot prefetch, second sample | first sample ran while the box was slow, A slowed 10 percent in the same run with no code change | pending | — | — | — |
-| 88 | Tag windows on multiples of 32, second sample | first sample T 0.0210 K 43.18, inside the range the chosen source has shown | pending | — | — | — |
-| 89 | T0 for the slot prefetch, third sample | samples so far K 41.66 on a slow box and K 43.96 | pending | — | — | — |
-| 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | pending | — | — | — |
-| 91 | Chosen source restored | neither idea beat it over three samples | pending | — | — | — |
+| 85 | T0 for the slot prefetch | ask to read the line first, it might queue less on a contended line | run-4262cd2eb150 | 0.0227 | 10.3 | 81.0 |
+| 86 | Tag windows on multiples of 32 | homes aligned so a window never straddles a line, at the cost of more names outside their first window | run-029d59804052 | 0.0210 | 10.4 | 81.8 |
+| 87 | T0 for the slot prefetch, second sample | first sample ran while the box was slow, A slowed 10 percent in the same run with no code change | run-37447595dbd9 | 0.0203 | 10.4 | 82.2 |
+| 88 | Tag windows on multiples of 32, second sample | first sample T 0.0210 K 43.18, inside the range the chosen source has shown | run-e6a8ded823e8, on docs commit 1e21980 with this source | 0.0211 | 10.3 | 81.8 |
+| 89 | T0 for the slot prefetch, third sample | samples so far K 41.66 on a slow box and K 43.96 | run-2bf3009dbcc3 | 0.0207 | 10.2 | 82.0 |
+| 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | run-ee0a2bfc62e2 | 0.0230 | 10.2 | 80.9 |
+| 91 | Chosen source restored | neither idea beat it over three samples | run-a80a4965a4fa | 0.0203 | 10.4 | 82.1 |
 
 ## Decision log
 
@@ -344,7 +344,6 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 
 The box showed that line fills per record set T here, more than instructions or the lock, so that's where we'd look.
 
-- **Tag windows that don't straddle a line.** A 32-byte window of tags from any slot crosses a cache line 31 times in 64. Homes on multiples of 32 would never cross, at the cost of more names outside their first window, in a table about 91% full. Never tried.
-- **`T0` for the slot prefetch.** It asks to own the line now (`ET0`). On a line many cores write, asking for it to read first might queue less. One word to test, and never tried on the box.
+- **Already tested, both lost (D91).** `T0` for the slot prefetch: K 41.66, 43.96, 43.73, median 43.73. Homes on multiples of 32, so that tag windows never straddle a line: K 43.18, 43.28, 41.48, median 43.18. The chosen source's median is 44.00 over 7 runs, and it has ranged from 42.71 to 44.95 with no change, so T0's 0.6% is a lack of gain rather than a proven loss. Aligned homes are about 1.9% down.
 - **Lines.** S is worth about 1% of K per 28 lines, and it's the largest part of what separates us from the leader. Removals of the big blocks mostly lost on the box, so what's left is many small ones, each needing several samples to tell from noise.
 - **A local machine like the box.** Local cycles on a Zen 4 ranked cache and lock changes wrongly, so each real answer took a board slot. A Golden Cove machine would have let us test far more of them.

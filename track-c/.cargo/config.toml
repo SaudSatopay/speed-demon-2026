@@ -5,4 +5,6 @@
 # carry-less multiply, PREFETCHW and GFNI, which x86-64-v3 leaves out. The multiply finds a field's
 # closing quote. PREFETCHW lets the name table ask for a slot's line with intent to write. GFNI turns
 # bit planes into position bytes in one instruction.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+prfchw,+gfni,+crt-static"]
+# The last two lift tuning meant for much older CPUs: a zeroing instruction before each bit count, and
+# three-part LEAs split in two.
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+prfchw,+gfni,+crt-static,-false-deps-popcnt,-false-deps-lzcnt-tzcnt,-slow-3ops-lea"]

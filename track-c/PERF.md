@@ -82,6 +82,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 60 | exp: four more huge pages mapped, touched and unmapped at the start | To time what zeroing and mapping huge pages costs on the box: locally 65 us per page. Memory reads high in this run | pending | — | — | — |
 | 61 | Rows unpacked to 8 words, one line each; min and max as branches; repeats added from BTS's carry; the locked write last in a record | The third loop had 103 instructions, with 5 register spills, 5 instructions turning the carry into a count and 8 for min and max, which hardly ever change | pending | — | — | — |
 | 62 | Position bytes from one GFNI matrix multiply instead of six PDEPs, with +gfni in the build's target features | Six PDEPs a block take the one port that runs them, and the box's Raptor Lake cores have GFNI | pending | — | — | — |
+| 63 | Row columns reordered so sums aren't adjacent; tuning for old CPUs lifted (false dependencies of bit counts, slow three-part LEA) | The compiler paired adjacent additions into vector instructions that took more than the two would, and added zeroing instructions and split LEAs meant for old CPUs | pending | — | — | — |
 
 ## Decision log
 
@@ -209,6 +210,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D61.** Instructions per record 290 to 272, cycles -3.4% over 15 runs each, S no higher. SLP off is flat
 
 **D62.** Cycles per record -3.3%, instructions the same, wall -3 to -5% locally, S +4
+
+**D63.** Instructions per record 271 to 261, cycles -1.5 to -2%, S the same
 
 ## What didn't work
 

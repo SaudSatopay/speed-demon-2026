@@ -396,11 +396,12 @@ impl<'a> NameTable<'a> {
     }
 }
 
-/// A country's totals, one cache line: its count; id sum; amount sum; lowest amount; highest amount;
-/// name bytes; note bytes; and how many of its records repeat a name.
+/// A country's totals, one cache line: its count; lowest amount; id sum; highest amount; amount sum;
+/// name bytes; how many of its records repeat a name; and note bytes. That order keeps sums apart, or
+/// the compiler pairs their additions up as vector instructions, which take more than the two would.
 #[repr(align(64))]
 struct Row([i64; 8]);
-const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0]);
+const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
@@ -586,17 +587,17 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         let cents = i64::from(cents as i32);
         let row = &mut rows[usize::from(country)].0;
         row[0] += 1;
-        row[1] += i64::from(id);
-        row[2] += cents;
+        row[2] += i64::from(id);
+        row[4] += cents;
         // These hardly ever change, so branches beat conditional moves and two stores.
-        (cents < row[3]).then(|| row[3] = cents);
-        (cents > row[4]).then(|| row[4] = cents);
+        (cents < row[1]).then(|| row[1] = cents);
+        (cents > row[3]).then(|| row[3] = cents);
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
         row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
-        row[6] += (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
+        row[7] += (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
         let key = (name_at + 1, name.saturating_sub(2));
-        unsafe { names.mark(guess as usize, text, key, country, &mut row[7]) };
+        unsafe { names.mark(guess as usize, text, key, country, &mut row[6]) };
     }
 }
 
@@ -665,10 +666,10 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
             }
         });
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
-            for i in [0, 1, 2, 5, 6, 7] {
+            for i in [0, 2, 4, 5, 6, 7] {
                 total[i] += row[i];
             }
-            (total[3], total[4]) = (total[3].min(row[3]), total[4].max(row[4]));
+            (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
         }
     };
     run_threads(&work, threads, names.stacks);
@@ -709,14 +710,14 @@ fn run() -> io::Result<()> {
     lines.push(("_UNMATCHED", &totals[0]));
     let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt"))?);
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
-        write!(out, "{key} {} {}", row[0], row[1])?;
+        write!(out, "{key} {} {}", row[0], row[2])?;
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
         // which would lose the sign of -0.75. Zero never gets a sign.
-        for cents in &row[2..5] {
+        for cents in [&row[4], &row[1], &row[3]] {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
             write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
         }
-        writeln!(out, " {} {} {}", row[0] - row[7], row[5], row[6])?;
+        writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7])?;
     }
     out.flush()
 }

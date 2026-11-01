@@ -16,10 +16,11 @@
 #![no_main]
 
 use std::arch::x86_64::*;
+use std::mem::{replace, transmute};
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Mutex};
-use std::{fs::File, io::Write, mem::replace, os::unix::fs::FileExt, path::Path, thread};
+use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path, thread};
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
 const HOURS: usize = 72;
@@ -191,9 +192,8 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// reads and writes no line that other threads write, and allocates nothing.
 fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Option<[usize; 2]>) {
     // With 192 spare bytes after a piece, so that a load that starts at a short fixed distance from a
-    // line needs no check of its own, and 128 to line a read up with its source in a cache line.
-    let mut room = [0u8; PIECE + 192 + 128];
-    let base = room.as_ptr().align_offset(64);
+    // line needs no check of its own.
+    let mut room = [0u8; PIECE + 192];
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
     // The last line's hour: its index and its place in a block, and in a segment, its bytes. An aligned
     // place means the block is used up, and hours change only between chunks of the log.
@@ -207,7 +207,6 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
         let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
             // No more than what the segment's lines need: the longest line is well below 256 bytes.
-            let room = &mut room[base + pos % 64..];
             let want = PIECE.min(end - pos + 256);
             let got = log.read_at(&mut room[..want], pos as u64).unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
@@ -294,27 +293,23 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
     }
 }
 
-/// The 8 decimal digits of a value below 10^8, as bytes with the most significant first, and with
-/// no ASCII offset yet. Each step splits every number in its lane in two, in parallel, by multiplying
+/// The 8 decimal digits of each of four values below 10^8, as bytes with the most significant first, and
+/// with no ASCII offset yet. Each step splits every number in its lane in two, in parallel, by multiplying
 /// by a scaled reciprocal: 10^8 into two of 10^4, those into 10^2, and those into digits.
-fn eight_digits(value: u64) -> u64 {
-    let high_low = value / 10_000 | (value % 10_000) << 32;
-    let hundreds = (high_low * 10486 >> 20) & 0x0000_007F_0000_007F;
-    let pairs = (high_low - 100 * hundreds) << 16 | hundreds;
-    let tens = (pairs * 103 >> 10) & 0x000F_000F_000F_000F;
-    tens | (pairs - 10 * tens) << 8
-}
-
-/// Appends a number in decimal, with no loop or mispredicted branch for values below 10^8.
-fn push_decimal(out: &mut Vec<u8>, value: u64) {
-    if value >= 100_000_000 {
-        return write!(out, "{value}").unwrap();
+fn eight_digits(values: [u64; 4]) -> [u64; 4] {
+    // SAFETY: the build targets x86-64-v3, which has AVX2, and both types are 32 bytes of plain data.
+    unsafe {
+        let value = transmute::<_, __m256i>(values);
+        let high = _mm256_srli_epi64(_mm256_mul_epu32(value, _mm256_set1_epi64x(0xD1B7_1759)), 45);
+        let low = _mm256_sub_epi64(value, _mm256_mul_epu32(high, _mm256_set1_epi64x(10_000)));
+        let fours = _mm256_or_si256(high, _mm256_slli_epi64(low, 32));
+        let hundreds = _mm256_srli_epi32(_mm256_mullo_epi32(fours, _mm256_set1_epi32(10486)), 20);
+        let rest = _mm256_sub_epi32(fours, _mm256_mullo_epi32(hundreds, _mm256_set1_epi32(100)));
+        let pairs = _mm256_or_si256(hundreds, _mm256_slli_epi32(rest, 16));
+        let tens = _mm256_srli_epi16(_mm256_mullo_epi16(pairs, _mm256_set1_epi16(103)), 10);
+        let ones = _mm256_sub_epi16(pairs, _mm256_mullo_epi16(tens, _mm256_set1_epi16(10)));
+        transmute(_mm256_or_si256(tens, _mm256_slli_epi16(ones, 8)))
     }
-    let digits = eight_digits(value);
-    let leading_zeros = (digits.trailing_zeros() as usize / 8).min(7);
-    let end = out.len() + 8 - leading_zeros;
-    out.extend_from_slice(&((digits | 0x3030_3030_3030_3030) >> (8 * leading_zeros)).to_le_bytes());
-    out.truncate(end);
 }
 
 /// One stable pass of an LSD radix sort. `at` holds each digit's count, `order` lists the digits that
@@ -334,7 +329,8 @@ fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl F
 /// Appends one hour's output lines, given its records sorted by endpoint and then latency, where each
 /// id's group ends, its big latencies sorted by id and then latency, and the endpoints and ids in order.
 fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, out: &mut Vec<u8>) {
-    let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24);
+    let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24).into_bytes();
+    let stamp: [u8; 21] = stamp.try_into().unwrap();
     // Each group starts where the one before it ends, and id 0's holds the unused ends of blocks.
     let mut start = ends[0] as usize;
     for (key, &id) in order.0.iter().zip(order.1).skip(1) {
@@ -355,13 +351,33 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, 
         let (p50, p99) = (pct(50), pct(99));
         // Below 20 records, p95 and p99 are the same record.
         let p95 = if n <= 19 { p99 } else { pct(95) };
-        out.extend_from_slice(stamp.as_bytes());
-        out.extend_from_slice(key);
-        for value in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
-            out.push(b' ');
-            push_decimal(out, value);
+        let rate = errors * 1_000_000 / count;
+        let [a, b, c, d] = eight_digits([count, p50, p95, p99]);
+        let [e, f, ..] = eight_digits([errors, rate, 0, 0]);
+        // SAFETY: the hour's array has room for 256 bytes past any line. A key is in the table's lines,
+        // followed by its closing space, and a copy of fixed size has no branch on its length.
+        unsafe {
+            let mut at = out.as_mut_ptr().add(out.len());
+            at.cast::<[u8; 21]>().write_unaligned(stamp);
+            let whole = key.as_ptr().cast::<[u8; 128]>().read_unaligned();
+            at.add(21).cast::<[u8; 128]>().write_unaligned(whole);
+            at = at.add(22 + key.len());
+            let numbers = at;
+            for digits in [a, b, c, d, e, f] {
+                let zeros = (digits.trailing_zeros() as usize / 8).min(7);
+                at.cast::<u64>()
+                    .write_unaligned((digits | 0x3030_3030_3030_3030) >> (8 * zeros));
+                at.add(8 - zeros).write(b' ');
+                at = at.add(9 - zeros);
+            }
+            at.sub(1).write(b'\n');
+            // A latency of 10^8 or more is rare, and isn't printed by the above: the numbers start again.
+            let end = if p99 < 100_000_000 { at } else { numbers };
+            out.set_len(end.offset_from(out.as_ptr()) as usize);
         }
-        out.push(b'\n');
+        if p99 >= 100_000_000 {
+            writeln!(out, "{count} {p50} {p95} {p99} {errors} {rate}").unwrap();
+        }
     }
 }
 
@@ -450,8 +466,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
         let mut scratch = Vec::with_capacity(usize::from(me < 4) << 18);
         let go = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
-            let head = cursor.load(Relaxed);
-            reached[me].store(head, Release);
+            reached[me].store(cursor.load(Relaxed), Release);
             let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
             let mut state = table.3.lock().unwrap();
             let (hour, seen) = (state.0, state.1.get(state.0).copied());
@@ -460,9 +475,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
             // its whole turn off the core, and that happens all the time, so a wait here turned a busy
             // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
             // while the box is busy.
-            // Once there's nothing left to read, every thread helps.
-            let helps = me < 4 || head >= end;
-            if helps && seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
+            if me < 4 && seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
                 state.0 += 1;
                 drop(state);
                 // While it writes, this thread holds no hour back.
@@ -473,7 +486,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
             }
             let start = cursor.fetch_add(size, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
-            if start < end || head >= end && hour >= HOURS {
+            if start < end || reached[me].load(Relaxed) >= end && (me >= 4 || hour >= HOURS) {
                 return (start < end).then_some([start, (start + size).min(end)]);
             }
             // The wait gives up its core, and the lock first: a spinning thread would keep the one

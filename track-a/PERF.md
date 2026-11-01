@@ -92,6 +92,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 57 | Reads that stop where the segment does, lined up with their source, in 32 KiB pieces again | With 64 KiB pieces T stayed at 0.0188 and M rose to 17.0, so the pieces go back to 32 KiB, and reads that stop with the segment, at T 0.0189 against 0.0193, stay | pending | — | — | — |
 | 58 | exp: three threads finish hours instead of four | Each finisher's scratch stays as large as the largest hour it has seen, about 0.3 MB, and eight finishers read T 0.0197 at M 17.5 | pending | — | — | — |
 | 59 | exp: once there's nothing left to read, every thread helps finish hours | Three finishers read T 0.0226 against 0.0192 with four, so finishing limits T on the box, while eight read T 0.0197 at M 17.5, as finishers take cores from the readers. After the last read, 8 of 12 threads have been leaving the other 4 to finish alone | pending | — | — | — |
+| 60 | Digits of four numbers at once in one vector, stamp and key as copies of fixed size, reads no longer lined up with their source | Finishing is about 30% of all thread time on the box, as 3 finishers against 4 showed, against 17% locally, and text was 38% of it: about 300 cycles per line and 3 mispredicts | pending | — | — | — |
 
 ## Decision log
 
@@ -212,6 +213,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D58.** Experiment, against T 0.0189 to 0.0195 and M 16.0 to 16.8 with four. Local timing can't judge this. It needs several samples, as one sample's noise is about the size of the effect.
 
 **D59.** Experiment, against T 0.0189 to 0.0195 at M 16.0 to 16.8, with four finishers during the read and all threads after it. Locally flat within noise: +0.2 ms of 11.7. M may rise as helpers' scratch adds up at the end. Grid and thread sweep pass; S 299 -> 301.
+
+**D60.** Instruction cuts, so local counters rank them. Text: 40M -> 26M time stamp ticks, summed over threads. Against the build before, over alternating runs: cycles 297M -> 278M, instructions 573M -> 498M, mispredicts 0.96M -> 0.86M, paired wall about -3%. Of that, 35M instructions are from taking out the alignment of step 54, whose changing base cost 12 instructions per line with no gain the board could show: T averaged 0.0192 over 3 runs with it. Tried on the board and dropped: three finishers (T 0.0226, M 16.9), all threads helping once the reading is done (T 0.0192, M 16.7). S 299 -> 313. Grid, thread sweep and const-hash pass, stress 0 wrong in 100, late logs pass.
 
 ## What didn't work
 

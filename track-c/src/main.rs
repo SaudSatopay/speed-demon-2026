@@ -390,7 +390,7 @@ impl<'a> NameTable<'a> {
             // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
             // leaves the old bit in the carry.
             let (words, bit) = (self.words.as_ptr(), usize::from(bit));
-            asm!("lock bts [{} + {} * 8 + 32], {}", "lock adc qword ptr [{}], 0",
+            asm!("lock bts [{} + {} * 8 + 32], {}", "adc qword ptr [{}], 0",
                 in(reg) words, in(reg) base, in(reg) bit, in(reg) same);
         }
     }

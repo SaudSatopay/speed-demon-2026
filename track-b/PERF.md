@@ -60,6 +60,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 26 | Back to ordered printing, without the page mapping ahead | Known offsets, direct OR and NOT, and shrinking ranges read T 0.1028 and 0.1008 at S 954, against a median of 0.1006 at S 928 | run-f39141d33527 | 0.0983 | 41.6 | 78.4 |
 | 27 | Terms found without their set's lock, one round of threads for the scan and the answers, larger print batches | Serial costs on the box are about twice local, and another ello reached T 0.077 at S 949, so there's more to find than instructions per token | pending | — | — | — |
 | 28 | exp: each thread gives back a range's pages when it has scanned it | The kernel's unmap at exit is serial, about 62K pages' mapping counts and references, cold by then, and T counts up to exit; on A, mapping lost to reading by 3.3 ms though reading copies every byte | pending | — | — | — |
+| 29 | Fifty-seven fewer lines outside the scan, `main` as the C entry point, and each range's pages left alone | Cause Of Death passed us on B at T 0.100 and S 823, so S is the cheap gain here: 100 lines is K +1.5% | pending | — | — | — |
 
 ## Decision log
 
@@ -120,6 +121,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D28.** For the board, as these are latency gains, not instruction cuts. Most query tokens are terms already in the table, and `intern` now finds those with no lock, since a way's key goes in last, with Release. `pack` makes its masks without a division. Threads stay on after the scan instead of a new round being started, and 1024 queries a batch means 49 ordered writes instead of 196. Locally, 12 threads, medians of 7: parse 3.3 -> 2.8 ms, plan 3.6 -> 3.3, answers 6.0 -> 4.5; cycles 2.34G -> 2.33G, instructions +0.3%, M 40.9 to 41.5 MB, S 925 -> 927. Tried and dropped: per-thread counts in the sample, an inlined compare of long keys (+1% instructions). Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 **D29.** Experiment, against T 0.098 to 0.102 at S 934. Each of 192 calls stops the other threads briefly for its TLB flush, which costs more here in a VM than on the box, so local timing can't judge this.
+
+**D30.** Cut lines with no loss of speed, in the plan and answer code; the scan isn't touched. Over alternating runs: cycles 2.359G flat, instructions +0.06%, M max 42.74 MB. `#![no_main]` skips std's setup before main, as on A. Giving back each range's pages after its scan read T 0.1030 against a median of 0.1013, so the serial unmap at exit isn't what limits B, and that goes. Also measured on B and dropped, locally: lookups in windows of tokens (flat), PGO (flat), an L1 table of hot terms (cycles +10 to 14%, as hot lines were already cached), new layouts for check_bools (cycles +2 to 3.5%), marks as bits (cycles +3%). Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 ## What didn't work
 

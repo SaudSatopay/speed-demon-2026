@@ -21,11 +21,9 @@
 #![no_main]
 
 use std::arch::x86_64::*;
-use std::io::{self, Write};
-use std::mem::{replace, transmute};
-use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::{fs::File, os::fd::AsRawFd, path::Path, sync::Arc, sync::Mutex, thread};
+use std::{fs::File, io, io::Write, mem::replace, mem::transmute, os::fd::AsRawFd, path::Path};
+use std::{slice::from_raw_parts, slice::from_raw_parts_mut, sync::Arc, sync::Mutex, thread};
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
 const HOURS: usize = 72;
@@ -174,8 +172,7 @@ fn id_of(table: &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
     let differ = |at: usize, b, m: u64| !equal_bytes(read(at), b) & m;
     loop {
         let slot = &table.slots[index & (SLOTS - 1)];
-        let mut line = slot.load(Acquire) as usize;
-        if line == 0 {
+        if slot.load(Acquire) == 0 {
             // A key takes at most 2 lines.
             let at = table.used.fetch_add(key.len().div_ceil(64), Relaxed);
             assert!(at + 2 <= IDS, "more keys than a record's id can hold");
@@ -183,9 +180,9 @@ fn id_of(table: &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
             cells.zip(key).for_each(|(c, &b)| c.store(b, Relaxed));
             // If another thread's key took the slot first, the lines reserved here stay unused, and
             // the compare below tells whose key is in the slot.
-            let swap = slot.compare_exchange(0, at as u16, Release, Acquire);
-            line = swap.err().map_or(at, |taken| taken as usize);
+            _ = slot.compare_exchange(0, at as u16, Release, Relaxed);
         }
+        let line = slot.load(Acquire) as usize;
         if differ(line, block, mask) | differ(line + 1, second, rest) == 0 {
             return line as u32;
         }
@@ -235,7 +232,6 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
         _mm_cvtsi128_si32(_mm_madd_epi16(eight, _mm_set1_epi32(10000 + (1 << 16)))) as u64
     };
     while digits >= 8 && text[pos + digits] != b'\n' {
-        cold();
         value = value * 10 + u64::from(text[pos + digits] - b'0');
         digits += 1;
     }
@@ -297,7 +293,6 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
             // read only when the first has no space: there, the first's trailing zeros are 64.
             let mut len = spaces.trailing_zeros() as usize;
             if spaces == 0 {
-                cold();
                 // SAFETY: the padding covers it.
                 len += unsafe { equal_bytes(load(text, at + 64), gap) }.trailing_zeros() as usize;
             }
@@ -327,7 +322,6 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
             let hit = !equal_bytes(seen, key) & mask == 0 && spaces != 0;
             let id = if hit { kept as u32 } else { miss() };
             if latency >= BIG_LATENCY {
-                cold();
                 // A fresh block of big latencies, from the back of the hour's array.
                 if bigs[hour] as usize % (BIG_BLOCK * 4) == 0 {
                     let Hour { words, back, .. } = &hours[hour];
@@ -342,9 +336,7 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
             }
             // A fresh block of records, from the front.
             if place as usize % (BLOCK * 4) == 0 {
-                cold();
-                let Hour { words, front, .. } = &hours[hour];
-                place = words[front.fetch_add(BLOCK, Relaxed)..].as_ptr();
+                place = hours[hour].words[hours[hour].front.fetch_add(BLOCK, Relaxed)..].as_ptr();
             }
             // Statuses are 100 to 599.
             // SAFETY: as above, for `close`.
@@ -402,8 +394,7 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
     for (key, &id) in order.0.iter().zip(&order.1).skip(1) {
         let group = &recs[replace(&mut start, ends[id] as usize)..ends[id] as usize];
         // An endpoint with no line in this hour prints nothing.
-        let Some(_) = group.first() else { continue };
-        let n = group.len();
+        let n @ 1.. = group.len() else { continue };
         let errors = group.iter().map(|r| r & 1).sum::<u32>() as u64;
         // Nearest rank, as the spec defines it. A group's big latencies are its last records, as they
         // sort highest, so a rank among them reads the real value from `big`, by two binary searches.
@@ -541,14 +532,10 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
     // Tying a segment's size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
     // smaller than a line on tiny inputs.
-    let segment = (end / (threads * 64)).max(1);
     // Threads faulting in the same large folio of the page cache sleep on its lock, so on a big log
     // they stay out of each other's folios.
-    let segment = if segment < 1 << 16 {
-        segment
-    } else {
-        segment.next_multiple_of(1 << 20)
-    };
+    let unit = if end < 1 << 26 { 1 } else { 1 << 20 };
+    let segment = (end / threads / 64 + 1).next_multiple_of(unit);
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
     let worker = &|me: usize| {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each

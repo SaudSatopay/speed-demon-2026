@@ -86,6 +86,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 50 | Line cuts with no change of behaviour: a helper for locks and one for ids inlined, and a few statements shortened | A fresh read of the code found them. S -16 by rustfmt's count, instructions flat at +0.07% | run-ac65e7ce25d1 | 0.0762 | 26.8 | K 41.33, one run |
 | 51 | exp: short checks filtered into a list before any write to hits, and group collects its items once | About half of 8.9M short checks are false, and each still wrote its hit word. Local: instructions -1.58%, cycles -2.9 to -4.7%, misses -3.4%, S -8 at first measure. group's second pass over its items was serial work in the plan | run-d5eeb62467e4 | 0.0751 | 28.1 | K median 41.59 over 3 runs: kept |
 | 52 | A term's own tally becomes an always-true check, dropping the separate add in check_bools | S -2 net, misses -6.75% locally, instructions +1% | pending | — | — | — |
+| 53 | Back to the kept source, cb's K 40.81 lost, plus the heap starting at a 2 MiB boundary | Up to 2 MiB of the heap, with the term table, otherwise gets small pages by a random amount per run | pending | — | — | — |
 
 ## Decision log
 
@@ -194,6 +195,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D52.** Experiment: judged by median K over at least 3 board runs
 
 **D53.** Judged on the board by median K over 3 against the current source
+
+**D54.** Judged on the board by median K over 3 or more against 41.59
 
 ## What didn't work
 

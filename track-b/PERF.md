@@ -73,6 +73,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 37 | Parked threads map the corpus ahead with MADV_POPULATE_READ, a common sure term's tally runs by blocks, columns numbered by first use and aligned, short checks packed in 8 bytes, a phrase anchor's neighbour stored for a first test, answers on their own cache lines, no barrier in the answer round, and 78 fewer lines | The board showed B more sensitive to L2 than local cycles say, so this round goes after bytes a thread drags through L2 per document and per block: block queries 2767 to 1913, columns 5067 to 3013, columns read per block 158 to 94 KB | run-840d618b3bd5 | 0.0786 | 28.4 | 80.4 |
 | 38 | exp: block queries at anchors holding N/32 documents, not N/48 | A common sure term's tally now runs by blocks, which changes what a block query costs, so the line may have moved | run-e2271da97952 | 0.0786 | 26.5 | 80.4 |
 | 39 | exp: all threads share the release of the corpus's pages before exit | The clock runs to exit, and exit takes 59,000 mapped pages out one by one on one thread. The same change helped A on the box. Local paired wall is flat, -0.8% inside 28% noise | pending | — | — | — |
+| 40 | exp: each thread lists its own first ten ids per tally, added up after the scan, with no lock during it | 322,000 lock takes and 524,000 reads of a shared limit on seed 1, each a likely cache-line transfer. Spends memory that scores nothing below 44 MB; this build is about 51 MB locally, so it measures T first | pending | — | — | — |
 
 ## Decision log
 
@@ -155,6 +156,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D39.** Measurement against T 0.0787 at N/48. S flat.
 
 **D40.** Experiment: judged by median K over at least 3 board runs against the current source
+
+**D41.** Experiment: T decides whether to trim M
 
 ## What didn't work
 

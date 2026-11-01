@@ -600,12 +600,6 @@ struct Query(bool, u32, u32);
 #[derive(Clone, Copy)]
 struct AnchorList(u32, u32, u32); // Where its short checks start, where its long ones do, and its own tally.
 
-/// A tally's place in the plan: the answer it goes into, and the last of that answer's ten smallest
-/// documents when this last saw them, which only falls, so that the documents past it need no lock. Those
-/// fill first, as threads work through the corpus together, and only a thread's own first ten ever get this
-/// far. What each thread has counted is in `Scan::hits`.
-struct Tally(u32, AtomicU32);
-
 /// The queries, and what the sample decided: how each term is stored, and what to check at each term's
 /// occurrences. The threads share this while they scan.
 #[derive(Default)]
@@ -627,28 +621,13 @@ struct Plan<'a> {
     shared_answer: Vec<u32>, // For each query, the answer of the term's tally that adds to it, or NONE.
     // The answers: the queries', in order, then one for each term with a tally, then a spare.
     answers: Vec<Slot>,
-    tallies: Vec<Tally>,
+    tallies: Vec<u32>, // The answer that each tally goes into. What each thread counted is in `Scan`.
 }
 
 /// Takes a lock. Only a panicking thread could poison the lock, and a panic aborts the process here,
 /// so there's no error to handle.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Puts a document among the smallest of a tally's answer. Returns `TOO_BIG` if it's past the limit, as all
-/// the thread's later ones will be too. This is cold beside the check that leads here, and keeping it out
-/// of line lets that check be inlined.
-#[cold]
-fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
-    let tally = &plan.tallies[at];
-    if doc >= tally.1.load(Relaxed) {
-        return TOO_BIG;
-    }
-    let mut answer = lock(&plan.answers[tally.0 as usize].0);
-    insert_smallest(&mut answer.ids, doc);
-    tally.1.store(answer.ids[SMALLEST - 1], Relaxed);
-    0
 }
 
 /// How many times each term occurs, among pieces of the corpus 2 MiB in all, about 1%, and in place of
@@ -857,8 +836,7 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let checked = checks.iter().map(|&(query, _)| query);
     let blocks = block_term_answers.into_iter().chain(block_queries);
     let tally_answers = checked.chain(query_count..answers).chain(blocks);
-    let tally = |answer| Tally(answer, AtomicU32::new(NONE));
-    plan.tallies = tally_answers.map(tally).collect();
+    plan.tallies = tally_answers.collect();
     let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
     let blank = |_| Slot(Mutex::new(Answer { count, sum, ids }));
     plan.answers = (0..answers).map(blank).collect();
@@ -882,7 +860,10 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
 struct Scan {
     columns: Vec<Column>, // For each term with one, which documents of the block in hand hold it. Then a spare.
     hits: Vec<u64>, // For each tally: documents, above `SUM_BITS`, and the sum of their ids, below.
-    counted: Vec<u32>, // The phrases that the document in hand has counted in.
+    // For each tally, the first ten documents this thread found. Its hits ascend, so no others of its can
+    // be among the smallest, and this memory saves a lock and a cache miss per document.
+    first_ids: Vec<[u32; SMALLEST]>,
+    counted: Vec<u32>,    // The phrases that the document in hand has counted in.
     short_list: Vec<u32>, // The short checks to run for the document in hand.
 }
 
@@ -925,9 +906,6 @@ struct Column([u64; 4]);
 
 /// The bits of `hits` that hold the sum of ids, enough for the spec's numbers of documents.
 const SUM_BITS: u32 = 40;
-
-/// A high bit of `hits`, past any count, which says that no more documents are among the smallest.
-const TOO_BIG: u64 = 1 << 62;
 
 /// Puts a document among a list's ten smallest.
 fn insert_smallest(smallest: &mut [u32; SMALLEST], mut doc: u32) {
@@ -1165,16 +1143,17 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
     // SAFETY: the build targets x86-64-v3, which has AVX.
     let stamp = unsafe { _mm_set1_epi8(lists.stamp as i8) };
     let (hits, short) = (&mut scan.hits[..], &mut scan.short_list[..]);
+    let first_ids = &mut scan.first_ids[..];
     let checks = plan.short_checks.as_ptr();
     let (anchor_lists, this_doc) = (&plan.anchor_lists[..], (1 << SUM_BITS) + u64::from(doc));
-    // SAFETY: `hits` has every tally. A thread's hits ascend, so only its first ten can be among the
-    // smallest.
+    // SAFETY: `hits` and `first_ids` have every tally, and a count below 11 that isn't 0 is a place there.
     let mut add = |counts: u64, at: usize| unsafe {
         let hit = hits.get_unchecked_mut(at);
         *hit += counts * this_doc;
         // Below 11 and counted, in a way the compiler can't turn into a coin-toss branch.
         if hit.wrapping_sub((SMALLEST as u64 + 1) << SUM_BITS) >> 63 & counts != 0 {
-            *hit |= add_smallest(plan, at, doc);
+            let place = (*hit >> SUM_BITS) as usize - 1;
+            *first_ids.get_unchecked_mut(at).get_unchecked_mut(place) = doc;
         }
     };
     // SAFETY: a prefetch has no other effect, whatever the address.
@@ -1223,22 +1202,20 @@ static STEP_MASKS: StepMasks = StepMasks([
     [!0, !0, !0, !0, 0, 0, 0, 0],
 ]);
 
-/// Puts documents of a block's result among the smallest of a tally's answer, up to the first past its limit.
+/// Lists documents of a block's result after the `held` that a thread has of a tally, up to ten.
 #[cold]
-fn add_smallest_of_block(plan: &Plan, at: usize, set: __m256i, first_doc: u32) -> u64 {
+fn list_first_ids(ids: &mut [u32; SMALLEST], held: usize, set: __m256i, first_doc: u32) {
     // SAFETY: a vector has the layout of four words.
     let words = unsafe { std::mem::transmute::<__m256i, [u64; 4]>(set) };
+    let mut places = ids[held..].iter_mut();
     for (word, &bits) in words.iter().enumerate() {
         let mut rest = bits;
         while rest != 0 {
-            let doc = first_doc + 64 * word as u32 + rest.trailing_zeros();
-            if add_smallest(plan, at, doc) != 0 {
-                return TOO_BIG;
-            }
+            let Some(place) = places.next() else { return };
+            *place = first_doc + 64 * word as u32 + rest.trailing_zeros();
             rest &= rest - 1;
         }
     }
-    0
 }
 
 /// Runs each query that goes by blocks over one block of documents, in vectors, and adds what it finds to
@@ -1247,7 +1224,13 @@ fn add_smallest_of_block(plan: &Plan, at: usize, set: __m256i, first_doc: u32) -
 /// word's first document, plus 8 times the byte's number in the word, plus its place in the byte. The
 /// bytes' numbers times their counts stay below 256 for each pair of bytes, so that SAD can add those too.
 #[inline(never)]
-fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u32) {
+fn answer_block(plan: &Plan, scan: &mut Scan, first_doc: u32) {
+    let Scan {
+        columns,
+        hits,
+        first_ids,
+        ..
+    } = scan;
     let mut at = plan.tallies.len() - plan.block_queries;
     // SAFETY: a step's number is a column's, its top two bits index `STEP_MASKS`, the tallies include `at`,
     // and the build targets x86-64-v3, which has AVX2.
@@ -1292,10 +1275,11 @@ fn answer_block(plan: &Plan, columns: &[Column], hits: &mut [u64], first_doc: u3
                 let found = _mm_cvtsi128_si64(found) as u64;
                 let hit = hits.get_unchecked_mut(at);
                 // Fewer than ten so far, and more now, in a way the compiler can't turn into a coin-toss
-                // branch. A thread's hits ascend, so only its first ten can be among the smallest.
+                // branch.
                 let open = (*hit).wrapping_sub((SMALLEST as u64) << SUM_BITS) >> 63;
                 if open & u64::from(found != 0) != 0 {
-                    *hit |= add_smallest_of_block(plan, at, set, first_doc);
+                    let held = (*hit >> SUM_BITS) as usize;
+                    list_first_ids(first_ids.get_unchecked_mut(at), held, set, first_doc);
                 }
                 *hit += found;
                 at += 1;
@@ -1310,7 +1294,7 @@ fn finish_block(plan: &Plan, scan: &mut Scan, rows: &mut [[u64; 64]], first_doc:
         let with_rows = &mut scan.columns[..plan.rowed_count];
         store_rows(rows, with_rows, docs as usize / 64);
     }
-    answer_block(plan, &scan.columns, &mut scan.hits, first_doc);
+    answer_block(plan, scan, first_doc);
     scan.columns.fill(Column([0; 4]));
 }
 
@@ -1326,14 +1310,14 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
 /// got.
 #[derive(Default)]
 struct Progress {
-    next_range: AtomicUsize,    // In bytes of the corpus.
-    hits: Mutex<Vec<Vec<u64>>>, // Each thread's `Scan::hits`, once it has scanned...
-    scanned: AtomicUsize,       // ...and how many have.
-    next_total: AtomicUsize,    // The next tally to add up.
-    totalled: AtomicUsize,      // How many threads have no more to add up.
-    next_batch: AtomicUsize,    // In queries, as is...
-    written: AtomicUsize,       // ...how many of them have reached the file.
-    next_release: AtomicUsize,  // In bytes of the corpus.
+    next_range: AtomicUsize, // In bytes of the corpus.
+    scans: Mutex<Vec<(Vec<u64>, Vec<[u32; SMALLEST]>)>>, // Each thread's hits and first ids, once scanned...
+    scanned: AtomicUsize,                                // ...and how many have.
+    next_total: AtomicUsize,                             // The next tally to add up.
+    totalled: AtomicUsize,                               // How many threads have no more to add up.
+    next_batch: AtomicUsize,                             // In queries, as is...
+    written: AtomicUsize,      // ...how many of them have reached the file.
+    next_release: AtomicUsize, // In bytes of the corpus.
 }
 
 /// How much of the corpus a thread takes out of the address space at a time.
@@ -1358,6 +1342,7 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
     // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();
     scan.hits.resize(plan.tallies.len(), 0);
+    scan.first_ids.resize(plan.tallies.len(), [0; SMALLEST]);
     scan.columns = vec![Column([0; 4]); plan.rowed_count + plan.sparse_count + 1];
     scan.short_list = vec![0; plan.short_checks.len() + 4];
     // With a row's worth more, as a row's marks are read whole.
@@ -1402,23 +1387,29 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
             lists.present.fill(0);
         }
     }
-    lock(&progress.hits).push(scan.hits);
+    let (hits, first_ids) = (scan.hits, scan.first_ids);
+    lock(&progress.scans).push((hits, first_ids));
     wait_for_all(&progress.scanned, threads);
-    let address = |hits: &Vec<u64>| hits.as_ptr();
-    let scans: Vec<_> = lock(&progress.hits).iter().map(address).collect();
+    let address = |scan: &(Vec<u64>, Vec<[u32; SMALLEST]>)| (scan.0.as_ptr(), scan.1.as_ptr());
+    let scans: Vec<_> = lock(&progress.scans).iter().map(address).collect();
 
-    // Adds the threads' counts and ids of each tally into its answer. All threads' hits for a tally are
+    // Adds the threads' counts, ids and sums of each tally into its answer. All threads' hits for a tally are
     // summed before its answer is locked, so an answer is visited once per tally, not once per thread as
     // well: they are many cache lines, and each thread's hits are read in order. Threads claim parts of
     // this.
     let next_tallies = || claim(&progress.next_total, BATCH, plan.tallies.len());
     for at in std::iter::from_fn(next_tallies).flatten() {
-        // SAFETY: each thread's `hits` has every tally.
-        let at_hits = |hits: &*const u64| unsafe { *hits.add(at) } & !TOO_BIG;
-        let hits: u64 = scans.iter().map(at_hits).sum();
-        let mut answer = lock(&plan.answers[plan.tallies[at].0 as usize].0);
-        answer.count += hits >> SUM_BITS;
-        answer.sum += hits & ((1 << SUM_BITS) - 1);
+        let mut answer = lock(&plan.answers[plan.tallies[at] as usize].0);
+        for &(hits, first_ids) in &scans {
+            // SAFETY: each thread's `hits` and `first_ids` have every tally.
+            let (hits, ids) = unsafe { (*hits.add(at), &*first_ids.add(at)) };
+            answer.count += hits >> SUM_BITS;
+            answer.sum += hits & ((1 << SUM_BITS) - 1);
+            let held = (hits >> SUM_BITS).min(SMALLEST as u64) as usize;
+            ids[..held]
+                .iter()
+                .for_each(|&doc| insert_smallest(&mut answer.ids, doc));
+        }
     }
 
     wait_for_all(&progress.totalled, threads);

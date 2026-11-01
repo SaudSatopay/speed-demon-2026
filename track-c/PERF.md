@@ -121,6 +121,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 85 | T0 for the slot prefetch | ask to read the line first, it might queue less on a contended line | pending | — | — | — |
 | 86 | Tag windows on multiples of 32 | homes aligned so a window never straddles a line, at the cost of more names outside their first window | pending | — | — | — |
 | 87 | T0 for the slot prefetch, second sample | first sample ran while the box was slow, A slowed 10 percent in the same run with no code change | pending | — | — | — |
+| 88 | Tag windows on multiples of 32, second sample | first sample T 0.0210 K 43.18, inside the range the chosen source has shown | pending | — | — | — |
 
 ## Decision log
 
@@ -298,6 +299,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D86.** T0 (7c28e9d) rejected on one sample, T 0.0227 K 41.66, far past the noise. Test aligned homes next, three samples.
 
 **D87.** Correction to the last entry: one T0 sample at T 0.0227 does not reject it, since A slowed in that run too. Three samples each, taken in turn.
+
+**D88.** Second sample of aligned homes, taken in turn with T0.
 
 ## What didn't work
 

@@ -131,6 +131,8 @@ unsafe extern "C" {
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn sched_getaffinity(pid: i32, bytes: usize, set: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, bytes: usize, set: *const u64) -> i32;
 }
 
 // Their arguments, as Linux on x86-64 defines them.
@@ -581,7 +583,22 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // smaller than a line on tiny inputs.
     let segment = (end / (threads * 64)).max(1);
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
+    let mut allowed = [0u64; 16];
+    // SAFETY: the kernel fills at most the 128 bytes it's told of. On a failure the set stays empty.
+    unsafe { sched_getaffinity(0, 128, allowed.as_mut_ptr()) };
+    let cpus: Vec<usize> = (0..1024)
+        .filter(|c| allowed[c / 64] >> (c % 64) & 1 == 1)
+        .collect();
     let worker = &|me: usize| {
+        // One thread on each CPU, every other one first, which on the box means the finishers on cores of their own.
+        // A move between CPUs costs its caches, and each CPU that charges memory holds a batch that counts in M.
+        if !cpus.is_empty() {
+            let cpu = cpus[(me * 2 + me * 2 / cpus.len()) % cpus.len()];
+            let mut one = [0u64; 16];
+            one[cpu / 64] = 1 << (cpu % 64);
+            // SAFETY: it only moves this thread, and a failure leaves it free to run anywhere.
+            unsafe { sched_setaffinity(0, 128, one.as_ptr()) };
+        }
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
         // one's scratch stays as large as the largest hour it has seen. It has room for 1 MiB of
         // records from the start, in pages that stay untouched until a large hour needs them.

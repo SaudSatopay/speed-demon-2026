@@ -690,7 +690,7 @@ const DF_CAP: u32 = 255;
 /// check at each term's occurrences.
 fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let df = sample_terms(docs, &plan.terms, threads);
-    // A query goes by blocks if its anchors hold about N/48 documents in all, where running it on every
+    // A query goes by blocks if its anchors hold about N/32 documents in all, where running it on every
     // block starts to cost less than its checks at all those documents. A term in such a query has a row
     // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
     // cost less than listing its first occurrence in each document that holds it. Any choice gives
@@ -732,8 +732,8 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         let trailing = steps.iter().rev().take_while(|step| is_or(step));
         let sure = trailing.max_by_key(|&&term| df[term as usize]);
         let (sum, sure_count) = (sum_of(&query_anchors), sure.map_or(0, |&t| df[t as usize]));
-        let common_sure = sure_count * 48 >= df[0] && (sum - sure_count) * 48 < df[0];
-        if sum * 48 >= df[0] && !common_sure {
+        let common_sure = sure_count * 32 >= df[0] && (sum - sure_count) * 32 < df[0];
+        if sum * 32 >= df[0] && !common_sure {
             block_queries.push(query);
             for term in steps.iter().map(|step| step & TERM_BITS) {
                 used.extend((store_of[term as usize] == NEITHER).then_some(term));

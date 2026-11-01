@@ -192,7 +192,8 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Option<[usize; 2]>) {
     // With 192 spare bytes after a piece, so that a load that starts at a short fixed distance from a
     // line needs no check of its own.
-    let mut room = [0u8; PIECE + 192];
+    let mut room = [0u8; PIECE + 192 + 128];
+    let base = room.as_ptr().align_offset(64);
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
     // The last line's hour: its index and its place in a block, and in a segment, its bytes. An aligned
     // place means the block is used up, and hours change only between chunks of the log.
@@ -205,7 +206,10 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Opti
         // line is much shorter than a piece, so there's an LF to find.
         let (mut pos, mut bytes) = (start.saturating_sub(1), 0);
         while pos < end {
-            let got = log.read_at(&mut room[..PIECE], pos as u64).unwrap();
+            let room = &mut room[base + pos % 64..];
+            let got = log
+                .read_at(&mut room[..PIECE.min(end - pos + 256)], pos as u64)
+                .unwrap();
             // Whole lines only: the next read starts at the line that this piece cut short.
             let whole = room[..got].iter().rposition(|&b| b == b'\n').unwrap() + 1;
             let (stop, text, skip) = (whole.min(end - pos), &room[..], usize::from(pos < start));

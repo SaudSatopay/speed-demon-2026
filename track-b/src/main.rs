@@ -342,7 +342,7 @@ impl TermTable<'_> {
     /// room is where it goes. A term that's in already is found without the lock, as a way's key is stored
     /// after its word, so a key that's there has its word: most of the tokens are common terms, which
     /// every thread meets.
-    fn intern(&self, token: &[u8], next_term: &AtomicUsize) -> u32 {
+    fn intern(&self, token: &[u8], next_term: &AtomicUsize, own: &mut usize) -> u32 {
         let (short, long) = keys_of(token);
         // SAFETY: the build targets x86-64-v3, which has AVX2.
         let hash = unsafe { _mm256_extract_epi64::<0>(hashes(_mm256_set1_epi64x(short as i64))) };
@@ -371,7 +371,12 @@ impl TermTable<'_> {
                 let free = set.ways(0) & if has_more { 14 } else { 15 };
                 let (mut term, room) = (set.word(ways) & TERM_BITS, free != 0);
                 if ways == 0 && room {
-                    term = next_term.fetch_add(1, Relaxed) as u32;
+                    // A thread takes numbers in batches, as that shared counter is the parse's busiest line.
+                    if *own % TERM_BATCH == 0 {
+                        *own = next_term.fetch_add(TERM_BATCH, Relaxed);
+                    }
+                    term = *own as u32;
+                    *own += 1;
                     if (term as usize) < FIRST_TERM + TERMS_PER_SET * self.sets.len() {
                         let way = [free.trailing_zeros(), free.ilog2()][has_more as usize] as usize;
                         let at = (token.as_ptr() as usize - self.text.as_ptr() as usize) as u32;
@@ -395,6 +400,10 @@ impl TermTable<'_> {
     }
 }
 
+/// A thread takes term numbers up to the next multiple of this at a time. Those left unused only make the
+/// table seem fuller.
+const TERM_BATCH: usize = 64;
+
 /// Reads the queries into a new plan, whose term table has this many sets: each thread the lines that
 /// start in its part of the text.
 fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
@@ -407,7 +416,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
     let (next_part, next_term) = (AtomicUsize::new(0), AtomicUsize::new(FIRST_TERM));
     let mut parts = on_threads(threads, || {
         let part = claim(&next_part, text.len() / threads + 1, text.len()).unwrap_or_default();
-        let (mut queries, mut steps, mut edges) = (vec![], vec![], vec![]);
+        let (mut queries, mut steps, mut edges, mut own) = (vec![], vec![], vec![], 0);
         let line_start = part.clone().find(|&at| at == 0 || text[at - 1] == b'\n');
         let mut pos = line_start.unwrap_or(part.end);
         while pos < part.end {
@@ -420,7 +429,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
                 if token[0].is_ascii_uppercase() {
                     op = u32::from(token[0] == b'A') * AND + u32::from(token[0] == b'N') * NOT;
                 } else {
-                    steps.push(op | plan.terms.intern(token, &next_term));
+                    steps.push(op | plan.terms.intern(token, &next_term, &mut own));
                 }
             }
             pos = line_feed + 1;
@@ -1483,18 +1492,25 @@ pub extern "C" fn main() -> i32 {
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
     // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
     // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
-    let mut mappers = vec![];
-    for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
-        mappers.push(thread::spawn(move || {
-            thread::park();
-            // SAFETY: this only maps pages of the mapping, and a part starts at a page.
-            unsafe { madvise(part.as_ptr(), part.len(), 22) };
-        }));
-    }
+    // One more thread starts them and creates the output, so that this one needn't wait for either.
+    let helper = thread::spawn(move || {
+        let mut mappers = vec![];
+        for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
+            mappers.push(thread::spawn(move || {
+                thread::park();
+                // SAFETY: this only maps pages of the mapping, and a part starts at a page.
+                unsafe { madvise(part.as_ptr(), part.len(), 22) };
+            }));
+        }
+        let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
+        thread::park();
+        mappers.iter().for_each(|mapper| mapper.thread().unpark());
+        file
+    });
     let mut plan = parse_queries(queries, threads, 1 << 16);
-    mappers.iter().for_each(|mapper| mapper.thread().unpark());
+    helper.thread().unpark();
     make_plan(&mut plan, docs, threads);
-    let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
+    let file = helper.join().expect("panics abort");
     // One round of threads scans, then answers, as starting threads again costs more than a short wait.
     let progress = Progress::default();
     let work = || scan_and_answer(docs, &plan, &file, &progress, threads);

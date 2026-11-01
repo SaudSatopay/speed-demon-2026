@@ -133,6 +133,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 97 | exp: positions by a fixed count of eight TZCNT steps instead of PEXT and GFNI | 14 lines. Local says T up 9 percent but local has misranked this track repeatedly and this was never run on the box | pending | — | — | — |
 | 98 | exp: back to PEXT and GFNI positions on the mapped file | TZCNT gave T 0.0208 and C over D 0.143 against 0.134, for 14 lines, so the box agrees with local here | pending | — | — | — |
 | 99 | exp: mapped file without the prefetch per block | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway. Two lines | pending | — | — | — |
+| 100 | exp: text prefetch back on the mapped file | Without it four samples gave median T 0.0201 and K 45.04 | pending | — | — | — |
 
 ## Decision log
 
@@ -334,6 +335,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D98.** TZCNT rejected. Mapped file sampled again
 
 **D99.** Compare C over D and T with the mapped samples
+
+**D100.** No-prefetch rejected, two lines do not pay
 
 ## What didn't work
 

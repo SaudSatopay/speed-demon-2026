@@ -265,7 +265,7 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// timestamp is always 27 bytes. A thread keeps its own unfilled blocks of each hour, so the hot path
 /// reads and writes no line that other threads write, and allocates nothing.
 fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Option<[usize; 2]>) {
-    let mut buf = [0u8; PIECE + PADDING];
+    let mut buf = [0u8; 64 + PIECE + PADDING];
     // This thread's place in each hour's block of records. An aligned place, as a null is, means the
     // block is used up.
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
@@ -284,12 +284,19 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
         while pos < end {
             // No more than what the segment's lines need: the longest line is well below 256 bytes.
             let want = PIECE.min(end - pos + 256);
-            let got = log.read_at(&mut buf[..want], pos as u64).expect("reading");
+            // It goes at the same place in a cache line as its source, which the kernel copies
+            // fastest, or nearly so at the log's start, as `base`, the log position of the buffer's
+            // start, can't go below 0.
+            let at = pos.wrapping_sub(buf.as_ptr() as usize) % 64 % (pos + 1);
+            let piece = &mut buf[at..at + want];
+            let got = at + log.read_at(piece, pos as u64).expect("reading");
+            let base = pos - at;
             // Whole lines only: the next read starts at the line that this piece cut short. `text` is
             // the whole buffer, as loads may run past the piece.
             let whole = buf[..got].iter().rposition(|&b| b == b'\n').expect("no LF") + 1;
-            let (stop, text, skip) = (whole.min(end - pos), &buf[..], usize::from(pos < start));
-            let mut line = skip * (text.iter().position(|&b| b == b'\n').expect("no LF") + 1);
+            let (stop, text, skip) = (whole.min(end - base), &buf[..], usize::from(pos < start));
+            let first = text[at..].iter().position(|&b| b == b'\n').expect("no LF") + 1;
+            let mut line = at + skip * first;
             while line < stop {
                 // Reads at a fixed distance from `line` need no check, since `line` is inside the piece
                 // and the padding is longer than any such distance, and whatever they read is safe.
@@ -307,7 +314,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                     // up, as its position is at or past the low mark. After one, it's too late, which
                     // ends the round.
                     let mut state = table.progress.lock().expect("poisoned");
-                    state.last_seen[hour] = state.last_seen[hour].max(pos + line + 1);
+                    state.last_seen[hour] = state.last_seen[hour].max(base + line + 1);
                     if hour < state.claimed {
                         state.claimed = usize::MAX;
                         return;
@@ -381,7 +388,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                 place = place.wrapping_add(1);
                 line = close + 6 + digits;
             }
-            pos += line;
+            pos = base + line;
         }
     }
 }

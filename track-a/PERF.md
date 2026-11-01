@@ -96,6 +96,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 61 | The same machine code with named structs instead of tuples, named constants and clearer names, and every comment checked against the code | A reader had to carry `table.3` and `hours[hour].1[0]` in their head, `round` was 79 lines of closures, and some comments no longer told the truth | run-f3d94dc0b7b9 | 0.0189 | 16.1 | 86.1 |
 | 62 | Tuning meant for older CPUs lifted: no zeroing instruction before each bit count, three-part LEAs kept whole | Found on C by reading its hot loop's assembly: for the generic target, LLVM clears the output of TZCNT, LZCNT and POPCNT first, against a false dependency that the box's cores don't have | pending | — | — | — |
 | 63 | Cold paths marked in the parse, the error flag loaded at the record, no per-line minimum, digits by a saturating subtract, and a big rank's lookup only when needed | Instructions were still falling short of cycles on the parse's common path, and each rank lookup and minimum ran for lines that never needed it | pending | — | — | — |
+| 64 | exp: reads lined up in a cache line, on a fixed base | A cache change, flat locally, which only the board can judge: reads that start on a line's boundary copied faster on the box in D55 and D60 | pending | — | — | — |
 
 ## Decision log
 
@@ -224,6 +225,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D62.** No lines. Over alternating runs: instructions 498M -> 491M (-1.4%), cycles flat, mispredicts flat. rustc warns that these three target features are unstable; they build on the board, as C showed.
 
 **D63.** Local, seed 1: user cycles 278.7M to 268.5M, instructions 491.5M to 456.0M, mispredicts flat at 0.86M, M flat, S +9. Grid 44/44, threads 234/234, const-hash 39/39, stress 0 wrong in 300. Also measured and dropped: two radix passes with a fix-up (cycles +3.9 to +7.5%, S +19), a free list of arrays (-1.6% with 4 spares, S +14; -5% with all of them, M +5.5 MB), MADV_POPULATE_WRITE (cycles flat, M up), grouped frees, 16 KiB pieces (kernel cycles +10 to 19%), counting errors in the count scan (-0.7%), non-PIE, exit at the last write.
+
+**D64.** Measurement, S +4, against T 0.0187 to 0.0192 at S 373. Grid, threads, const-hash, stress pass.
 
 ## What didn't work
 

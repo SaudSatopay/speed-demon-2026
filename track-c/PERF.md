@@ -200,6 +200,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 164 | c-ph1 sample 2 | second sample | pending | — | — | — |
 | 165 | c-ph1 sample 3 | third sample | pending | — | — | — |
 | 166 | c-ph2 same with no release at all, sample 1 | exit cost on the box is unknown, S 8 lower | pending | — | — | — |
+| 167 | c-ph2 sample 2 | second sample | pending | — | — | — |
 
 ## Decision log
 
@@ -535,6 +536,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D165.** exp: judged over 3 samples against c64f 46.64
 
 **D166.** exp: judged over 3 samples against c64f 46.64
+
+**D167.** exp: judged over 3 samples against c64f 46.64
 
 ## What didn't work
 

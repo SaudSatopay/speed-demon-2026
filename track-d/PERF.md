@@ -51,6 +51,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 27 | 28 fewer lines: offsets close up in the region pass, no shrink between queries, shorter helpers | S 648 costs K, and measuring each block showed every large one pays for itself, so only small cuts are left: removing simplify costs 9% K, tier 3 alone also 9% | superseded before it ran | — | — | — |
 | 28 | REGION 2^13 -> 2^14 (board test) | Fewer boundary nodes kept by simplify; +6 MB of per-thread Local arrays. Local timing too noisy to judge. | pending | — | — | — |
 | 29 | REGION back to 2^13 (2^14 lost: board T 0.1507, M 48.7 MB, K 26.34 against about 27.2); BATCH 32 -> 64 (board test) | Wider batches overlap more cache misses in parse and build, at 1.5 KB more stack. | pending | — | — | — |
+| 30 | Default thread cap 12 -> 6 (board test); BATCH 64 kept (3 board samples K 27.45, 27.24, 27.32 against a 27.16 median before) | The box has 6 cores with hyper-threading; parse and numbering may contend at 12. | pending | — | — | — |
 
 ## Decision log
 
@@ -113,6 +114,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D29.** Board test only: keep if median K beats the current source over 3 runs, else restore.
 
 **D30.** Board test only: keep if median K beats the current source over 3 runs, else restore to BATCH 32.
+
+**D31.** Board test only: keep only if T falls, else restore the cap of 12.
 
 ## What didn't work
 

@@ -196,6 +196,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 160 | c64f restored | c64f median K 46.64 over 4, c-f40 46.66 over 3 for one more line, so level | pending | — | — | — |
 | 161 | c-k1 find walks hits and free slots in one loop, plain spin, 11 lines cut, sample 1 | S 352 to 341 with hot code unchanged | pending | — | — | — |
 | 162 | c-k1 sample 3 | third sample | pending | — | — | — |
+| 163 | c-ph1 12 segments per thread, pages released after parsing, spills hop by tag, sample 1 | end idle was 8.6 percent of T and windows walked fall from 780k to 251k; local -5.6 percent | pending | — | — | — |
 
 ## Decision log
 
@@ -523,6 +524,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D161.** exp: judged over 3 samples against c64f 46.64
 
 **D162.** exp: judged over 3 samples against c64f 46.64
+
+**D163.** exp: judged over 3 samples against c64f 46.64
 
 ## What didn't work
 

@@ -1,6 +1,6 @@
 # Track B: performance log
 
-**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0732 s / 26.2 MB** (`run-763c4b4ded66`), at S 1,046: K = **42.06** and **81.2 speed points**. Its five runs read T 0.0733 to 0.0754, for a median K of 41.80.
+**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0732 s / 26.2 MB** (`run-763c4b4ded66`), at S 1,046: K = **42.06** and **81.2 speed points**. Its 9 runs read T 0.0732 to 0.0775, for a median K of 41.49.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks b`. Output SHA-256 on seed 1: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
@@ -9,7 +9,7 @@
 - S is 1,046 code lines against the reference's 91, which costs (91/1046)^0.15, K x 0.69, about 7.9 speed points. It's the most code of any of our tracks. Each 100 lines move K by about 1.5%.
 - M scores nothing here. K takes min(M_ref / M, 50), and the board measured the reference at 2,199,961,600 bytes, so any M below 44.0 MB counts as 44.0. Ours has been below that since the design that stored postings (41.6 MB, `run-f39141d33527`), so cutting it from 42 to 27 MB with the block queries (D33) earned nothing by itself: K read 36.24 in that change's first run (`run-21faf3464957`), against 34.49 to 36.28 in the eight runs before it at S 1,015.
 - Local timing ranks the block queries the wrong way round. With block queries at anchors holding N/96, N/48 and N/24 documents, local cycles read 2.10G, 2.13G and 2.16G, and the board read T 0.0996, 0.0909 and 0.0942, one sample each (D36). Our guess, not confirmed, is that a block's columns and tallies go through a cache that two threads share on the box. Locally the whole run takes about 40 ms (D37, D38), and on the box T is 78 ms.
-- The board can't tell changes of under 1% apart: the five runs of this build span 0.0732 to 0.0754.
+- The board can't tell changes of under 1% apart: the 9 runs of this build span 0.0732 to 0.0775.
 - The plan runs on one thread, after a parallel sample. Moving it onto threads was tried and dropped (D38), and we haven't timed it on the box for this design.
 - Printing keeps an order: threads claim batches of 1,024 queries, and each waits for the batch before it to reach the file. On an idle box that's flat against printing at known offsets, but a busy box stalls it (D26).
 
@@ -167,7 +167,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D42.** The source of D40 again, as a new commit.
 
-**D43.** Kept, on the board: median K 41.80 over 3 runs against 41.46, S +2. A range of 1/576 of the corpus held about 434 documents, one full block and one cut short, and a short block costs a whole pass over the columns. Now a range is 247 documents' worth of bytes at the sample's mean length. Local paired wall read +7.1% inside 35% noise, and an earlier local test of block-sized ranges had shown no gain, so again only the board shows this. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300, verify 38/38.
+**D43.** Kept, on the board, though later runs took its median to 41.49, so its gain over D40's 41.46 is within noise: median K 41.80 over its first 3 runs against 41.46, S +2. A range of 1/576 of the corpus held about 434 documents, one full block and one cut short, and a short block costs a whole pass over the columns. Now a range is 247 documents' worth of bytes at the sample's mean length. Local paired wall read +7.1% inside 35% noise, and an earlier local test of block-sized ranges had shown no gain, so again only the board shows this. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300, verify 38/38.
 
 **D44.** Experiment: judged by median K over at least 3 board runs
 

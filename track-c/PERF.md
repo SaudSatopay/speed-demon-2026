@@ -182,6 +182,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 146 | c-c4 sample 2 | second sample | pending | — | — | — |
 | 147 | c-c3 sample 3 | third sample | pending | — | — | — |
 | 148 | c-c4 sample 3 | third sample | pending | — | — | — |
+| 149 | c-p1 populate each segment before parsing, sample 1 | faults per 16 pages cost kernel time, and text prefetch stops at unmapped pages | pending | — | — | — |
 
 ## Decision log
 
@@ -481,6 +482,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D147.** exp: judged over 3 samples each, c-c3 against c-c4
 
 **D148.** exp: judged over 3 samples each, c-c3 against c-c4
+
+**D149.** exp: judged over 3 samples against c-c3 46.40
 
 ## What didn't work
 

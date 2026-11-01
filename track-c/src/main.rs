@@ -448,12 +448,17 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
             // writes 8 whatever the number, and moves on by the right amount. The positions of the
             // lowest 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every
-            // position at that position, PEXT gathers it for the set ones, and PDEP spreads those
-            // into bit `k` of each byte.
-            let packed = planes.iter().enumerate().fold(0, |packed, (k, &plane)| {
-                packed | _pdep_u64(_pext_u64(plane, left), 0x0101_0101_0101_0101) << k
-            });
-            let bytes = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(packed as i64));
+            // position at that position, and PEXT gathers it for those bits, into a byte. Those
+            // bytes are a bit matrix with a row per bit of a position, and GFNI's multiply, given
+            // the columns one at a time, turns it around into a byte per position.
+            let first = _pdep_u64(0xFF, left);
+            let matrix = planes
+                .iter()
+                .fold(0, |matrix, &plane| matrix << 8 | _pext_u64(plane, first));
+            let columns = _mm_cvtsi64_si128(0x8040_2010_0804_0201u64 as i64);
+            let packed =
+                _mm_gf2p8affine_epi64_epi8::<0>(columns, _mm_cvtsi64_si128((matrix << 16) as i64));
+            let bytes = _mm256_cvtepu8_epi32(packed);
             _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
             let total = left.count_ones() as usize;
             let mut rest = _pdep_u64(!0 << 8, left);

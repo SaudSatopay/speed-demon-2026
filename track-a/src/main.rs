@@ -561,10 +561,9 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             reached[me].store(cursor.load(Relaxed), Release);
             // Only finishers take the lock here, as a thread put to sleep on it wakes up late and maybe on
             // another CPU, and its segment holds up the rest.
-            let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
-            let mut hour = table.claimed.load(Relaxed);
-            // Once all reading is done, every thread finishes hours.
-            if finisher || low >= end {
+            let mut hour = HOURS;
+            if finisher {
+                let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
                 let last_seen = table.last_seen.lock().expect("poisoned");
                 hour = table.claimed.load(Relaxed);
                 let seen = last_seen.get(hour).copied();

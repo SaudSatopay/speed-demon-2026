@@ -1516,6 +1516,10 @@ pub extern "C" fn main() -> i32 {
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
         thread::park();
         mappers.iter().for_each(|mapper| mapper.thread().unpark());
+        // No more threads than CPUs in the scan, where one left waiting a tick would set the time.
+        mappers
+            .into_iter()
+            .for_each(|mapper| mapper.join().expect("panics abort"));
         file
     });
     let mut plan = parse_queries(queries, threads, 1 << 16);

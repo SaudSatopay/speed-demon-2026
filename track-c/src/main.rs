@@ -133,9 +133,9 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1_000_001;
-/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 71%
+/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 87%
 /// full. A test build makes it tiny, so that names run out of slots.
-const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 140_000 };
+const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 115_000 };
 /// Slots past the last home, where the names of the last homes can spill: more than a table this full
 /// can need, for a generated file.
 const SPARE: usize = 256;

@@ -579,10 +579,9 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         };
         parse(log, &table, &hours, next_segment);
         // Exit would take the log's pages out of the address space one by one on the last thread, and
-        // the clock counts that, so a few of the threads that are done share the work first, and the rest
-        // leave, freeing the hyper-threads next to the finishers. From the log's start on, as threads
-        // still reading are near its end, and a page taken from them just comes back.
-        let claims = (0..).map_while(|_| (me < 7).then(|| released.fetch_add(RELEASE, Relaxed)));
+        // the clock counts that, so whichever threads are done share the work first. From the log's
+        // start on, as threads still reading are near its end, and a page taken from them just comes back.
+        let claims = (0..).map(|_| released.fetch_add(RELEASE, Relaxed));
         for at in claims.take_while(|&at| at < end) {
             let page = log[at..].as_ptr().cast_mut();
             // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`

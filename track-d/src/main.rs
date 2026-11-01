@@ -789,7 +789,7 @@ fn main() -> io::Result<()> {
     let (data_dir, out_dir) = (arg(1, "/data"), arg(2, "/out"));
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(6));
+    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
     let threads = if asked > 0 { asked } else { allowed };
     let (mut forward, numbers) = build_graph(map_file(&format!("{data_dir}/graph.txt"))?, threads);

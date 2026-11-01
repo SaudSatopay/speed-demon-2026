@@ -131,8 +131,6 @@ unsafe extern "C" {
     fn prctl(option: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mmap(addr: usize, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn sched_getaffinity(pid: i32, bytes: usize, set: *mut u64) -> i32;
-    fn sched_setaffinity(pid: i32, bytes: usize, set: *const u64) -> i32;
 }
 
 // Their arguments, as Linux on x86-64 defines them.
@@ -583,22 +581,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // smaller than a line on tiny inputs.
     let segment = (end / (threads * 64)).max(1);
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
-    let mut allowed = [0u64; 16];
-    // SAFETY: the kernel fills at most the 128 bytes it's told of. On a failure the set stays empty.
-    unsafe { sched_getaffinity(0, 128, allowed.as_mut_ptr()) };
-    let cpus: Vec<usize> = (0..1024)
-        .filter(|c| allowed[c / 64] >> (c % 64) & 1 == 1)
-        .collect();
     let worker = &|me: usize| {
-        // One thread on each CPU, every other one first, which on the box means the finishers on cores of their own.
-        // A move between CPUs costs its caches, and each CPU that charges memory holds a batch that counts in M.
-        if !cpus.is_empty() {
-            let cpu = cpus[(me * 2 + me * 2 / cpus.len()) % cpus.len()];
-            let mut one = [0u64; 16];
-            one[cpu / 64] = 1 << (cpu % 64);
-            // SAFETY: it only moves this thread, and a failure leaves it free to run anywhere.
-            unsafe { sched_setaffinity(0, 128, one.as_ptr()) };
-        }
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
         // one's scratch stays as large as the largest hour it has seen. It has room for 1 MiB of
         // records from the start, in pages that stay untouched until a large hour needs them.
@@ -607,31 +590,35 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         let next_segment = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
             reached[me].store(cursor.load(Relaxed), Release);
-            let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
-            let mut state = table.progress.lock().expect("poisoned");
-            let (hour, seen) = (state.claimed, state.last_seen.get(state.claimed).copied());
-            // An hour with no line yet has 0, and it's due only when all reading is done. Nothing
-            // waits for a thread that fell behind: on a shared machine, the others would then sit out
-            // its whole turn off the core, and that happens all the time, so a wait here turned a busy
-            // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
-            // while the box is busy.
-            if finisher && seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
-                state.claimed += 1;
-                drop(state);
-                // While it writes, this thread holds no hour back.
-                reached[me].store(usize::MAX, Release);
-                write_hour(hour, &hours[hour], &table, &digits, &mut scratch);
-                append(&hours, &next_out, &file);
-                continue;
+            // Only finishers take the lock here, as a thread put to sleep on it wakes up late and maybe on
+            // another CPU, and its segment holds up the rest.
+            let mut hour = HOURS;
+            if finisher {
+                let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
+                let mut state = table.progress.lock().expect("poisoned");
+                hour = state.claimed;
+                let seen = state.last_seen.get(hour).copied();
+                // An hour with no line yet has 0, and it's due only when all reading is done. Nothing
+                // waits for a thread that fell behind: on a shared machine, the others would then sit out
+                // its whole turn off the core, and that happens all the time, so a wait here turned a busy
+                // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
+                // while the box is busy.
+                if seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
+                    state.claimed += 1;
+                    drop(state);
+                    // While it writes, this thread holds no hour back.
+                    reached[me].store(usize::MAX, Release);
+                    write_hour(hour, &hours[hour], &table, &digits, &mut scratch);
+                    append(&hours, &next_out, &file);
+                    continue;
+                }
             }
             let start = cursor.fetch_add(segment, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
-            if start < end || reached[me].load(Relaxed) >= end && (!finisher || hour >= HOURS) {
+            if start < end || reached[me].load(Relaxed) >= end && hour >= HOURS {
                 return (start < end).then_some([start, (start + segment).min(end)]);
             }
-            // The wait gives up its core, and the lock first: a spinning thread would keep the one
-            // it waits for off a shared core, and one put off while spinning here would keep the lock.
-            drop(state);
+            // The wait gives up its core: a spinning thread would keep the one it waits for off a shared core.
             thread::yield_now();
         };
         parse(log, &table, &hours, next_segment);

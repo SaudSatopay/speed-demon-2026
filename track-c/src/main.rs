@@ -314,7 +314,7 @@ type Found = [(u32, u32, u64); LISTED / 5];
 
 /// Segments per thread: when the segments run out, each thread still has its last to finish, and the
 /// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
-const SEGMENTS: usize = 3;
+const SEGMENTS: usize = 1;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
 /// Bytes ahead of a block to prefetch: past where the chunk's own loads and a page's end stop the core.

@@ -86,6 +86,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 64 | exp: 52-byte name slots on the current base, with the join table first in the mapping | Local M 9.85 to 8.53, wall +3%, S +17; its one earlier sample came in a run where A and D also ran slow | pending | — | — | — |
 | 65 | Amounts parsed with saturating subtraction and their own weights, with no PEXT; back to 64-byte name slots | A saturating subtract turns the sign and the point into zero digits, and per-lane weights skip the point. 52-byte slots: T 0.0218 M 9.22 S 513, K 42.62, level with 64-byte at 17 more lines | pending | — | — | — |
 | 66 | The padding table on one cache line; 8 lines saved outside the hot path | PADS straddled a line, so most key loads split across two. mark's signature fits one line now, and find always gives a slot, since a full table throws the pass away anyway | pending | — | — | — |
+| 67 | exp: a second locked operation per record, on the thread's own row | To time one uncontended locked operation on the box: Golden Cove's are about twice Zen 4's in cycles, and locally dropping the lock saves only 2% | pending | — | — | — |
 
 ## Decision log
 
@@ -221,6 +222,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D65.** Cycles -2 to -3%, S +1
 
 **D66.** S -8, cycles flat to -1%
+
+**D67.** An experiment, reverted right after its run
 
 ## What didn't work
 

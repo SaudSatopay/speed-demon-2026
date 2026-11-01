@@ -7,46 +7,54 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 | What | Where |
 |---|---|
 | Headline numbers and their board run IDs | [PERF.md](PERF.md), first lines |
+| What each phase costs on the box | [PERF.md](PERF.md#where-it-loses) |
 | Why each decision was made, reverted ones included | [PERF.md](PERF.md#decision-log) |
 | The hot loop | `src/main.rs`, function `parse` |
+| Finishing an hour | `src/main.rs`, closure `write_hour` in `round`, and `format_hour` |
 | How correctness was checked | [Correctness](#correctness), below |
 
 ## Limits
 
-- It relies on two spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, and every line is well formed. A line outside that window aborts the program instead of being counted wrongly.
-- Latencies of 524,287 or more take a slower path through a side list, about 3% of requests.
-- It relies on the spec's promise of 1,842 endpoints per seed. Past 3,584 it aborts rather than risk a wrong answer.
-- S is 283 code lines after the radix change, against the reference's 56.
+- It relies on three spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, every line is well formed, and a seed has 1,842 endpoints. A line outside the window, or an endpoint table past 4,094 lines of keys, aborts the program instead of giving a wrong answer.
+- The spec promises no bound on how late a line can come. An hour is finished once the reading is 1/48 of the log past it, and a line that comes after that stops the run and starts it again with no early finish, which about doubles T. The worst disorder on our seeds is 1/315 of the log, and 280 full runs saw no restart.
+- Readers never wait for a thread that falls behind, so on a busy machine records pile up: M rises by about 2 MB, while T stays about 1.5 times better than with a wait.
+- S is 293 code lines, against the reference's 56.
 
 ## Approach
 
-The log is memory-mapped, followed by readable padding so that block loads can run past its end, and cut into segments that 12 threads claim from an atomic cursor. Each line is read at fixed offsets where the format allows it: the hour comes from four timestamp bytes, and the method's length from its 4th byte. Two 32-byte loads find the end of the endpoint, and one 8-byte load usually parses the latency. One lock-free table, shared by all threads, turns endpoints into ids, always comparing the full key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves blocks of 256. When the log is done, up to 10 output threads claim hours. Each performs four stable radix passes over latency and endpoint rank; the output vector's storage holds the aligned scratch array, then is reused for text. Latencies at or above 524,287 live in a side list sorted by endpoint rank and value. The hour's records are formatted, freed, and appended to the file in turn.
+The log is cut into segments that 12 threads claim from an atomic counter, and each thread reads its segment in 32 KiB pieces into its own buffer. Each line is read at fixed offsets where the format allows: the hour comes from one 8-byte load, and the method's length from its 4th byte. One 64-byte block finds the end of the endpoint, and one vector parses the latency. One lock-free table turns endpoints into ids, always comparing the whole key. Each line becomes one 32-bit record in a shared array for its hour, where each thread reserves a page at a time.
+
+The log runs in rough time order, so hours don't wait for the end of the log. Once the reading is 1/48 of the log past an hour, one of four threads claims it, sorts its records with three stable radix passes, and writes its text over the records. Whichever thread is free then appends the ready hours to the file in order, and gives their pages back. So few records are in memory at once, text never sits in memory for long, and all 12 threads stay busy to the end.
 
 ## Why it's fast
 
-See [PERF.md](PERF.md) for run IDs.
+Run IDs and the full story are in [PERF.md](PERF.md).
 
-1. **No date parsing.** The reference spends about 77% of its time in `strptime`. Here the hour is a few bit operations on four bytes.
-2. **No per-line objects.** A line costs no allocation, except when a latency list grows.
-3. **The log isn't read into memory.** Mapped dataset pages don't count toward the memory peak.
-4. **No byte loops on the hot path.** Finding the endpoint's end, hashing it and parsing the latency are all block operations, so a line costs few branch mispredictions.
-5. **One sortable 32-bit integer per request.** With the endpoint's byte-order rank in the top bits and latency below it, stable radix passes produce ordered groups and latencies.
-6. **Four linear passes per hour.** Three small latency digits and one endpoint rank determine the order; only latencies at or above 524,287 need a separate sort in the side list.
-7. **Output and records don't add up.** Each hour's records are freed as its text is written, and the output vector's storage doubles as radix scratch.
+1. **No date parsing and no objects per line.** The reference spends about 77% of its time in `strptime`, and 228 MB on Python ints. Here the hour is one multiply of an 8-byte load, and a line is one 32-bit integer whose plain order is the order the percentiles need.
+2. **Reading into a small buffer instead of mapping the log.** A page fault costs far more on the box than a copy into memory that's already in the caches. T 0.0277 -> 0.0252 on the board, and two later tries at mapping again with prefetches lost to it (T 0.0252 and 0.0230, against 0.0193 at the time).
+3. **Hours finished during the read.** Memory peaks when records and text are both held. Finishing an hour as soon as the reading is past it took M from 18.8 to 16.4 MB, and T from 0.0245 to 0.0221, because no thread sits waiting for the output stage.
+4. **Almost no slow paths per line.** Keys sit in whole 64-byte lines, so one block compare settles nearly every line, with no branch on the key's length. Before this, 13.7% of lines took the slow path.
+5. **Three linear passes per hour.** A record holds an endpoint id, a latency and an error flag. Two radix passes over the latency and one over the ids, in the endpoints' byte order, leave each endpoint's latencies sorted, with no comparison sort. Only latencies of 524,287 or more, about 3% of lines, take a side list, in the far end of the same array.
+6. **Text written over its own records.** The hour's array has room for its text, so an hour's text takes no new pages beyond what its records and big latencies already touched.
 
 ## Ideas and where they came from
 
-- Fixed-offset parsing: our own reading of the spec's grammar.
-- A full-key compare on every hash hit: the 1BRC contest rejected entries that trusted hashes (Morling, 2024).
-- The 8-digit SWAR parse: Lemire (2022). Printing 8 digits at once: Khuong (2017).
+- Fixed-offset parsing, and the hour from masked bytes: our own reading of the spec's grammar.
+- A full-key compare on every hit: the 1BRC contest rejected entries that trusted hashes (Morling, 2024).
+- Parsing 8 digits at once: Lemire (2022). Printing 8 digits at once: Khuong (2017).
+- Reading in small pieces instead of mapping: found on our Track C, by trying it on the board after local timing couldn't tell.
+- Finishing hours during the read, and restarting if a line comes too late: our own, from the eight shards the spec describes.
+- Timing a phase on a machine we can't profile, by running that phase twice in a labelled `exp:` push: our own.
 
 ## Correctness
 
-The spec's edge cases need no special code: duplicate lines count twice, a 499 isn't an error because only a first byte of `5` counts, the hour comes from the timestamp rather than the file's order, and an empty log gives an empty file. Every build is checked by SHA-256 against the naive reference on 15 generator seeds, 8 answer-preserving rewrites and 5 limit cases. A constant-hash test build, where every key collides in the 4,096-slot table, must give the same answers. Anyone can reproduce this with one command: `python3 tools/verify.py` (see [tools/README.md](../tools/README.md)).
+The spec's edge cases need no special code: duplicate lines count twice, a 499 isn't an error because only a first byte of `5` counts, the hour comes from the timestamp rather than the file's order, and an empty log gives an empty file. Lines that come late for their hour are the case that does need code: a thread records where it last came to each hour under a lock, an hour isn't claimed until every reader is past that by the margin, and a line for an hour already claimed stops the round.
+
+Every build is checked by SHA-256 against the naive reference on 15 generator seeds, 8 answer-preserving rewrites and 5 limit cases, and at 1, 2, 3, 7, 12 and 64 threads. A constant-hash test build, where every key collides, must give the same answers. On top of those: repeated runs on 2 to 14 threads, since a lock-free table's races don't show up on a single pass, and logs shuffled, reversed, rotated and with single lines moved far from their place, which force the restart. Anyone can reproduce the main check with one command: `python3 tools/verify.py` (see [tools/README.md](../tools/README.md)).
 
 ## Dependencies
 
-None. `mmap` is declared directly against glibc, which `std` already links, and the AVX2 loads come from `std::arch`.
+None. `mmap`, `madvise` and `prctl` are declared directly against glibc, which `std` already links, and the vector code comes from `std::arch`.
 
 ## Build and run
 

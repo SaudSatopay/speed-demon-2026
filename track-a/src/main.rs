@@ -13,6 +13,8 @@
 //! the end. No bound on the disorder is promised, so a line that comes after its hour was claimed stops
 //! the round, and a new one starts with no hour due until the log is done.
 
+#![no_main]
+
 use std::arch::x86_64::*;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
@@ -479,7 +481,8 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
     table.3.lock().unwrap().0 == HOURS
 }
 
-fn main() {
+#[unsafe(no_mangle)]
+extern "C" fn main() -> i32 {
     // Transparent huge pages would round each hour's sparse array up to 2 MB, so turn them off, with
     // PR_SET_THP_DISABLE. Failing is harmless.
     // SAFETY: it only sets a flag on our own process.
@@ -494,4 +497,5 @@ fn main() {
     // A 48th of the log is several times the disorder that the spec's shards make. If it's not enough,
     // the second round has no hour due until the log is done.
     _ = round(48) || round(1);
+    0
 }

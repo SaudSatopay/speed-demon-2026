@@ -84,6 +84,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 62 | Position bytes from one GFNI matrix multiply instead of six PDEPs, with +gfni in the build's target features | Six PDEPs a block take the one port that runs them, and the box's Raptor Lake cores have GFNI | pending | — | — | — |
 | 63 | Row columns reordered so sums aren't adjacent; tuning for old CPUs lifted (false dependencies of bit counts, slow three-part LEA) | The compiler paired adjacent additions into vector instructions that took more than the two would, and added zeroing instructions and split LEAs meant for old CPUs | pending | — | — | — |
 | 64 | exp: 52-byte name slots on the current base, with the join table first in the mapping | Local M 9.85 to 8.53, wall +3%, S +17; its one earlier sample came in a run where A and D also ran slow | pending | — | — | — |
+| 65 | Amounts parsed with saturating subtraction and their own weights, with no PEXT; back to 64-byte name slots | A saturating subtract turns the sign and the point into zero digits, and per-lane weights skip the point. 52-byte slots: T 0.0218 M 9.22 S 513, K 42.62, level with 64-byte at 17 more lines | pending | — | — | — |
 
 ## Decision log
 
@@ -215,6 +216,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D63.** Instructions per record 271 to 261, cycles -1.5 to -2%, S the same
 
 **D64.** Keep or revert after several samples
+
+**D65.** Cycles -2 to -3%, S +1
 
 ## What didn't work
 

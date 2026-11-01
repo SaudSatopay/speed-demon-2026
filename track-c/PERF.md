@@ -171,6 +171,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 135 | exp: tags16, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 | 136 | exp: cuts, sample 3 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 | 137 | exp: tags16, sample 3 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
+| 138 | exp: tags16-h105k, sample 1 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
 
 ## Decision log
 
@@ -448,6 +449,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D136.** Median of three decides
 
 **D137.** Median of three decides
+
+**D138.** Median of three decides against 46.25
 
 ## What didn't work
 

@@ -1,6 +1,6 @@
 # Track B: performance log
 
-**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0733 s / 28.0 MB** (`run-1f4332f9431a`), at S 1,046: K = **42.05** and **81.1 speed points**. Its three runs, with `run-d6592edbc383` and `run-0545176ab4a3`, read T 0.0741, 0.0754 and 0.0733, for a median K of 41.80.
+**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0732 s / 26.2 MB** (`run-763c4b4ded66`), at S 1,046: K = **42.06** and **81.2 speed points**. Its five runs read T 0.0733 to 0.0754, for a median K of 41.80.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks b`. Output SHA-256 on seed 1: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
@@ -9,7 +9,7 @@
 - S is 1,046 code lines against the reference's 91, which costs (91/1046)^0.15, K x 0.69, about 7.9 speed points. It's the most code of any of our tracks. Each 100 lines move K by about 1.5%.
 - M scores nothing here. K takes min(M_ref / M, 50), and the board measured the reference at 2,199,961,600 bytes, so any M below 44.0 MB counts as 44.0. Ours has been below that since the design that stored postings (41.6 MB, `run-f39141d33527`), so cutting it from 42 to 27 MB with the block queries (D33) earned nothing by itself: K read 36.24 in that change's first run (`run-21faf3464957`), against 34.49 to 36.28 in the eight runs before it at S 1,015.
 - Local timing ranks the block queries the wrong way round. With block queries at anchors holding N/96, N/48 and N/24 documents, local cycles read 2.10G, 2.13G and 2.16G, and the board read T 0.0996, 0.0909 and 0.0942, one sample each (D36). Our guess, not confirmed, is that a block's columns and tallies go through a cache that two threads share on the box. Locally the whole run takes about 40 ms (D37, D38), and on the box T is 78 ms.
-- The board can't tell changes of under 1% apart: the three runs of this build span 0.0733 to 0.0754.
+- The board can't tell changes of under 1% apart: the five runs of this build span 0.0732 to 0.0754.
 - The plan runs on one thread, after a parallel sample. Moving it onto threads was tried and dropped (D38), and we haven't timed it on the box for this design.
 - Printing keeps an order: threads claim batches of 1,024 queries, and each waits for the batch before it to reach the file. On an idle box that's flat against printing at known offsets, but a busy box stalls it (D26).
 
@@ -76,10 +76,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 40 | exp: each thread lists its own first ten ids per tally, added up after the scan, with no lock during it | 322,000 lock takes and 524,000 reads of a shared limit on seed 1, each a likely cache-line transfer. Spends memory that scores nothing below 44 MB; this build is about 51 MB locally, so it measures T first | run-35f97fe72a66 | 0.0806 | 46.1 | K median K 39.73 over 3 runs: rejected |
 | 41 | Back to the build where threads share the release of the corpus's pages | First ten ids per thread: T 0.0804, M 46.5 MB, K 39.73 over 3 runs, against K 41.46 over 4 for this source | run-c81ac5a14d50 | 0.0761 | 27.8 | K the source of step 39 again |
 | 42 | exp: ranges of a little under a block's documents, from the sample's mean document length | A range cut a block short about every second block, and a short block costs a whole pass over the columns: about 18% more passes than documents need | run-1f4332f9431a | 0.0733 | 28.0 | K median K 41.80 over 3 runs: kept |
-| 43 | exp: each tally's shared limit in a cache line of its own | A limit that one thread lowers throws out seven neighbours from the other threads' caches, 322,000 times on seed 1. This spends 2.6 MB that scores nothing, and M stays under 44 MB. Local cycles are flat, but they rank cache changes wrongly here | pending | — | — | — |
-| 44 | Back to the build without a cache line per tally's limit | A line per limit: median K 41.37 over 3 runs at M 29.6 MB, against 41.63 over 4 for this source | pending | — | — | — |
-| 45 | exp: a prefetch of a term's first hit word, beside the one of its checks | check_bools writes hits with no prefetch, and it has 24% of the cache misses. The box has half this PC's L2 per thread. Local cycles flat | pending | — | — | — |
-| 46 | Back to the build without the prefetch of hits | Prefetch of hits: median K 41.10 over 3 runs, against 41.80 over 5 for this source | pending | — | — | — |
+| 43 | exp: each tally's shared limit in a cache line of its own | A limit that one thread lowers throws out seven neighbours from the other threads' caches, 322,000 times on seed 1. This spends 2.6 MB that scores nothing, and M stays under 44 MB. Local cycles are flat, but they rank cache changes wrongly here | run-fbce98a5f127 | 0.0757 | 29.7 | K median 41.37 over 3 runs: rejected |
+| 44 | Back to the build without a cache line per tally's limit | A line per limit: median K 41.37 over 3 runs at M 29.6 MB, against 41.63 over 4 for this source | run-763c4b4ded66 | 0.0732 | 26.2 | K 42.06, the source of step 42 |
+| 45 | exp: a prefetch of a term's first hit word, beside the one of its checks | check_bools writes hits with no prefetch, and it has 24% of the cache misses. Local cycles flat | run-c00fb88f9c97 | 0.0766 | 28.3 | K median 41.10 over 3 runs: rejected |
+| 46 | Back to the build without the prefetch of hits | Prefetch of hits: median K 41.10 over 3 runs, against 41.80 over 5 for this source | pending, same source as step 42 | — | — | — |
 
 ## Decision log
 
@@ -197,6 +197,7 @@ This PC's wall time is noisy, so thread cycles from `perf stat`, which repeat to
 | Batched tallies, SWAR printing, the LF block apart, block-sized ranges, a prefetch before the phrase checks, 1 or 4 MiB samples | Each a few percent of cycles | No gain | local, D37 | not kept |
 | A table of 1<<17 sets, one of 1<<15, non-temporal prefetch of sets, sets prefetched a document ahead | Fewer misses | Worse by 4%, 6%, 2% and 3% | local, D37 | not kept |
 | Each thread's own first ten ids per tally, so no locks in the scan | Fewer cache-line transfers, spending memory that scores nothing | T 0.0804 against 0.075, M 46.5 MB, K 39.73 against 41.46 | `run-35f97fe72a66`, `run-bd5defba895e`, `run-824503bf4037` | reverted (D41) |
+| A cache line per tally's limit, to end false sharing between the limits; a prefetch of a term's first hit word | Fewer misses, for memory that scores nothing | K 41.37 and 41.10, 3 runs each, against 41.80 over 5. Local cycles flat for both | `run-fbce98a5f127`, `run-c00fb88f9c97` | reverted |
 | One round of threads for parse and scan, the plan on threads, a prefault of the heap, mapped output, skipping the empty sets (12% of them), clearing only the columns used | Shorter serial parts and fewer misses | One round +1 ms, skipping empty sets +1.5%; the others no gain | local, D38 | not kept |
 
 ## The final design

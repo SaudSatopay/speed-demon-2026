@@ -91,6 +91,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 56 | exp: 64 KiB pieces | Half the system calls, for 32 KiB more per thread | pending | — | — | — |
 | 57 | Reads that stop where the segment does, lined up with their source, in 32 KiB pieces again | With 64 KiB pieces T stayed at 0.0188 and M rose to 17.0, so the pieces go back to 32 KiB, and reads that stop with the segment, at T 0.0189 against 0.0193, stay | pending | — | — | — |
 | 58 | exp: three threads finish hours instead of four | Each finisher's scratch stays as large as the largest hour it has seen, about 0.3 MB, and eight finishers read T 0.0197 at M 17.5 | pending | — | — | — |
+| 59 | exp: once there's nothing left to read, every thread helps finish hours | Three finishers read T 0.0226 against 0.0192 with four, so finishing limits T on the box, while eight read T 0.0197 at M 17.5, as finishers take cores from the readers. After the last read, 8 of 12 threads have been leaving the other 4 to finish alone | pending | — | — | — |
 
 ## Decision log
 
@@ -209,6 +210,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D57.** Decided by the board. A segment's last read took a whole piece, which threw away half a piece per segment, 5% of all the copying. Each read now takes what the segment needs, and goes where its source and destination share a place in a cache line. Runs: T 0.0189 at M 16.5, K 54.20, against T 0.0193 at M 16.2, K 53.91; 64 KiB read T 0.0188 at M 17.0, K 53.91. S 300 -> 299.
 
 **D58.** Experiment, against T 0.0189 to 0.0195 and M 16.0 to 16.8 with four. Local timing can't judge this. It needs several samples, as one sample's noise is about the size of the effect.
+
+**D59.** Experiment, against T 0.0189 to 0.0195 at M 16.0 to 16.8, with four finishers during the read and all threads after it. Locally flat within noise: +0.2 ms of 11.7. M may rise as helpers' scratch adds up at the end. Grid and thread sweep pass; S 299 -> 301.
 
 ## What didn't work
 

@@ -148,6 +148,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 112 | exp: 1seg, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
 | 113 | exp: h105k, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
 | 114 | exp: 1seg, sample 2 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
+| 115 | exp: h105k, sample 2 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
 
 ## Decision log
 
@@ -379,6 +380,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D113.** Median of three decides against 45.90
 
 **D114.** Median of three decides against 45.90
+
+**D115.** Median of three decides against 45.90
 
 ## What didn't work
 

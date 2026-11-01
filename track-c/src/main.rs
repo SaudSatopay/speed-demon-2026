@@ -12,7 +12,7 @@
 //! thread sums into its own rows. One shared table counts the distinct names per country, and a chunk
 //! of records has its cache lines prefetched before any of it is added up.
 //!
-//! All the memory is one mapping, touched by the main thread while it's pinned to one CPU. The kernel
+//! All the memory is one mapping, touched by the main thread before any other starts. The kernel
 //! charges a memory group's pages to each CPU in batches, and what a CPU has charged but not used yet
 //! counts in the peak: up to 252 KB per CPU that charges anything at all. So the workers, on stacks in
 //! that mapping, never fault and never use the heap.
@@ -28,7 +28,7 @@ use std::{ptr::null_mut, sync::Mutex, thread};
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc. A `pthread_attr_t`
-// is 56 bytes and a `cpu_set_t` 128, so the word arrays hold them.
+// is 56 bytes, so the word array holds it.
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
@@ -36,9 +36,6 @@ unsafe extern "C" {
     fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
     fn pthread_create(id: *mut u64, attr: *const [u64; 8], start: Start, arg: *mut u8) -> i32;
     fn pthread_join(id: u64, result: *mut *mut u8) -> i32;
-    fn sched_getcpu() -> i32;
-    fn sched_getaffinity(pid: i32, len: usize, cpus: *mut [u64; 16]) -> i32;
-    fn sched_setaffinity(pid: i32, len: usize, cpus: *const [u64; 16]) -> i32;
 }
 
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
@@ -185,22 +182,15 @@ impl<'a> NameTable<'a> {
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
         let (read_write, private_anon, huge) = (3, 0x22, 1 << 21);
-        let (mut allowed, mut here) = ([0u64; 16], [0u64; 16]);
         // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
-        // so the parts don't overlap, and zero is a valid value of each atomic. The CPU sets are the
-        // size given, and if a call fails, this thread just stays free to move.
+        // so the parts don't overlap, and zero is a valid value of each atomic.
         unsafe {
-            sched_getaffinity(0, 128, &mut allowed);
-            let cpu = sched_getcpu().max(0) as usize;
-            here[cpu / 64 % 16] = 1 << (cpu % 64);
-            sched_setaffinity(0, 128, &here);
             let at = mmap(null_mut(), bytes + huge, read_write, private_anon, -1, 0);
             assert!(at as isize != -1);
             let base = at.add(at.align_offset(huge));
             // No huge page past the last whole one: whether one fits there depends on the address.
             madvise(base.add(bytes / huge * huge), huge, 15);
             madvise(base, bytes, 23);
-            sched_setaffinity(0, 128, &allowed);
             NameTable {
                 records,
                 words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),

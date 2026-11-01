@@ -97,6 +97,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 75 | exp: names with no slot (long, or every window to the end of the table full) go to one locked set, so no restart and no pointers in slots; on top of the piece claims | Thirteen fewer lines with only cold paths changed, and a second sample of the piece claims | pending | — | — | — |
 | 76 | Back to segments, with the locked set for names with no slot, and line trims: BOM by arithmetic, quotes counted in a closure | Piece claims cost about 3% of T in two samples, C over D 0.141 against 0.136, so they go; the locked set changes only cold paths and is 13 lines shorter, and the trims 8 more | pending | — | — | — |
 | 77 | exp: only the locked set for names with no slot, with the BOM branch and the old quote count back | The trims gave T 0.0212 and C over D 0.146, so this takes them out to see whether the locked set alone keeps T 0.0200 | pending | — | — | — |
+| 78 | exp: the main thread is no longer pinned while it touches the mapping | Eight lines for a guard against a move in the first millisecond; if the main thread rarely moves, M stays and S falls | pending | — | — | — |
 
 ## Decision log
 
@@ -254,6 +255,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D76.** pending the board
 
 **D77.** pending the board
+
+**D78.** pending the board
 
 ## What didn't work
 

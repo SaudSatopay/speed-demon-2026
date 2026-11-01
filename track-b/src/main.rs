@@ -52,6 +52,9 @@ use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, thread};
 const FIRST_TERM: usize = 1;
 /// The low bits of a term table's word are its term's number...
 const TERM_BITS: u32 = (1 << 24) - 1;
+/// ...an `UNSURE` one says here which way's long key is its token's to compare, counted from the word of
+/// no way, which matches no token...
+const WAY_SHIFT: u32 = 26;
 /// ...and the top bits say what else to do. A word that may not be the token's says to look further, as
 /// its key held only part of the token, or as the probe has to go on...
 const UNSURE: u32 = 1 << 31;
@@ -233,126 +236,174 @@ fn hashes(keys: __m256i) -> __m256i {
     }
 }
 
-/// A word's bit, while the queries are read, that its slot is locked...
-const LOCKED: u32 = 1 << 26;
-/// ...and its bit that some term was placed past this slot, so a probe that gets here goes on. It isn't the
-/// term's, so that a swap in `make_plan` leaves it behind, and `look_up` drops it from a word it finds.
-const PASSED: u32 = 1 << 27;
+/// Where a set's `rest` holds the word of no way, which comes just past the ways' words...
+const NO_WAY: usize = 4;
 /// The top bit of a long key, on a term longer than the keys. The rest of it says where the term is in
 /// the query file.
 const LONG: u32 = 1 << 31;
+/// How many terms a table takes for each of its sets, whose ways with long keys are more than that, so that
+/// a probe always comes to a set with room.
+const TERMS_PER_SET: usize = 2;
 
-/// One term, by keys that `look_up` reads for four tokens at once by a gather, with no branch on what it
-/// finds. A short key of 0 is an empty slot.
-#[repr(C, align(16))]
-struct TermSlot {
-    short: u64,
-    word: u32,
-    long: u32,
+/// Four terms in one cache line, whose keys are compared at once, so a lookup has no branch on which of
+/// them it found, or whether it found one. The word of no way is what a lookup that finds none gets: 0 (no
+/// query uses this token), or `UNSURE` if the probe goes on. While the queries are read, its low bit is the
+/// set's lock. Only the last three ways have long keys, and terms that need one fill those in order, from
+/// the last. The others take the first way free, so the first way's long key is always 0.
+#[repr(align(64))]
+struct TermSet {
+    shorts: [u64; 4], // Short keys, 0 in the ways not used.
+    rest: [u32; 8],   // The ways' words, last way first, the word of no way, then the long keys.
 }
 
-/// Query terms to dense ids, by open addressing with linear probing. A hit always compares the whole
-/// token: for a term longer than the keys' 12 bytes, the long key says where it is in the query file, and
-/// its top bit is set.
+impl TermSet {
+    /// A bit for each way holding this short key.
+    fn ways(&self, short_key: u64) -> u32 {
+        // SAFETY: the build targets x86-64-v3, which has AVX2, and the struct is aligned.
+        unsafe {
+            let keys = _mm256_load_si256(self.shorts.as_ptr().cast());
+            let same = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(short_key as i64));
+            _mm256_movemask_pd(_mm256_castsi256_pd(same)) as u32
+        }
+    }
+
+    /// A bit for each way holding this long key.
+    fn long_ways(&self, long_key: u32) -> u32 {
+        // SAFETY: as in `ways`.
+        unsafe {
+            let keys = _mm_load_si128(self.rest.as_ptr().add(NO_WAY).cast());
+            let same = _mm_cmpeq_epi32(keys, _mm_set1_epi32(long_key as i32));
+            // The word of no way comes first, in the place of the first way's key, which is always 0.
+            _mm_movemask_ps(_mm_castsi128_ps(same)) as u32 & 14 | u32::from(long_key == 0)
+        }
+    }
+
+    /// The word of the last of these ways, or else of no way: a count of zeros above four bits of ways.
+    fn word(&self, ways: u32) -> u32 {
+        // SAFETY: `ways` has four bits, so there are 28 to 32 of those zeros.
+        unsafe { *self.rest.get_unchecked(ways.leading_zeros() as usize - 28) }
+    }
+}
+
+/// Query terms to dense ids, by open addressing with linear probing over sets. A hit always compares
+/// the whole token: for a term longer than the keys' 12 bytes, the long key says where it is in the query
+/// file, and its top bit is set.
 #[derive(Default)]
 struct TermTable<'a> {
-    slots: Vec<TermSlot>, // The length is a power of two.
-    text: &'a [u8],       // Where the terms come from.
-    count: usize,         // How many term numbers there are.
+    sets: Vec<TermSet>, // The length is a power of two.
+    text: &'a [u8],     // Where the terms come from.
+    count: usize,       // How many term numbers there are.
 }
 
 impl TermTable<'_> {
-    /// The slot a probe for this short key starts at.
-    fn home(&self, short: u64) -> usize {
-        // SAFETY: the build targets x86-64-v3, which has AVX2.
-        let hash = unsafe { _mm256_extract_epi64::<0>(hashes(_mm256_set1_epi64x(short as i64))) };
-        let top = hash as usize >> (32 - self.slots.len().trailing_zeros());
-        top & (self.slots.len() - 1)
-    }
-
-    /// Whether this slot, holding this token's short key, holds this token, whose long key this is.
-    fn holds(&self, slot: &TermSlot, token: &[u8], long: u32) -> bool {
-        if long & LONG == 0 {
-            return slot.long == long;
-        }
-        let term = self.text.get((slot.long & !LONG) as usize..).unwrap_or(&[]);
-        slot.long & LONG != 0
-            && token.eq_ignore_ascii_case(term.get(..token.len()).unwrap_or(&[]))
-            && !term.get(token.len()).is_some_and(u8::is_ascii_alphanumeric)
-    }
-
     /// The word of the term of this token, in any letter case, or else 0, from a probe that starts at
-    /// this slot. A slot that no term was placed past ends a probe.
+    /// this set. A set that no term was placed past ends a probe.
     #[cold]
-    fn find(&self, token: &[u8], short: u64, mut index: usize) -> u32 {
-        let long = keys_of(token).1;
+    fn find<'s>(&'s self, token: &[u8], short: u64, mut set: &'s TermSet) -> u32 {
         loop {
-            let slot = &self.slots[index];
-            if slot.short == short && self.holds(slot, token, long) {
-                return slot.word & !PASSED;
+            let ways = self.ways_of(set, token, short, keys_of(token).1);
+            // One test, not two: that this finds a term or not is a coin toss.
+            if ways | u32::from(set.rest[NO_WAY] == 0) != 0 {
+                return set.word(ways);
             }
-            if slot.word & PASSED == 0 {
-                return 0;
-            }
-            index = (index + 1) & (self.slots.len() - 1);
+            // SAFETY: the set is one of these.
+            let index = unsafe { std::ptr::from_ref(set).offset_from(self.sets.as_ptr()) } as usize;
+            set = &self.sets[(index + 1) & (self.sets.len() - 1)];
         }
+    }
+
+    /// Which ways of this set hold this token, whose keys these are. Beyond the short key, only a long
+    /// key's compare is left, unless the token is longer than the keys.
+    #[inline(always)]
+    fn ways_of(&self, set: &TermSet, token: &[u8], short: u64, long: u32) -> u32 {
+        if long & LONG == 0 {
+            return set.ways(short) & set.long_ways(long);
+        }
+        self.ways_of_long_term(set, token, short)
+    }
+
+    /// Which ways of this set hold this token longer than the keys.
+    #[cold]
+    fn ways_of_long_term(&self, set: &TermSet, token: &[u8], short: u64) -> u32 {
+        let (ways, end) = (set.ways(short), token.len());
+        let is_token = |way: &u32| {
+            let long = set.rest[NO_WAY + *way as usize];
+            let term = self.text.get((long & !LONG) as usize..).unwrap_or(&[]);
+            ways >> way & long >> 31 != 0
+                && token.eq_ignore_ascii_case(term.get(..end).unwrap_or(&[]))
+                && !term.get(end).is_some_and(u8::is_ascii_alphanumeric)
+        };
+        (1..4).filter(is_token).map(|way| 1 << way).sum()
     }
 
     /// Adds this query term, if it's new, and returns its number. With no room left in the table, that
     /// number is too big for it, and `parse_queries` reads the queries again into a larger one. Threads do
-    /// this at once: each holds the lock of the slot it's looking at. So threads adding one term get the
-    /// same number, as slots only fill, and the first with room is where it goes. A term that's in already
-    /// is found without the lock, as a slot's short key is stored after the rest: most of the tokens are
-    /// common terms, which every thread meets.
+    /// this at once: each holds the lock of the set it's looking at. So threads adding one term get the same number, as sets only fill, and the first set with
+    /// room is where it goes. A term that's in already is found without the lock, as a way's key is stored
+    /// after its word, so a key that's there has its word: most of the tokens are common terms, which
+    /// every thread meets.
     fn intern(&self, token: &[u8], next_term: &AtomicUsize) -> u32 {
         let (short, long) = keys_of(token);
-        let mut index = self.home(short);
+        // SAFETY: the build targets x86-64-v3, which has AVX2.
+        let hash = unsafe { _mm256_extract_epi64::<0>(hashes(_mm256_set1_epi64x(short as i64))) };
+        let top = hash as usize >> (32 - self.sets.len().trailing_zeros());
+        let mut index = top & (self.sets.len() - 1);
         loop {
-            // SAFETY: the slot is in the table. The look before the lock can run while another thread fills
-            // it: it acts only on a short key that's there, whose `Release` store comes after the rest. The
-            // word is only ever written atomically, and holding the lock, this thread alone writes the rest.
+            // SAFETY: the set is in the table. The look before the lock can run while another thread
+            // fills the set: it acts only on a short key that's there, which an aligned load doesn't tear,
+            // and whose `Release` store comes after that way's long key and word. Holding the lock,
+            // this thread alone writes to the set, and only to ways that readers don't act on yet.
             unsafe {
-                let slot = self.slots.as_ptr().add(index).cast_mut();
-                let key = AtomicU64::from_ptr(&raw mut (*slot).short);
-                let word = AtomicU32::from_ptr(&raw mut (*slot).word);
-                if key.load(Acquire) == short && self.holds(&*slot, token, long) {
-                    return word.load(Relaxed) & TERM_BITS;
+                let set = self.sets.as_ptr().add(index).cast_mut();
+                let ways = self.ways_of(&*set, token, short, long);
+                if ways != 0 {
+                    return (*set).word(ways) & TERM_BITS;
                 }
-                while word.fetch_or(LOCKED, Acquire) & LOCKED != 0 {}
-                let found = key.load(Relaxed);
-                let held = word.load(Relaxed);
-                if found == short && self.holds(&*slot, token, long) {
-                    word.store(held & !LOCKED, Release);
-                    return held & TERM_BITS;
+                let lock = AtomicU32::from_ptr(&raw mut (*set).rest[NO_WAY]);
+                let mut no_way = lock.fetch_or(1, Acquire);
+                while no_way & 1 != 0 {
+                    no_way = lock.fetch_or(1, Acquire);
                 }
-                if found == 0 {
-                    let term = next_term.fetch_add(1, Relaxed) as u32;
-                    if (term as usize) < FIRST_TERM + self.slots.len() / 2 {
-                        let has_more = token.len() > 8;
+                let set = &mut *set;
+                let ways = self.ways_of(set, token, short, long);
+                // A token past the short key has more to compare.
+                let has_more = token.len() > 8;
+                let free = set.ways(0) & if has_more { 14 } else { 15 };
+                let (mut term, room) = (set.word(ways) & TERM_BITS, free != 0);
+                if ways == 0 && room {
+                    term = next_term.fetch_add(1, Relaxed) as u32;
+                    if (term as usize) < FIRST_TERM + TERMS_PER_SET * self.sets.len() {
+                        let way = [free.trailing_zeros(), free.ilog2()][has_more as usize] as usize;
                         let at = (token.as_ptr() as usize - self.text.as_ptr() as usize) as u32;
-                        (*slot).long = if long & LONG != 0 { LONG | at } else { long };
-                        word.store(held | term | u32::from(has_more) * UNSURE, Relaxed);
-                        key.store(short, Release);
+                        if has_more {
+                            let key = if long & LONG != 0 { LONG | at } else { long };
+                            set.rest[NO_WAY + way] = key;
+                        }
+                        let more = UNSURE | (way as u32) << WAY_SHIFT;
+                        set.rest[NO_WAY - 1 - way] = term | u32::from(has_more) * more;
+                        AtomicU64::from_ptr(&raw mut set.shorts[way]).store(short, Release);
                     }
-                    word.fetch_and(!LOCKED, Release);
+                }
+                // A lookup that finds nothing in a set this term has passed has to look further.
+                lock.store(no_way | u32::from(ways == 0 && !room) * UNSURE, Release);
+                if ways != 0 || room {
                     return term;
                 }
-                word.store((held | PASSED) & !LOCKED, Release);
             }
-            index = (index + 1) & (self.slots.len() - 1);
+            index = (index + 1) & (self.sets.len() - 1);
         }
     }
 }
 
-/// Reads the queries into a new plan, whose term table has this many slots: each thread the lines that
+/// Reads the queries into a new plan, whose term table has this many sets: each thread the lines that
 /// start in its part of the text.
-fn parse_queries(text: &[u8], threads: usize, slots: usize) -> Plan<'_> {
+fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
     let mut plan = Plan::default();
-    // Empty slots, from the kernel's zeros as threads first touch them. Threads that fault in the same huge
+    // Empty sets, from the kernel's zeros as threads first touch them. Threads that fault in the same huge
     // page each allocate one, which the memory peak counts, but below 44 MB that scores nothing.
-    // SAFETY: zeros are a valid TermSlot.
-    let empty = unsafe { Box::<[TermSlot]>::new_zeroed_slice(slots).assume_init() };
-    (plan.terms.text, plan.terms.slots) = (text, empty.into_vec());
+    // SAFETY: zeros are a valid TermSet.
+    let empty = unsafe { Box::<[TermSet]>::new_zeroed_slice(sets).assume_init() };
+    (plan.terms.text, plan.terms.sets) = (text, empty.into_vec());
     let (next_part, next_term) = (AtomicUsize::new(0), AtomicUsize::new(FIRST_TERM));
     let mut parts = on_threads(threads, || {
         let part = claim(&next_part, text.len() / threads + 1, text.len()).unwrap_or_default();
@@ -380,8 +431,8 @@ fn parse_queries(text: &[u8], threads: usize, slots: usize) -> Plan<'_> {
     });
     plan.terms.count = next_term.into_inner();
     // Far more terms than the table was sized for: the queries are read again, into a larger one.
-    if plan.terms.count > FIRST_TERM + slots / 2 {
-        return parse_queries(text, threads, slots * 4);
+    if plan.terms.count > FIRST_TERM + TERMS_PER_SET * sets {
+        return parse_queries(text, threads, sets * 4);
     }
     parts.sort_unstable_by_key(|part| part.0);
     for (_, mut queries, steps) in parts {
@@ -726,23 +777,11 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         new_number[term] = (FIRST_TERM + at) as u32;
         flags[term] |= new_number[term] | (u32::from(store_of[term] == COLUMN_ONLY) * SPARSE);
     }
-    // A term past its home slot costs a full look at each occurrence, so the commoner term takes it. Each
-    // keeps the slots it's placed past marked, which covers the other's probe too: the term at home came
-    // from there or before. Empty slots hold term 0, whose word stays 0, and then each word gets its flags.
-    for index in 0..plan.terms.slots.len() {
-        let home = plan.terms.home(plan.terms.slots[index].short);
-        let of = |slot: &TermSlot| df[(slot.word & TERM_BITS) as usize];
-        let slots = &mut plan.terms.slots;
-        if slots[index].short != 0 && of(&slots[home]) < of(&slots[index]) {
-            let (here, there) = (slots[index].word, slots[home].word);
-            (slots[index].short, slots[home].short) = (slots[home].short, slots[index].short);
-            (slots[index].long, slots[home].long) = (slots[home].long, slots[index].long);
-            slots[index].word = there & !PASSED | here & PASSED;
-            slots[home].word = here & !PASSED | there & PASSED;
+    // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
+    for set in &mut plan.terms.sets {
+        for word in &mut set.rest[..=NO_WAY] {
+            *word = flags[(*word & TERM_BITS) as usize] | (*word & !TERM_BITS);
         }
-    }
-    for slot in &mut plan.terms.slots {
-        slot.word = flags[(slot.word & TERM_BITS) as usize] | (slot.word & !TERM_BITS);
     }
     for step in &mut plan.steps {
         *step = (*step & !TERM_BITS) | new_number[(*step & TERM_BITS) as usize];
@@ -848,7 +887,7 @@ struct DocLists {
     phrase_at: Vec<u32>, // The positions of phrase anchors.
     bools: Vec<u32>,     // The terms with BOOL checks, once each.
     keys: Vec<u64>,      // Every token's short key...
-    places: Vec<u64>,    // ...and its slot's address.
+    places: Vec<u64>,    // ...and its set's address.
     present: Vec<u8>,    // Each term's mark, then one that means nothing.
     stamp: u8,           // The stamp of the document in hand.
 }
@@ -888,14 +927,15 @@ fn insert_smallest(smallest: &mut [u32; SMALLEST], mut doc: u32) {
     }
 }
 
-/// Looks the tokens up, four at a time, by gathers: each one's bytes for its key, then its slot, with no
-/// branch on what that finds. Misses overlap by themselves, as the core runs ahead past a gather. A word with
-/// no flags marks its term there and then. The others are listed by position: those marked `UNSURE` need a
-/// full look, and few do, and those that are a term's with flags go to `mark`. Returns how many it listed for
-/// that. This stage stays out of line, like `mark` and `check_bools`, because measurements say so.
+/// Looks the tokens up: first finding each one's key and prefetching its set, so that cache misses
+/// overlap, then comparing the keys without a branch on what that finds. A word with no flags marks its
+/// term there and then. The others are listed by position: those marked `UNSURE` need a full look, and few
+/// do, and those that are a term's with flags go to `mark`. Returns how many it listed for that. This stage
+/// stays out of line, like `mark` and `check_bools`, because measurements say so: inlining this one costs
+/// 1.7% of all cycles, and those two 1.9% together.
 #[inline(never)]
 fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) -> usize {
-    let (slots, count) = (terms.slots.as_ptr() as i64, edges.len() / 2 - 2 * LANES);
+    let (sets, count) = (terms.sets.as_ptr() as i64, edges.len() / 2 - 2 * LANES);
     if lists.keys.len() < count + 2 * LANES {
         make_room(lists, count + 2 * LANES);
     }
@@ -903,56 +943,59 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
     let (flagged, present) = (&mut lists.flagged[..], &mut lists.present[..]);
     let (keys, places) = (&mut lists.keys[..], &mut lists.places[..]);
     let (stamp, last) = (lists.stamp, terms.count as u32);
-    // A slot is 16 bytes, so these take a hash to a slot's distance from the first.
-    let shift = 32 - 4 - terms.slots.len().trailing_zeros() as i32;
-    let distances = (terms.slots.len() as i64 - 1) << 4;
+    // A set is 64 bytes, so these take a hash to a set's distance from the first.
+    let shift = 32 - 6 - terms.sets.len().trailing_zeros() as i32;
+    let distances = (terms.sets.len() as i64 - 1) << 6;
+    // First pass: each token's key, and its set's address, prefetched, as far as the next pass reads.
+    for at in (0..count.next_multiple_of(2 * LANES)).step_by(LANES) {
+        // SAFETY: `edges` has eight pairs more than there are tokens, each at or before a token's start,
+        // whose load stays in the mapping as in `keys_of`. Keys and places have room for seven more.
+        // The set is in the table, and a prefetch has no other effect. The build targets x86-64-v3,
+        // which has AVX2.
+        unsafe {
+            let pairs = edges.as_ptr().add(2 * at);
+            let start = |i: usize| text.as_ptr().add(*pairs.add(2 * i) as usize);
+            let load = |i: usize| start(i).cast::<i64>().read_unaligned();
+            let bytes = _mm256_setr_epi64x(load(0), load(1), load(2), load(3));
+            // Each lane of the pairs is end << 32 | start, which gives end - start in the low half, where
+            // the rest of this looks.
+            let pair = _mm256_loadu_si256(pairs.cast());
+            let lens = _mm256_sub_epi32(_mm256_srli_epi64(pair, 32), pair);
+            // The token's bytes are those whose numbers are below its length, copied to each byte as a signed
+            // number, which `keys_of` follows for the very long.
+            let copies = _mm256_set_epi64x(0x0808_0808_0808_0808, 0, 0x0808_0808_0808_0808, 0);
+            let numbers = _mm256_set1_epi64x(0x0706_0504_0302_0100);
+            let held = _mm256_cmpgt_epi8(_mm256_shuffle_epi8(lens, copies), numbers);
+            let lower = _mm256_or_si256(bytes, _mm256_set1_epi8(CASE_BITS as i8));
+            let more = _mm256_slli_epi64(_mm256_cmpgt_epi32(lens, _mm256_set1_epi64x(8)), 63);
+            let key = _mm256_or_si256(_mm256_and_si256(held, lower), more);
+            let distance = _mm256_srl_epi64(hashes(key), _mm_cvtsi32_si128(shift));
+            let distance = _mm256_and_si256(distance, _mm256_set1_epi64x(distances));
+            let place = _mm256_add_epi64(distance, _mm256_set1_epi64x(sets));
+            _mm256_storeu_si256(keys.as_mut_ptr().add(at).cast(), key);
+            _mm256_storeu_si256(places.as_mut_ptr().add(at).cast(), place);
+            for i in 0..LANES {
+                _mm_prefetch(*places.get_unchecked(at + i) as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
+    // Second pass: compare the keys, mark the terms of the words with no flags, and list the others. Any
+    // other word is above `last`, so marks the mark past the last term's.
     let (mut unsure_count, mut flagged_count) = (0, 0);
     // SAFETY: the build targets x86-64-v3, which has AVX2.
     let mut here = unsafe { _mm256_setzero_si256() };
     for at in (0..count).step_by(2 * LANES) {
-        // SAFETY: `edges` has eight pairs more than there are tokens, each at or before a token's start,
-        // whose load stays in the mapping as in `keys_of`. The slots are in the table. `present` has a mark
-        // past the last term's, and the lists have room for every token and seven more. `POSITIONS` has a
-        // row for each of the masks. The build targets x86-64-v3, which has AVX2.
+        // SAFETY: the places are in the table, `present` has a mark past the last term's, and the lists have
+        // room for every token and seven more. `POSITIONS` has a row for each of the masks. The build targets
+        // x86-64-v3, which has AVX2.
         unsafe {
-            let mut four = |at: usize| {
-                let pairs = edges.as_ptr().add(2 * at);
-                // Each lane of the pairs is end << 32 | start, which gives end - start in the low half, where
-                // the rest of this looks.
-                let pair = _mm256_loadu_si256(pairs.cast());
-                let starts = _mm256_and_si256(pair, _mm256_set1_epi64x(u32::MAX as i64));
-                let bytes = _mm256_i64gather_epi64::<1>(text.as_ptr().cast(), starts);
-                let lens = _mm256_sub_epi32(_mm256_srli_epi64(pair, 32), pair);
-                // The token's bytes are those whose numbers are below its length, copied to each byte as a signed
-                // number, which `keys_of` follows for the very long.
-                let copies = _mm256_set_epi64x(0x0808_0808_0808_0808, 0, 0x0808_0808_0808_0808, 0);
-                let numbers = _mm256_set1_epi64x(0x0706_0504_0302_0100);
-                let held = _mm256_cmpgt_epi8(_mm256_shuffle_epi8(lens, copies), numbers);
-                let lower = _mm256_or_si256(bytes, _mm256_set1_epi8(CASE_BITS as i8));
-                let more = _mm256_slli_epi64(_mm256_cmpgt_epi32(lens, _mm256_set1_epi64x(8)), 63);
-                let key = _mm256_or_si256(_mm256_and_si256(held, lower), more);
-                let distance = _mm256_srl_epi64(hashes(key), _mm_cvtsi32_si128(shift));
-                let distance = _mm256_and_si256(distance, _mm256_set1_epi64x(distances));
-                let held_keys = _mm256_i64gather_epi64::<1>(slots as *const i64, distance);
-                let rest = _mm256_i64gather_epi64::<1>((slots + 8) as *const i64, distance);
-                // A hit gets the word without `PASSED`. A miss gets `UNSURE` if the slot is `PASSED`, else 0.
-                let word_of_hit =
-                    _mm256_and_si256(rest, _mm256_set1_epi64x((u32::MAX & !PASSED) as i64));
-                let up = _mm256_slli_epi64(rest, (UNSURE / PASSED).trailing_zeros() as i32);
-                let word_of_miss = _mm256_and_si256(up, _mm256_set1_epi64x(UNSURE as i64));
-                let hit = _mm256_cmpeq_epi64(held_keys, key);
-                let words = _mm256_blendv_epi8(word_of_miss, word_of_hit, hit);
-                let order = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-                let words = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(words, order));
-                _mm256_storeu_si256(keys.as_mut_ptr().add(at).cast(), key);
-                let place = _mm256_add_epi64(distance, _mm256_set1_epi64x(slots));
-                _mm256_storeu_si256(places.as_mut_ptr().add(at).cast(), place);
-                words
+            let word = |i: usize| {
+                let set = &*(*places.get_unchecked(at + i) as *const TermSet);
+                set.word(set.ways(*keys.get_unchecked(at + i))) as i32
             };
-            let (low, high) = (four(at), four(at + LANES));
-            let words = _mm256_set_m128i(high, low);
+            let half = |i| _mm_setr_epi32(word(i), word(i + 1), word(i + 2), word(i + 3));
+            let words = _mm256_set_m128i(half(4), half(0));
             _mm256_storeu_si256(tokens.as_mut_ptr().add(at).cast(), words);
-            // Any other word is above `last`, so marks the mark past the last term's.
             let marked = _mm256_min_epu32(words, _mm256_set1_epi32(last as i32));
             for index in std::mem::transmute::<__m256i, [u32; 8]>(marked) {
                 *present.get_unchecked_mut(index as usize) = stamp;
@@ -973,27 +1016,27 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             here = _mm256_add_epi32(here, _mm256_set1_epi32(2 * LANES as i32));
         }
     }
-    // Then the words that may not be the token's.
+    // Third pass: the words that may not be the token's.
     for at in unsure[..unsure_count].iter().map(|&at| at as usize) {
         // SAFETY: this is a token's position or at most seven past the last, for which `tokens` has room,
-        // and `flagged` has room for every token and those.
+        // and `flagged` has room for every token and those seven.
         unsafe {
             let mut word = *tokens.get_unchecked(at);
             let pair = edges.as_ptr().add(2 * at);
             let (start, end) = (*pair as usize, *pair.add(1) as usize);
-            let slot = *places.get_unchecked(at) as *const TermSlot;
-            // Most are terms of up to 12 bytes, whose word is right if the long key is the rest of the token,
-            // taken here as up to 8 bytes, zero-padded, so that a longer rest is a bigger number than any
-            // long key. A miss has no term in its word, and it and tokens of over 16 bytes go to `find`.
+            let set = &*(*places.get_unchecked(at) as *const TermSet);
+            // Most are terms of up to 12 bytes, whose word is right if its way's long key is the rest of the
+            // token, taken here as up to 8 bytes, zero-padded, so that a longer rest is a bigger number than
+            // any long key. A word of no way reads that word in place of a long key, which no token's bytes
+            // equal, so those go to `find`, like tokens of over 16 bytes, and of under 8, whose count of bits
+            // wraps, keeping all of them, and of 8, whose rest of 0 isn't that word. It gives 0 for the empty
+            // pairs past the last token, which marks term 0, whose mark means nothing.
             let rest = text.as_ptr().add(start + 8).cast::<u64>().read_unaligned() | CASE_BITS;
             let rest = _bzhi_u64(rest, 8 * end.wrapping_sub(start + 8) as u32);
-            if word & TERM_BITS == 0 || rest != u64::from((*slot).long) {
-                let index = (slot as usize - slots as usize) / size_of::<TermSlot>();
-                word = terms.find(
-                    text.get_unchecked(start..end),
-                    *keys.get_unchecked(at),
-                    index,
-                );
+            let w = NO_WAY + (word >> WAY_SHIFT & 3) as usize;
+            if rest != u64::from(*set.rest.get_unchecked(w)) {
+                let token = text.get_unchecked(start..end);
+                word = terms.find(token, *keys.get_unchecked(at), set);
                 *tokens.get_unchecked_mut(at) = word;
             }
             let bare = word & (TERM_BITS | PHRASE_ANCHOR | BOOL_ANCHOR | SPARSE);
@@ -1435,8 +1478,8 @@ pub extern "C" fn main() -> i32 {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = if asked > 0 { asked } else { allowed };
     let (docs, queries) = (map_file(&data, "docs.txt"), map_file(&data, "queries.txt"));
-    // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: half the
-    // table's slots have room for all of their 75,000 or so.
+    // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
+    // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
     // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
     // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
@@ -1448,7 +1491,7 @@ pub extern "C" fn main() -> i32 {
             unsafe { madvise(part.as_ptr(), part.len(), 22) };
         }));
     }
-    let mut plan = parse_queries(queries, threads, 1 << 19);
+    let mut plan = parse_queries(queries, threads, 1 << 16);
     mappers.iter().for_each(|mapper| mapper.thread().unpark());
     make_plan(&mut plan, docs, threads);
     let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");

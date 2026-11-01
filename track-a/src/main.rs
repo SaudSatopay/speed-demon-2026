@@ -447,7 +447,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
     // The first few threads also finish hours: enough to keep up with the rest, and few, since each
     // one's scratch stays as large as the largest hour it has seen.
     let work = &|me: usize| {
-        let mut scratch = Vec::with_capacity(usize::from(me < 4) << 18);
+        let mut scratch = Vec::with_capacity(usize::from(me < 3) << 18);
         let go = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
             reached[me].store(cursor.load(Relaxed), Release);
@@ -459,7 +459,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
             // its whole turn off the core, and that happens all the time, so a wait here turned a busy
             // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
             // while the box is busy.
-            if me < 4 && seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
+            if me < 3 && seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
                 state.0 += 1;
                 drop(state);
                 // While it writes, this thread holds no hour back.
@@ -470,7 +470,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> bool {
             }
             let start = cursor.fetch_add(size, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
-            if start < end || reached[me].load(Relaxed) >= end && (me >= 4 || hour >= HOURS) {
+            if start < end || reached[me].load(Relaxed) >= end && (me >= 3 || hour >= HOURS) {
                 return (start < end).then_some([start, (start + size).min(end)]);
             }
             // The wait gives up its core, and the lock first: a spinning thread would keep the one

@@ -2,4 +2,6 @@
 # timed run skips the dynamic loader's work: T counts from exec.
 [build]
 # x86-64-v3 is AVX2, BMI2, POPCNT and friends, and no AVX-512, like the scoring box.
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
+# The last three lift tuning meant for much older CPUs: a zeroing instruction before each bit count, and
+# three-part LEAs split in two.
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static,-false-deps-popcnt,-false-deps-lzcnt-tzcnt,-slow-3ops-lea"]

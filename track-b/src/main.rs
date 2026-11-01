@@ -1342,8 +1342,9 @@ struct Shared {
 /// because batches cost about the same.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, shared: &Shared) {
     let (progress, barrier) = (&shared.progress, &shared.barrier);
-    // 16 ranges per thread: enough that a thread slowed for a while doesn't hold the others up.
-    let range_size = docs.len() / (shared.scans.len() * 16) + 1;
+    // 48 ranges per thread: enough that a thread slowed for a while holds no one up, and that all
+    // finish within a small part of the scan.
+    let range_size = docs.len() / (shared.scans.len() * 48) + 1;
     let scan = scan_ranges(docs, plan, range_size, &progress.next_range);
     let slot = progress.next_scan_slot.fetch_add(1, Relaxed);
     assert!(shared.scans[slot].set(scan).is_ok(), "slot taken twice");

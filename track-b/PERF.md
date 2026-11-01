@@ -62,6 +62,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 28 | exp: each thread gives back a range's pages when it has scanned it | The kernel's unmap at exit is serial, about 62K pages' mapping counts and references, cold by then, and T counts up to exit; on A, mapping lost to reading by 3.3 ms though reading copies every byte | run-cddb558fe995 | 0.1030 | 40.8 | 77.8 |
 | 29 | Fifty-seven fewer lines outside the scan, `main` as the C entry point, and each range's pages left alone | Cause Of Death passed us on B at T 0.100 and S 823, so S is the cheap gain here: 100 lines is K +1.5% | run-d2958120f77f | 0.1100 | 41.9 | 77.3 |
 | 30 | The same machine code with named structs instead of tuples, named constants, and every comment checked against the code | A reader had to remember what `.0` and `.1` held across a dozen record types, and some comments no longer told the truth | pending | — | — | — |
+| 31 | 48 ranges per thread instead of 16, and tuning meant for older CPUs lifted | With 16 ranges a thread's last one takes about 5 ms of the box's time, so threads finish that far apart and wait; C gained 2 to 4% from the same change. For the generic target LLVM also clears the output of TZCNT and POPCNT first, against a false dependency the box's cores don't have | pending | — | — | — |
 
 ## Decision log
 
@@ -126,6 +127,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D30.** Cut lines with no loss of speed, in the plan and answer code; the scan isn't touched. Over alternating runs: cycles 2.359G flat, instructions +0.06%, M max 42.74 MB. `#![no_main]` skips std's setup before main, as on A. Giving back each range's pages after its scan read T 0.1030 against a median of 0.1013, so the serial unmap at exit isn't what limits B, and that goes. Also measured on B and dropped, locally: lookups in windows of tokens (flat), PGO (flat), an L1 table of hot terms (cycles +10 to 14%, as hot lines were already cached), new layouts for check_bools (cycles +2 to 3.5%), marks as bits (cycles +3%). Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
 
 **D31.** A trade: S 880 -> 1015, K x 0.979, for code someone else could change. Answer, Query, AnchorList, Tally, Check, Block, Chain, DocLists, Progress and Shared have named fields, with `repr(C)` where rustc would move a field. Layouts have the same size and offsets, by `offset_of!`, but for Query, which the scan doesn't read. Over 8 alternating rounds: instructions +0.03%, cycles +0.3%, mark and check_bools have identical machine code. M 40.9 to 43.07 MB, under the cap. Grid 43/43, threads 228/228, const-hash 38/38 and 114/114, stress 0 wrong in 300. `make_room` stays out of line, as inlining it into look_up costs +0.9% instructions. The README and this log were read against the code too, and 24 claims were corrected.
+
+**D32.** No lines. Local paired wall -1.0 ms of 57, and wall's spread fell from about 7% to 2%, with cycles flat. Instructions: 3.572G -> 3.539G from the tuning, then 3.563G with more ranges. Hits stay ascending within a thread, as ranges are claimed in order.
 
 ## What didn't work
 

@@ -59,6 +59,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 25 | Answers printed at known offsets with no ordered handoffs, chained OR and NOT applied directly, ranges that shrink toward the end | Parse, plan and answers are likely 25 to 30 ms of T on the box, about twice their local time, and the print phase's 196 ordered write-and-yield steps stall on anything else running | run-3e06bf691391 | 0.1028 | 41.5 | 77.8 |
 | 26 | Back to ordered printing, without the page mapping ahead | Known offsets, direct OR and NOT, and shrinking ranges read T 0.1028 and 0.1008 at S 954, against a median of 0.1006 at S 928 | run-f39141d33527 | 0.0983 | 41.6 | 78.4 |
 | 27 | Terms found without their set's lock, one round of threads for the scan and the answers, larger print batches | Serial costs on the box are about twice local, and another ello reached T 0.077 at S 949, so there's more to find than instructions per token | pending | — | — | — |
+| 28 | exp: each thread gives back a range's pages when it has scanned it | The kernel's unmap at exit is serial, about 62K pages' mapping counts and references, cold by then, and T counts up to exit; on A, mapping lost to reading by 3.3 ms though reading copies every byte | pending | — | — | — |
 
 ## Decision log
 
@@ -117,6 +118,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D27.** Decided by the board: they don't pay for 26 lines on an idle box, though they did hold up better under load. MADV_POPULATE_READ stays out, as plain faults read T 0.1008, flat, for 3 fewer lines.
 
 **D28.** For the board, as these are latency gains, not instruction cuts. Most query tokens are terms already in the table, and `intern` now finds those with no lock, since a way's key goes in last, with Release. `pack` makes its masks without a division. Threads stay on after the scan instead of a new round being started, and 1024 queries a batch means 49 ordered writes instead of 196. Locally, 12 threads, medians of 7: parse 3.3 -> 2.8 ms, plan 3.6 -> 3.3, answers 6.0 -> 4.5; cycles 2.34G -> 2.33G, instructions +0.3%, M 40.9 to 41.5 MB, S 925 -> 927. Tried and dropped: per-thread counts in the sample, an inlined compare of long keys (+1% instructions). Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300.
+
+**D29.** Experiment, against T 0.098 to 0.102 at S 934. Each of 192 calls stops the other threads briefly for its TLB flush, which costs more here in a VM than on the box, so local timing can't judge this.
 
 ## What didn't work
 

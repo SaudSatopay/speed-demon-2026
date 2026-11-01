@@ -54,6 +54,7 @@ const PADDING: usize = 4096;
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only for the life of the process, followed by `PADDING` readable zero bytes. The
@@ -1053,6 +1054,11 @@ fn scan_ranges(docs: &[u8], plan: &Plan, range_size: usize, next_range: &AtomicU
             }
             present[FIRST_TERM..chain_from].fill(0);
         });
+        // Give back the range's whole pages (MADV_DONTNEED), as the kernel's unmap at exit is serial.
+        let from = range.start.next_multiple_of(4096);
+        let len = (range.end & !4095).saturating_sub(from);
+        // SAFETY: the file stays mapped, and these pages come back from the page cache if read again.
+        unsafe { madvise(docs.as_ptr().add(from), len, 4) };
     }
     scan
 }

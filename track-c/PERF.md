@@ -1,6 +1,6 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-ec2daf493b37`: **0.0197 s / 10.4 MB**, K **45.42** and **82.9** speed points. That's one of 1 runs of the final source, which gave T 0.0197 to 0.0197 s, M 10.4 to 10.4 MB and a median K of 45.42 (D94).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-700275291d62`: **0.0195 s / 10.4 MB**, K **45.56** and **82.9** speed points. That's one of 3 runs of the final source, which gave T 0.0195 to 0.0198 s, M 10.4 to 10.4 MB and a median K of 45.42 (D94).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
@@ -318,7 +318,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D93.** All memory is one zeroed static aligned to 2 MiB, so the mapping's setup, the `NameTable` struct and `self` go. `.bss` starts on a 2 MiB boundary too, and `exit` writes its first byte, which cost one whole huge page (local peak 9.70 to 12.06 MB), so the run ends in `_exit`, and the locked state is a static that isn't all zeros, which keeps it out of that extent. The box's kernel, 6.12, honours the alignment for a static PIE. Local: instructions 300.7 to 289.7 per record, paired T -2.5%, peak 9.70 MB. Board `run-0766e5fe11fd`: T 0.0203, M 10.25, S 407, K 44.68. Outcome: kept, with D94 on top.
 
-**D94.** Helpers merged: one function gives a name's home and tag, closures for the arguments and for claiming a job. Instructions per record unchanged. Board: K 45.42 at S 399, median 45.42 against 44.00. Outcome: kept.
+**D94.** Helpers merged: one function gives a name's home and tag, closures for the arguments and for claiming a job. Instructions per record unchanged. Board: K 45.42, 45.29, 45.56 at S 399, median 45.42 against 44.00. Outcome: kept.
 
 ## What didn't work
 

@@ -557,12 +557,11 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // smaller than a line on tiny inputs.
     let segment = (end / (threads * 64)).max(1);
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
-    let parsed = AtomicUsize::new(0);
     let worker = &|me: usize| {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
         // one's scratch stays as large as the largest hour it has seen. It has room for 1 MiB of
         // records from the start, in pages that stay untouched until a large hour needs them.
-        let finisher = me < 4;
+        let finisher = me < 5;
         let mut scratch = Vec::with_capacity(usize::from(finisher) << 18);
         let next_segment = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
@@ -599,11 +598,6 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             thread::yield_now();
         };
         parse(log, &table, &hours, next_segment);
-        // No release while anyone still works, as each one interrupts every CPU running this process.
-        parsed.fetch_add(1, Relaxed);
-        while parsed.load(Relaxed) < threads {
-            thread::yield_now();
-        }
         // Exit would take the log's pages out of the address space one by one on the last thread, and
         // the clock counts that, so whichever threads are done share the work first. From the log's
         // start on, as threads still reading are near its end, and a page taken from them just comes back.

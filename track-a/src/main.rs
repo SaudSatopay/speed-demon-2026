@@ -37,7 +37,7 @@ const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
 /// Bytes per read: few enough to stay in the caches, enough that a read costs little per line.
-const PIECE: usize = 1 << 15;
+const PIECE: usize = 1 << 16;
 
 /// Room for the spec's exactly 1,842 endpoints, at a low load.
 const SLOTS: usize = 1 << 14;

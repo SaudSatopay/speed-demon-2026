@@ -12,10 +12,10 @@
 //! thread sums into its own rows. One shared table counts the distinct names per country, and a chunk
 //! of records has its cache lines prefetched before any of it is added up.
 //!
-//! All the memory is one mapping, touched by the main thread before any other starts. The kernel
+//! All the memory is one static, touched by the main thread before any other starts. The kernel
 //! charges a memory group's pages to each CPU in batches, and what a CPU has charged but not used yet
 //! counts in the peak: up to 252 KB per CPU that charges anything at all. So the workers, on stacks in
-//! that mapping, never fault and never use the heap.
+//! that static, never fault and never use the heap.
 
 #![no_main]
 
@@ -23,15 +23,15 @@ use std::arch::{asm, x86_64::*};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
 use std::{collections::BTreeSet, fs::File, os::unix::fs::FileExt};
-use std::{ptr::null_mut, sync::Mutex, thread};
+use std::{mem::offset_of, ptr::null_mut, sync::Mutex, thread};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
 // Declared by hand to keep the crate at zero dependencies; std already links glibc. A `pthread_attr_t`
 // is 56 bytes, so the word array holds it.
 unsafe extern "C" {
-    fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
+    fn _exit(status: i32) -> !;
     fn pthread_attr_init(attr: *mut [u64; 8]) -> i32;
     fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
     fn pthread_create(id: *mut u64, attr: *const [u64; 8], start: Start, arg: *mut u8) -> i32;
@@ -140,6 +140,8 @@ const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 const SPARE: usize = 256;
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
 const STACK: usize = 68 << 10;
+/// Threads the stacks are enough for, which is more than the box has, and more than any test asks for.
+const THREADS: usize = 64;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
 /// Names longer than this get no slot. No generated name has been seen beyond 25 bytes.
@@ -158,167 +160,145 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 /// encode the value one to one. The slots are insert-only: a key's words go from zero to their final
 /// value once, and a key has no zero bytes, so a slot that compares equal is complete. A name that
 /// gets no slot goes to a locked set instead. A full window stays full, so it never gets one later.
-struct NameTable<'a> {
-    records: &'a File,
-    words: &'static [AtomicU64],
-    tags: &'static [AtomicU8],
-    regions: &'static [AtomicU8], // The join table, country indices by region id.
-    stacks: usize,                // Where the first worker's stack starts.
-    index_of: Vec<AtomicU8>,      // Country indices by code, which takes every one in `[A-Z]{3}`.
-    keys: Mutex<Vec<[u8; 3]>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
-    spill: Mutex<BTreeSet<(Vec<u8>, u8)>>, // Names with no slot, each with a country it has seen.
+///
+/// All of it is zeros in the program's image until it's touched, and the alignment gives it huge pages.
+#[repr(C, align(2097152))]
+struct Memory {
+    words: [AtomicU64; (HOMES + SPARE) * SLOT_WORDS],
+    tags: [AtomicU8; HOMES + SPARE],
+    regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
+    index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
+    stacks: [[AtomicU64; STACK / 8]; THREADS],
+}
+// SAFETY: zero is a valid value of each atomic.
+static MEMORY: Memory = unsafe { std::mem::zeroed() };
+/// What the threads change under a lock, neither of it often. First the country codes: index 0 is
+/// `_UNMATCHED`, and codes take the next as they appear, in room that `aggregate` makes. Then the names
+/// with no slot, each with a country it has seen.
+static LOCKED: Mutex<(Vec<[u8; 3]>, BTreeSet<(Vec<u8>, u8)>)> =
+    Mutex::new((Vec::new(), BTreeSet::new()));
+
+/// Fills the join table from `len` bytes of whole region lines. Ids have at most 8 digits (spec
+/// section 2.3): digits have bit 4 set, and commas don't, so the first clear bit marks the end.
+fn parse_regions(text: &[u8], len: usize) {
+    let mut pos = 0;
+    while pos < len {
+        // SAFETY: `pos` is inside the text, and the padding covers the load.
+        let word = unsafe { load_u64(text, pos) };
+        let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
+        let (id, _) = parse_three([word << (64 - bits), 0, 0]);
+        pos += bits as usize / 8 + 1;
+        let code = (0..3).fold(0, |code, i| code * 26 + usize::from(text[pos + i] - b'A'));
+        let index = &MEMORY.index_of[code];
+        if index.load(Relaxed) == 0 {
+            let keys = &mut LOCKED.lock().unwrap().0;
+            if index.load(Relaxed) == 0 {
+                keys.push([text[pos], text[pos + 1], text[pos + 2]]);
+                index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
+            }
+        }
+        MEMORY.regions[id as u32 as usize].store(index.load(Relaxed), Relaxed);
+        pos += 4; // The three letters and the LF.
+    }
 }
 
-impl<'a> NameTable<'a> {
-    fn new(records: &'a File, threads: usize) -> Self {
-        let tags = HOMES + SPARE;
-        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
-        let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
-        let bytes = stacks_at + (threads - 1) * STACK;
-        let (read_write, private_anon, huge) = (3, 0x22, 1 << 21);
-        // SAFETY: the mapping is fresh, zeroed, never unmapped and big enough for an aligned `bytes`,
-        // so the parts don't overlap, and zero is a valid value of each atomic.
-        unsafe {
-            let at = mmap(null_mut(), bytes + huge, read_write, private_anon, -1, 0);
-            assert!(at as isize != -1);
-            let base = at.add(at.align_offset(huge));
-            // No huge page past the last whole one: whether one fits there depends on the address.
-            madvise(base.add(bytes / huge * huge), huge, 15);
-            madvise(base, bytes, 23);
-            NameTable {
-                records,
-                words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),
-                tags: std::slice::from_raw_parts(base.add(tags_at).cast(), tags),
-                regions: std::slice::from_raw_parts(base.add(regions_at).cast(), REGION_IDS),
-                stacks: base.add(stacks_at) as usize,
-                index_of: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
-                keys: Mutex::new(Vec::with_capacity(256)),
-                spill: Mutex::new(BTreeSet::new()),
+/// A hash of the name's length and first 8 bytes, with whatever follows it masked off: the pool's
+/// names rarely share them. BZHI reads only the low 8 bits of its count, so a name of 32 bytes or
+/// more can keep extra bytes. That's still the same word for the same name, and the key decides
+/// anyway. A test build swaps this for a constant, so that every key collides and any logic that
+/// trusts a hash without comparing the key shows up as a wrong answer.
+fn hash(text: &[u8], start: usize, len: usize) -> u32 {
+    // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
+    // CRC32 in SSE4.2, and x86-64-v3 includes both.
+    let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
+    let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
+    if cfg!(sd_const_hash) { 0 } else { crc }
+}
+
+fn home(hash: u32) -> usize {
+    (u64::from(hash) * HOMES as u64 >> 32) as usize
+}
+
+/// One bit per slot of a window of tags, set where the tag is `tag`.
+fn slots_with(tags: __m256i, tag: u8) -> u32 {
+    // SAFETY: x86-64-v3 has AVX2.
+    unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, _mm256_set1_epi8(tag as i8))) as u32 }
+}
+
+/// The tags of the 32 slots from `home`.
+fn window(home: usize) -> __m256i {
+    // SAFETY: `home` stays 32 below the end of the tags.
+    // x86-64-v3 has AVX2.
+    unsafe { _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast()) }
+}
+
+/// The key of a name of at most `INLINE_BYTES`.
+fn key(text: &[u8], start: usize, len: usize) -> __m256i {
+    // SAFETY: the name starts inside the text and the padding covers the load. Its length keeps
+    // the other load inside the table. x86-64-v3 has AVX2.
+    unsafe {
+        let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
+        let pad = at(PADS.0.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
+        _mm256_or_si256(at(text.as_ptr().add(start)), pad)
+    }
+}
+
+/// Whether the slot at this offset in bytes holds the name, of at most `INLINE_BYTES`. A slot whose
+/// writer hasn't finished with it doesn't.
+///
+/// # Safety
+/// `at` must be where a slot's words start.
+unsafe fn holds(at: usize, text: &[u8], start: usize, len: usize) -> bool {
+    // SAFETY: the slot is inside the table. x86-64-v3 has AVX2.
+    unsafe {
+        let key = key(text, start, len);
+        let stored = MEMORY.words.as_ptr().byte_add(at);
+        let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));
+        _mm256_testz_si256(differ, differ) == 1
+    }
+}
+
+/// Finds the name's slot, or takes a free one for it, and returns its offset in bytes. Only a wrong
+/// guess or a new name comes here. A long name, or one that finds every window from its home to the
+/// end of the table full, gets no slot.
+#[cold]
+fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
+    let hash = hash(text, start, len);
+    let (mut home, tag) = (home(hash), (hash as u8).max(1));
+    while len <= INLINE_BYTES && home <= HOMES + SPARE - 32 {
+        // One load answers both questions below, so a name can't get two slots. Each byte only
+        // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
+        // two threads insert one name, whichever saw the other's slot as taken saw its tag too,
+        // and if neither did, they both want the same byte and one loses the exchange.
+        let window = window(home);
+        let mut hits = slots_with(window, tag);
+        while hits != 0 {
+            let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
+            while MEMORY.words[base + 3].load(Acquire) == 0 {}
+            // SAFETY: `base` is where a slot's words start.
+            if unsafe { holds(base * 8, text, start, len) } {
+                return Some(base * 8);
             }
+            hits &= hits - 1;
+        }
+        let free = slots_with(window, 0);
+        if free == 0 {
+            home += 32; // Past this window.
+            continue;
+        }
+        // Losing this race just means another look at the same window.
+        let at = home + free.trailing_zeros() as usize;
+        let slot = &MEMORY.tags[at];
+        if slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
+            // SAFETY: both are 32 bytes. x86-64-v3 has AVX2.
+            let key: [u64; 4] = unsafe { std::mem::transmute(key(text, start, len)) };
+            let stored = &MEMORY.words[at * SLOT_WORDS..][..4];
+            (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
+            stored[3].store(key[3], Release);
+            return Some(at * SLOT_WORDS * 8);
         }
     }
-
-    /// Fills the join table from `len` bytes of whole region lines. Ids have at most 8 digits (spec
-    /// section 2.3): digits have bit 4 set, and commas don't, so the first clear bit marks the end.
-    fn parse_regions(&self, text: &[u8], len: usize) {
-        let mut pos = 0;
-        while pos < len {
-            // SAFETY: `pos` is inside the text, and the padding covers the load.
-            let word = unsafe { load_u64(text, pos) };
-            let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
-            let (id, _) = parse_three([word << (64 - bits), 0, 0]);
-            pos += bits as usize / 8 + 1;
-            let code = (0..3).fold(0, |code, i| code * 26 + usize::from(text[pos + i] - b'A'));
-            let index = &self.index_of[code];
-            if index.load(Relaxed) == 0 {
-                let mut keys = self.keys.lock().unwrap();
-                if index.load(Relaxed) == 0 {
-                    keys.push([text[pos], text[pos + 1], text[pos + 2]]);
-                    index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
-                }
-            }
-            self.regions[id as u32 as usize].store(index.load(Relaxed), Relaxed);
-            pos += 4; // The three letters and the LF.
-        }
-    }
-
-    /// A hash of the name's length and first 8 bytes, with whatever follows it masked off: the pool's
-    /// names rarely share them. BZHI reads only the low 8 bits of its count, so a name of 32 bytes or
-    /// more can keep extra bytes. That's still the same word for the same name, and the key decides
-    /// anyway. A test build swaps this for a constant, so that every key collides and any logic that
-    /// trusts a hash without comparing the key shows up as a wrong answer.
-    fn hash(text: &[u8], start: usize, len: usize) -> u32 {
-        // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
-        // CRC32 in SSE4.2, and x86-64-v3 includes both.
-        let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
-        let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
-        if cfg!(sd_const_hash) { 0 } else { crc }
-    }
-
-    fn home(hash: u32) -> usize {
-        (u64::from(hash) * HOMES as u64 >> 32) as usize
-    }
-
-    /// One bit per slot of a window of tags, set where the tag is `tag`.
-    fn slots_with(tags: __m256i, tag: u8) -> u32 {
-        // SAFETY: x86-64-v3 has AVX2.
-        unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, _mm256_set1_epi8(tag as i8))) as u32 }
-    }
-
-    /// The tags of the 32 slots from `home`.
-    fn window(&self, home: usize) -> __m256i {
-        // SAFETY: `home` stays 32 below the end of the tags.
-        // x86-64-v3 has AVX2.
-        unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(home).cast()) }
-    }
-
-    /// The key of a name of at most `INLINE_BYTES`.
-    fn key(text: &[u8], start: usize, len: usize) -> __m256i {
-        // SAFETY: the name starts inside the text and the padding covers the load. Its length keeps
-        // the other load inside the table. x86-64-v3 has AVX2.
-        unsafe {
-            let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
-            let pad = at(PADS.0.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
-            _mm256_or_si256(at(text.as_ptr().add(start)), pad)
-        }
-    }
-
-    /// Whether this slot holds the name, of at most `INLINE_BYTES`. A slot whose writer hasn't finished
-    /// with it doesn't.
-    ///
-    /// # Safety
-    /// `stored` must be where a slot's words start.
-    unsafe fn holds(stored: *const AtomicU64, text: &[u8], start: usize, len: usize) -> bool {
-        // SAFETY: the slot is inside the table. x86-64-v3 has AVX2.
-        unsafe {
-            let key = Self::key(text, start, len);
-            let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));
-            _mm256_testz_si256(differ, differ) == 1
-        }
-    }
-
-    /// Finds the name's slot, or takes a free one for it, and returns its offset in bytes. Only a wrong
-    /// guess or a new name comes here. A long name, or one that finds every window from its home to the
-    /// end of the table full, gets no slot.
-    #[cold]
-    fn find(&self, text: &[u8], start: usize, len: usize) -> Option<usize> {
-        let hash = Self::hash(text, start, len);
-        let (mut home, tag) = (Self::home(hash), (hash as u8).max(1));
-        while len <= INLINE_BYTES && home <= HOMES + SPARE - 32 {
-            // One load answers both questions below, so a name can't get two slots. Each byte only
-            // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
-            // two threads insert one name, whichever saw the other's slot as taken saw its tag too,
-            // and if neither did, they both want the same byte and one loses the exchange.
-            let window = self.window(home);
-            let mut hits = Self::slots_with(window, tag);
-            while hits != 0 {
-                let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
-                while self.words[base + 3].load(Acquire) == 0 {}
-                // SAFETY: `base` is where a slot's words start.
-                if unsafe { Self::holds(self.words[base..].as_ptr(), text, start, len) } {
-                    return Some(base * 8);
-                }
-                hits &= hits - 1;
-            }
-            let free = Self::slots_with(window, 0);
-            if free == 0 {
-                home += 32; // Past this window.
-                continue;
-            }
-            // Losing this race just means another look at the same window.
-            let at = home + free.trailing_zeros() as usize;
-            let slot = &self.tags[at];
-            if slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
-                // SAFETY: both are 32 bytes. x86-64-v3 has AVX2.
-                let key: [u64; 4] = unsafe { std::mem::transmute(Self::key(text, start, len)) };
-                let stored = &self.words[at * SLOT_WORDS..][..4];
-                (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
-                stored[3].store(key[3], Release);
-                return Some(at * SLOT_WORDS * 8);
-            }
-        }
-        None
-    }
+    None
 }
 
 /// A country's totals, one cache line: its count; lowest amount; id sum; highest amount; amount sum;
@@ -407,14 +387,14 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
 }
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
+fn parse_records(file: &File, mut pos: usize, end: usize, rows: &mut Rows, room: &mut [u8]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
     let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
-        let text = read(names.records, pos, len, room);
+        let text = read(file, pos, len, room);
         // A piece starts at a record's start, so outside quotes.
         let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
         listed[0] = 0;
@@ -428,7 +408,7 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
                 count += 1;
             }
             let records = (count - 1) / 5;
-            add_records(text, &listed[..=records * 5], &mut found, names, rows);
+            add_records(text, &listed[..=records * 5], &mut found, rows);
             // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
             // copy moves them, where a call to copy just the right number would cost more.
             listed.copy_within(records * 5..records * 5 + 8, 0);
@@ -443,14 +423,14 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
 
 /// Adds up a chunk of whole records from `text`, given where they start and the positions just past
 /// each one's five separators.
-fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable, rows: &mut Rows) {
+fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) {
     let records = listed.len() / 5;
     let positions = |record: usize| {
         // SAFETY: the caller passes `records * 5 + 1` positions.
         let six = unsafe { listed.as_ptr().add(record * 5).cast::<[u32; 6]>() };
         unsafe { six.read_unaligned() }.map(|position| position as usize)
     };
-    let (words, regions) = (names.words.as_ptr(), names.regions.as_ptr());
+    let (words, regions) = (MEMORY.words.as_ptr(), MEMORY.regions.as_ptr());
     for record in 0..records {
         let [mut start, name_at, note_at, region_at, amount_at, _] = positions(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
@@ -472,14 +452,14 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
-            let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
+            let hash = hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong
             // guess costs a search. A name's tag is the low byte of its hash, or 1 for zero, which
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
             // name in 256 less than a check.
-            let home = NameTable::home(hash);
-            let hits = NameTable::slots_with(names.window(home), hash as u8);
+            let home = home(hash);
+            let hits = slots_with(window(home), hash as u8);
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
@@ -521,15 +501,13 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // SAFETY: `guess` came from the first pass, and `find` returns a slot too. The name starts
         // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.
         unsafe {
-            let at = if len <= INLINE_BYTES
-                && NameTable::holds(words.byte_add(guess as usize), text, start, len)
-            {
+            let at = if len <= INLINE_BYTES && holds(guess as usize, text, start, len) {
                 guess as usize
-            } else if let Some(at) = names.find(text, start, name.saturating_sub(2)) {
+            } else if let Some(at) = find(text, start, name.saturating_sub(2)) {
                 at
             } else {
                 let name = text[start..start + name.saturating_sub(2)].to_vec();
-                row[6] += i64::from(!names.spill.lock().unwrap().insert((name, country)));
+                row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country)));
                 continue;
             };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
@@ -554,14 +532,14 @@ unsafe extern "C" fn start<F: Fn()>(work: *mut u8) -> *mut u8 {
 }
 
 /// Calls `work` on `threads` threads, this one and others on the given stacks.
-fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: usize) {
+fn run_threads<F: Fn() + Sync>(work: &F, threads: usize) {
     let mut ids = vec![0u64; threads - 1];
-    // SAFETY: each thread has its own stack, inside the mapping, and is joined before `work` ends.
+    // SAFETY: each thread has its own stack, inside `MEMORY`, and is joined before `work` ends.
     unsafe {
         let mut attr = [0u64; 8];
         for (at, id) in ids.iter_mut().enumerate() {
             pthread_attr_init(&mut attr);
-            pthread_attr_setstack(&mut attr, (stacks + at * STACK) as *mut u8, STACK);
+            pthread_attr_setstack(&mut attr, MEMORY.stacks[at].as_ptr() as *mut u8, STACK);
             let arg = std::ptr::from_ref(work).cast_mut().cast();
             assert!(pthread_create(id, &attr, start::<F>, arg) == 0);
         }
@@ -572,12 +550,20 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: usize) {
     }
 }
 
-/// Parses the whole file on `threads` threads and merges their rows. Returns every country's code, in
-/// index order from 1, and every index's row, index 0 being `_UNMATCHED`.
+/// Parses the whole file on `threads` threads and merges their rows. Returns every index's row, index 0
+/// being `_UNMATCHED`.
 /// The threads share the regions too, and all of those are done before any record is parsed. Tying
 /// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-fn aggregate(records: &File, lookup: &File, threads: usize) -> (Vec<[u8; 3]>, Rows) {
-    let names = NameTable::new(records, threads);
+fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
+    let (base, huge) = (MEMORY.words.as_ptr() as *mut u8, 1 << 21);
+    let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
+    // SAFETY: both are only advice about pages of `MEMORY`, and a range past its end has no effect.
+    unsafe {
+        // No huge page past the last whole one: a fault there would charge all of it.
+        madvise(base.add(bytes / huge * huge), huge, 15);
+        madvise(base, bytes, 23);
+    }
+    LOCKED.lock().unwrap().0.reserve(256);
     let record_bytes = records.metadata().unwrap().len() as usize;
     let lookup_bytes = lookup.metadata().unwrap().len() as usize;
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
@@ -586,7 +572,7 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> (Vec<[u8; 3]>, Ro
         let mut room = [0u8; PIECE + PADDING + 64];
         while let Some(at) = next_job(&lines, line_parts) {
             let (pos, end) = part(lookup, lookup_bytes, line_parts, at, b"\n");
-            names.parse_regions(read(lookup, pos, end - pos, &mut room), end - pos);
+            parse_regions(read(lookup, pos, end - pos, &mut room), end - pos);
             parsed.fetch_add(1, Release);
         }
         // Not a barrier: nobody should wait for a thread that hasn't started, or be woken up.
@@ -596,7 +582,7 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> (Vec<[u8; 3]>, Ro
         let mut rows = [EMPTY_ROW; 256];
         while let Some(at) = next_job(&segments, threads * SEGMENTS) {
             let (pos, end) = part(records, record_bytes, threads * SEGMENTS, at, b"\r\n");
-            parse_records(pos, end, &names, &mut rows, &mut room);
+            parse_records(records, pos, end, &mut rows, &mut room);
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             for i in [0, 2, 4, 5, 6, 7] {
@@ -605,9 +591,8 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> (Vec<[u8; 3]>, Ro
             (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
         }
     };
-    run_threads(&work, threads, names.stacks);
-    let keys = names.keys.into_inner().unwrap();
-    (keys, totals.into_inner().unwrap())
+    run_threads(&work, threads);
+    totals.into_inner().unwrap()
 }
 
 /// C's entry point, not std's: std's would read `/proc/self/maps` and install handlers first, none of
@@ -622,7 +607,8 @@ extern "C" fn main() -> i32 {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
     let open = |name| File::open(format!("{data_dir}/{name}.csv")).unwrap();
-    let (codes, totals) = aggregate(&open("records"), &open("regions"), threads);
+    let totals = aggregate(&open("records"), &open("regions"), threads);
+    let codes = &LOCKED.lock().unwrap().0;
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
@@ -642,5 +628,8 @@ extern "C" fn main() -> i32 {
         writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7]).unwrap();
     }
     out.flush().unwrap();
-    0
+    // Not a return. The handlers that `exit` runs write a byte at the start of the zeroed part of the
+    // image, which is a whole 2 MiB extent with the alignment of `MEMORY`, so a huge page of its own.
+    // SAFETY: the output is flushed, and nothing else needs cleaning up.
+    unsafe { _exit(0) }
 }

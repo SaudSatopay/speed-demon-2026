@@ -126,6 +126,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | run-ee0a2bfc62e2 | 0.0230 | 10.2 | 80.9 |
 | 91 | Chosen source restored | neither idea beat it over three samples | run-a80a4965a4fa | 0.0203 | 10.4 | 82.1 |
 | 92 | Twenty line cuts on cold paths: the input files as plain functions, main does its own work, one job claim call, one miss chain, one BOM line | S 446 to 426 is worth about 0.7 percent of K, and instructions fall 302.5 to 300.7 per record, so nothing hot pays for it | pending | — | — | — |
+| 93 | All memory is one zeroed 2 MiB aligned static in the image: no mmap, no NameTable struct, table functions are free functions, and the run ends in _exit | S 426 to 407 is worth about 0.7 percent of K. Local: instructions 300.7 to 289.7 per record in the counting build, paired T -2.5 percent, M flat at 9.70 | pending | — | — | — |
 
 ## Decision log
 
@@ -313,6 +314,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D91.** Rejected: T0 median K 43.73 (41.66, 43.96, 43.73). Rejected: homes on multiples of 32, median K 43.18 (43.18, 43.28, 41.48). The chosen source stands at median K 44.02.
 
 **D92.** Pending: kept only if its median K over 3 runs beats the chosen source
+
+**D93.** Pending: kept only if its median K over 3 runs beats the chosen source
 
 ## What didn't work
 

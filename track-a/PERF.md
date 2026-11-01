@@ -71,6 +71,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 49 | exp: the round run twice | Where the time goes on the box | pending | — | — | — |
 | 50 | Back to the build before the measurements | The phase measurements are done | pending | — | — | — |
 | 51 | exp: eight threads finish hours instead of four | Finishing takes about 8.5 ms on the box, 26 cycles per record, and no cheaper scatter was found | pending | — | — | — |
+| 52 | Back to four finishers | Eight read T 0.0197 and M 17.5, against T 0.0191 and M 16.2 with four | pending | — | — | — |
 
 ## Decision log
 
@@ -172,6 +173,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D43. Revert the experiments.
 
 **D44. Experiment, against T 0.0191. More finishers should cut how long finishing lags behind reading, at about 0.8 MB of M. Local timing can't judge this.
+
+**D45. Decided by the board. More finishers took cores from the readers and held more memory.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

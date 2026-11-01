@@ -37,6 +37,10 @@ const BIG_BLOCK: usize = 32;
 /// Bytes per read: few enough to stay in the caches, enough that a read costs little per line.
 const PIECE: usize = 1 << 15;
 
+/// Spare bytes after a piece in its buffer, so that a load that starts at a short fixed distance from a
+/// line needs no check of its own.
+const PADDING: usize = 192;
+
 /// A method's length, as the nibble selected by the low nibble of its 4th byte, which tells the seven
 /// apart: GET and PUT have a space there (0), POST and HEAD have T and D (4), PATCH has C (3), DELETE
 /// has E (5), and OPTIONS has I (9).
@@ -71,7 +75,7 @@ unsafe extern "C" {
 /// registers for a block of 64.
 ///
 /// # Safety
-/// `pos + size_of::<T>()` must be at most 192 past `text.len()`, and those bytes must be readable.
+/// `pos + size_of::<T>()` must be at most `text.len() + PADDING`, and those bytes must be readable.
 unsafe fn load<T: Copy>(text: &[u8], pos: usize) -> T {
     // SAFETY: the caller keeps the load inside the buffer, and the load needs no alignment.
     unsafe { text.as_ptr().add(pos).cast::<T>().read_unaligned() }
@@ -194,9 +198,7 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
 /// timestamp is always 27 bytes. A thread keeps its own unfilled blocks of each hour, so the hot path
 /// reads and writes no line that other threads write, and allocates nothing.
 fn parse(log: &File, table: &Table, hours: &[Hour], mut go: impl FnMut() -> Option<[usize; 2]>) {
-    // With 192 spare bytes after a piece, so that a load that starts at a short fixed distance from a
-    // line needs no check of its own.
-    let mut room = [0u8; PIECE + 192];
+    let mut room = [0u8; PIECE + PADDING];
     let mut blocks = [std::ptr::null::<AtomicU32>(); HOURS];
     // The last line's hour: its index and its place in a block, and in a segment, its bytes. An aligned
     // place means the block is used up, and hours change only between chunks of the log.
@@ -332,24 +334,23 @@ fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl F
 }
 
 /// Appends one hour's output lines, given its records sorted by endpoint and then latency, where each
-/// id's group ends and, from `IDS` on, where its big latencies start among them all, sorted by id and
-/// then latency, and the endpoints and ids in order.
-fn format_hour(h: usize, recs: &[u32], at: &[u32], big: &[u64], order: Order, out: &mut Vec<u8>) {
+/// id's group ends, its big latencies sorted by id and then latency, and the endpoints and ids in order.
+fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: Order, out: &mut Vec<u8>) {
     let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24);
     // Each group starts where the one before it ends, and id 0's holds the unused ends of blocks.
-    let mut start = at[0] as usize;
+    let mut start = ends[0] as usize;
     for (key, &id) in order.0.iter().zip(order.1).skip(1) {
-        let group = &recs[replace(&mut start, at[id] as usize)..at[id] as usize];
+        let group = &recs[replace(&mut start, ends[id] as usize)..ends[id] as usize];
         let Some(_) = group.first() else { continue };
         let n = group.len();
         let latency = |record: u32| (record >> 1) & BIG_LATENCY;
         let (count, errors): (u64, u64) = (n as u64, group.iter().map(|r| u64::from(r & 1)).sum());
-        // The group's big latencies are its last records, and the id's entries in `big`.
-        let big_count = (at[IDS + id + 1] - at[IDS + id]) as usize;
+        let is_big = |&&r: &&u32| latency(r) == BIG_LATENCY;
+        let big_count = group.iter().rev().take_while(is_big).count();
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
             match index.checked_sub(n - big_count) {
-                Some(i) => big[at[IDS + id] as usize + i] & 0xFFFF_FFFF,
+                Some(i) => big[big.partition_point(|e| e >> 32 < id as u64) + i] & 0xFFFF_FFFF,
                 None => u64::from(latency(group[index])),
             }
         };
@@ -407,35 +408,30 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
         // Three stable passes sort by latency first and endpoint last, through one word of scratch per
         // record.
         tmp.resize(recs.len(), 0);
-        // Counts per digit of the three passes, with room after the ids' for the big latencies.
-        let (mut low, mut high, mut at) = ([0u32; 1024], [0u32; 1024], [0u32; 2 * IDS]);
+        let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
         for &record in recs.iter() {
             low[(record >> 1 & 511) as usize] += 1;
             high[(record >> 10 & 1023) as usize] += 1;
-            at[(record >> ID_SHIFT) as usize] += 1;
+            groups[(record >> ID_SHIFT) as usize] += 1;
         }
         // An endpoint that's new since the order was made means a new order.
         let mut now = order.lock().unwrap();
-        if now.1.iter().map(|&id| at[id] as usize).sum::<usize>() != recs.len() {
+        if now.1.iter().map(|&id| groups[id] as usize).sum::<usize>() != recs.len() {
             *now = Arc::new(order_ids(&table));
         }
         let order = now.clone();
         drop(now);
         pass(recs, tmp, &mut low, &all, |r| (r >> 1 & 511) as usize);
         pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
-        pass(recs, tmp, &mut at, &order.1, |r| r as usize >> ID_SHIFT);
+        pass(recs, tmp, &mut groups, &order.1, |r| r as usize >> ID_SHIFT);
         // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
         // ones are zero, which sorts before id 1.
         let big = unsafe { from_raw_parts_mut(big.as_mut_ptr().cast::<u64>(), big.len() / 2) };
         big.sort_unstable();
-        // Where each id's big latencies start in `big`: how many the ids before it have, counting the
-        // unused zeros as id 0's. A search per endpoint cost more than the rest of its line.
-        big.iter().for_each(|e| at[IDS + (e >> 32) as usize] += 1);
-        at[IDS..].iter_mut().fold(0, |t, g| t + replace(g, t));
         // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
         // this vector never reallocates, and it's leaked rather than dropped.
         let mut text = unsafe { Vec::from_raw_parts(recs.as_mut_ptr().cast(), 0, array.len() * 4) };
-        format_hour(hour, tmp, &at, big, (&order.0, &order.1), &mut text);
+        format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
         ready.store(text.leak().len() + 1, Release);
     };
     // Appends the ready hours, in order, and frees them: `put` counts the hours out. A thread that
@@ -456,7 +452,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
     // The first few threads also finish hours: enough to keep up with the rest, and few, since each
     // one's scratch stays as large as the largest hour it has seen.
     let work = &|me: usize| {
-        let mut scratch = Vec::with_capacity(usize::from(me < 8) << 18);
+        let mut scratch = Vec::with_capacity(usize::from(me < 4) << 18);
         let go = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
             let head = cursor.load(Relaxed);
@@ -470,7 +466,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
             // sit out its whole turn off the core, and that happens all the time, so a wait here turned
             // a busy box into a 4 times slower run. Its records pile up meanwhile, which costs memory
             // only while the box is busy.
-            if me < 8 && seen.is_some_and(due) {
+            if me < 4 && seen.is_some_and(due) {
                 state.0 += 1;
                 drop(state);
                 // While it writes, this thread holds no hour back.
@@ -481,7 +477,7 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
             }
             let start = cursor.fetch_add(size, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
-            if start < end || head >= end && (me >= 8 || hour >= HOURS) {
+            if start < end || head >= end && (me >= 4 || hour >= HOURS) {
                 return (start < end).then_some([start, (start + size).min(end)]);
             }
             // The wait gives up its core, and the lock first: a spinning thread would keep the one

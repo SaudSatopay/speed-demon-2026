@@ -260,19 +260,6 @@ impl<'a> NameTable<'a> {
         unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(home).cast()) }
     }
 
-    /// Guesses the name's slot from the tags, and asks to own its line, for a write: a locked update
-    /// then needs no second trip to take it from the core that wrote it last. A wrong guess costs a
-    /// search. A name's tag is the low byte of its hash, or 1 for zero, which means free; here a zero
-    /// finds a free slot, which is a wrong guess too, and costs one name in 256 less than a check.
-    /// It returns the slot's offset in bytes.
-    fn guess_slot(&self, home: usize, tag: u8) -> u32 {
-        let hits = Self::slots_with(self.window(home), tag);
-        let at = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
-        // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
-        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().byte_add(at).cast()) };
-        at as u32
-    }
-
     /// The key of a name of at most `INLINE_BYTES`.
     fn key(text: &[u8], start: usize, len: usize) -> __m256i {
         // SAFETY: the name starts inside the text and the padding covers the load. Its length keeps
@@ -404,13 +391,10 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             // that position, and PEXT gathers it for those bits, into a byte. Those bytes are a bit
             // matrix with a row per bit of a position, and GFNI's multiply, given the columns one at
             // a time, turns it around into a byte per position.
-            let matrix = planes
-                .iter()
-                .fold(0, |matrix, &plane| matrix << 8 | _pext_u64(plane, left));
+            let matrix = planes.iter().fold(0, |m, &p| m << 8 | _pext_u64(p, left));
             let columns = _mm_cvtsi64_si128(0x8040_2010_0804_0201u64 as i64);
-            let packed =
-                _mm_gf2p8affine_epi64_epi8::<0>(columns, _mm_cvtsi64_si128((matrix << 16) as i64));
-            let bytes = _mm256_cvtepu8_epi32(packed);
+            let rows = _mm_cvtsi64_si128((matrix << 16) as i64);
+            let bytes = _mm256_cvtepu8_epi32(_mm_gf2p8affine_epi64_epi8::<0>(columns, rows));
             _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
             let total = left.count_ones() as usize;
             if total > 8 {
@@ -499,9 +483,17 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let negative = -i32::from((word as u8) < b'0');
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
             let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
-            let guess = names.guess_slot(NameTable::home(hash), hash as u8);
+            // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
+            // update then needs no second trip to take it from the core that wrote it last. A wrong
+            // guess costs a search. A name's tag is the low byte of its hash, or 1 for zero, which
+            // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
+            // name in 256 less than a check.
+            let home = NameTable::home(hash);
+            let hits = NameTable::slots_with(names.window(home), hash as u8);
+            let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
+            _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
-            *found.get_unchecked_mut(record) = (guess, cents as u32, id_region);
+            *found.get_unchecked_mut(record) = (guess as u32, cents as u32, id_region);
         }
     }
     for record in 0..records {

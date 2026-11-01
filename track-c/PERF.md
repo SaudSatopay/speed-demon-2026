@@ -100,6 +100,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 78 | exp: the main thread is no longer pinned while it touches the mapping | Eight lines for a guard against a move in the first millisecond; if the main thread rarely moves, M stays and S falls | pending | — | — | — |
 | 79 | Best source again, c-v91, as a second sample | Every build since has T near 0.0206 against its one sample of 0.0200, so this shows whether that was luck or the box drifting | pending | — | — | — |
 | 80 | exp: the locked set, no pin, and two line trims with the BOM branch kept | c-v91 re-sampled at T 0.0204 M 11.04, so T moves 2% and M 6% on one source, and the removals look neutral; this is a second sample of them | pending | — | — | — |
+| 81 | The slot guess written in the record loop, and three statements on fewer lines | Seven fewer lines with the same instructions per record locally, and a third sample of the locked set with no pin | pending | — | — | — |
 
 ## Decision log
 
@@ -263,6 +264,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D79.** pending the board
 
 **D80.** pending the board
+
+**D81.** pending the board
 
 ## What didn't work
 

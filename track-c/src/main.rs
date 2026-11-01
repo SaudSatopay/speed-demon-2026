@@ -20,7 +20,7 @@
 #![no_main]
 
 use std::arch::{asm, x86_64::*};
-use std::io::{self, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
 use std::{collections::BTreeSet, fs::File, os::unix::fs::FileExt};
 use std::{ptr::null_mut, sync::Mutex, thread};
@@ -43,45 +43,39 @@ const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
 const PIECE: usize = 1 << 15;
 
-/// An input file, read in parts: its size, and the file.
-struct Input(usize, File);
-
-impl Input {
-    /// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
-    /// file. In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2),
-    /// so it's never inside quotes, and about half the records end in one, so it's never far. A file
-    /// without one simply doesn't get split.
-    fn boundary(&self, mut pos: usize, terminator: &[u8]) -> usize {
-        let mut bytes = [0; 512];
-        while let read @ 1.. = self.1.read_at(&mut bytes, pos as u64).unwrap() {
-            if let Some(at) = bytes[..read].iter().position(|&c| c == terminator[0]) {
-                return pos + at + terminator.len();
-            }
-            pos += read;
+/// The first line boundary at or after `pos`: just past the next `terminator`, or the end of the
+/// file. In the records, a CR can only be the first byte of a CRLF terminator (spec section 2.2),
+/// so it's never inside quotes, and about half the records end in one, so it's never far. A file
+/// without one simply doesn't get split.
+fn boundary(file: &File, mut pos: usize, terminator: &[u8]) -> usize {
+    let mut bytes = [0; 512];
+    while let read @ 1.. = file.read_at(&mut bytes, pos as u64).unwrap() {
+        if let Some(at) = bytes[..read].iter().position(|&c| c == terminator[0]) {
+            return pos + at + terminator.len();
         }
-        pos
+        pos += read;
     }
+    pos
+}
 
-    /// Where part `at` of `parts` starts and ends. The first boundary in a file ends its header.
-    fn part(&self, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
-        let size = self.0.div_ceil(parts).max(1);
-        let cut = |at: usize| self.boundary((at * size).min(self.0), terminator);
-        (cut(at), cut(at + 1))
-    }
+/// Where part `at` of `parts` of a file of `bytes` starts and ends. The first boundary in a file ends
+/// its header.
+fn part(file: &File, bytes: usize, parts: usize, at: usize, terminator: &[u8]) -> (usize, usize) {
+    let size = bytes.div_ceil(parts).max(1);
+    let cut = |at: usize| boundary(file, (at * size).min(bytes), terminator);
+    (cut(at), cut(at + 1))
+}
 
-    /// Reads `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
-    /// (no generated record comes near that), with `PADDING` zeros after them.
-    fn read<'a>(&self, at: usize, len: usize, room: &'a mut [u8]) -> &'a [u8] {
-        // The kernel's copy runs fastest when source and destination agree within a cache line.
-        let skew = at.wrapping_sub(room.as_ptr() as usize) % 64;
-        let text = match room.get_mut(skew..skew + len + PADDING) {
-            Some(room) => room,
-            None => Vec::leak(vec![0; len + PADDING]),
-        };
-        self.1.read_exact_at(&mut text[..len], at as u64).unwrap();
-        text[len..].fill(0);
-        text
-    }
+/// Reads `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
+/// (no generated record comes near that), with `PADDING` zeros after them.
+fn read<'a>(file: &File, at: usize, len: usize, room: &'a mut [u8]) -> &'a [u8] {
+    // The kernel's copy runs fastest when source and destination agree within a cache line.
+    let skew = at.wrapping_sub(room.as_ptr() as usize) % 64;
+    let fits = room.get_mut(skew..skew + len + PADDING);
+    let text = fits.unwrap_or_else(|| Vec::leak(vec![0; len + PADDING]));
+    file.read_exact_at(&mut text[..len], at as u64).unwrap();
+    text[len..].fill(0);
+    text
 }
 
 /// Loads 8 bytes, little-endian, which may run into the padding.
@@ -165,7 +159,7 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 /// value once, and a key has no zero bytes, so a slot that compares equal is complete. A name that
 /// gets no slot goes to a locked set instead. A full window stays full, so it never gets one later.
 struct NameTable<'a> {
-    records: &'a Input,
+    records: &'a File,
     words: &'static [AtomicU64],
     tags: &'static [AtomicU8],
     regions: &'static [AtomicU8], // The join table, country indices by region id.
@@ -176,7 +170,7 @@ struct NameTable<'a> {
 }
 
 impl<'a> NameTable<'a> {
-    fn new(records: &'a Input, threads: usize) -> Self {
+    fn new(records: &'a File, threads: usize) -> Self {
         let tags = HOMES + SPARE;
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
@@ -246,11 +240,9 @@ impl<'a> NameTable<'a> {
     }
 
     /// One bit per slot of a window of tags, set where the tag is `tag`.
-    fn slots_with(window: __m256i, tag: u8) -> u32 {
+    fn slots_with(tags: __m256i, tag: u8) -> u32 {
         // SAFETY: x86-64-v3 has AVX2.
-        unsafe {
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(window, _mm256_set1_epi8(tag as i8))) as u32
-        }
+        unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, _mm256_set1_epi8(tag as i8))) as u32 }
     }
 
     /// The tags of the 32 slots from `home`.
@@ -422,7 +414,7 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
-        let text = names.records.read(pos, len, room);
+        let text = read(names.records, pos, len, room);
         // A piece starts at a record's start, so outside quotes.
         let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
         listed[0] = 0;
@@ -444,9 +436,8 @@ fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows,
         }
         // What's left is the start of a record the piece cut short. A record longer than a piece gets
         // a longer piece.
-        let done = listed[0] as usize;
-        piece = if done > 0 { PIECE } else { 2 * piece };
-        pos += done;
+        piece = if listed[0] > 0 { PIECE } else { 2 * piece };
+        pos += listed[0] as usize;
     }
 }
 
@@ -466,9 +457,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
             // A byte order mark can only start a record here, and no record otherwise starts with it.
-            if *text.get_unchecked(start) == 0xEF {
-                start = std::hint::black_box(start + 3); // Keeps it a branch: one record in 4,000.
-            }
+            // The black box keeps it a branch: one record in 4,000.
+            (*text.get_unchecked(start) == 0xEF).then(|| start = std::hint::black_box(start + 3));
             // Moves the digits of the field at `start` to the top of a word, with zeros below them.
             let id = load_u64(text, start) << (8 * (start + 1 - name_at) as u32 & 63);
             // At most 7 digits (spec section 2.2), and the comma below them counts as a zero.
@@ -514,9 +504,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
         // for a count of 64.
         let (name_quotes, quotes) = if both <= 64 {
-            let quote = unsafe { _mm256_set1_epi8(b'"' as i8) };
-            let is_quote = |block| unsafe { _mm256_cmpeq_epi8(block, quote) };
-            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), is_quote) };
+            let is = |block| unsafe { _mm256_cmpeq_epi8(block, _mm256_set1_epi8(b'"' as i8)) };
+            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), is) };
             let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
             (below(name), below(both))
         } else {
@@ -536,14 +525,12 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
                 && NameTable::holds(words.byte_add(guess as usize), text, start, len)
             {
                 guess as usize
-            } else {
-                let len = name.saturating_sub(2);
-                let Some(at) = names.find(text, start, len) else {
-                    let pair = (text[start..start + len].to_vec(), country);
-                    row[6] += i64::from(!names.spill.lock().unwrap().insert(pair));
-                    continue;
-                };
+            } else if let Some(at) = names.find(text, start, name.saturating_sub(2)) {
                 at
+            } else {
+                let name = text[start..start + name.saturating_sub(2)].to_vec();
+                row[6] += i64::from(!names.spill.lock().unwrap().insert((name, country)));
+                continue;
             };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
@@ -554,12 +541,9 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
     }
 }
 
-/// Runs the numbered jobs below `count` that `next` hasn't handed out yet, sharing them with however
-/// many threads call this.
-fn run_jobs(next: &AtomicUsize, count: usize, mut job: impl FnMut(usize)) {
-    while let Some(at) = Some(next.fetch_add(1, Relaxed)).filter(|&at| at < count) {
-        job(at);
-    }
+/// Hands out the next numbered job below `count`, if any is left.
+fn next_job(next: &AtomicUsize, count: usize) -> Option<usize> {
+    Some(next.fetch_add(1, Relaxed)).filter(|&at| at < count)
 }
 
 /// Runs a closure, from a new thread's start.
@@ -588,32 +572,32 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: usize) {
     }
 }
 
-/// Every country's code, in index order from 1, and every index's row, index 0 being `_UNMATCHED`.
-type Totals = (Vec<[u8; 3]>, Rows);
-
-/// Parses the whole file on `threads` threads and merges their rows, returning them with the codes.
+/// Parses the whole file on `threads` threads and merges their rows. Returns every country's code, in
+/// index order from 1, and every index's row, index 0 being `_UNMATCHED`.
 /// The threads share the regions too, and all of those are done before any record is parsed. Tying
 /// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-fn aggregate(records: &Input, lookup: &Input, threads: usize) -> Totals {
+fn aggregate(records: &File, lookup: &File, threads: usize) -> (Vec<[u8; 3]>, Rows) {
     let names = NameTable::new(records, threads);
+    let record_bytes = records.metadata().unwrap().len() as usize;
+    let lookup_bytes = lookup.metadata().unwrap().len() as usize;
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
         let mut room = [0u8; PIECE + PADDING + 64];
-        run_jobs(&lines, line_parts, |at| {
-            let (pos, end) = lookup.part(line_parts, at, b"\n");
-            names.parse_regions(lookup.read(pos, end - pos, &mut room), end - pos);
+        while let Some(at) = next_job(&lines, line_parts) {
+            let (pos, end) = part(lookup, lookup_bytes, line_parts, at, b"\n");
+            names.parse_regions(read(lookup, pos, end - pos, &mut room), end - pos);
             parsed.fetch_add(1, Release);
-        });
+        }
         // Not a barrier: nobody should wait for a thread that hasn't started, or be woken up.
         while parsed.load(Acquire) < line_parts {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        run_jobs(&segments, threads * SEGMENTS, |at| {
-            let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
+        while let Some(at) = next_job(&segments, threads * SEGMENTS) {
+            let (pos, end) = part(records, record_bytes, threads * SEGMENTS, at, b"\r\n");
             parse_records(pos, end, &names, &mut rows, &mut room);
-        });
+        }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             for i in [0, 2, 4, 5, 6, 7] {
                 total[i] += row[i];
@@ -630,10 +614,6 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize) -> Totals {
 /// which this program needs, and the timer counts all of it.
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
-    run().map_or(1, |()| 0)
-}
-
-fn run() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -641,12 +621,8 @@ fn run() -> io::Result<()> {
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
-    let open = |name| {
-        let file = File::open(format!("{data_dir}/{name}.csv"))?;
-        io::Result::Ok(Input(file.metadata()?.len() as usize, file))
-    };
-    let (lookup, records) = (open("regions")?, open("records")?);
-    let (codes, totals) = aggregate(&records, &lookup, threads);
+    let open = |name| File::open(format!("{data_dir}/{name}.csv")).unwrap();
+    let (codes, totals) = aggregate(&open("records"), &open("regions"), threads);
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
@@ -654,16 +630,17 @@ fn run() -> io::Result<()> {
     let mut lines: Vec<_> = keys.zip(&totals[1..]).collect();
     lines.sort_by_key(|&(key, _)| key);
     lines.push(("_UNMATCHED", &totals[0]));
-    let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt"))?);
+    let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt")).unwrap());
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
-        write!(out, "{key} {} {}", row[0], row[2])?;
+        write!(out, "{key} {} {}", row[0], row[2]).unwrap();
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
         // which would lose the sign of -0.75. Zero never gets a sign.
         for cents in [&row[4], &row[1], &row[3]] {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
-            write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
+            write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100).unwrap();
         }
-        writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7])?;
+        writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7]).unwrap();
     }
-    out.flush()
+    out.flush().unwrap();
+    0
 }

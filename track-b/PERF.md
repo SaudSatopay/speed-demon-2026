@@ -1,6 +1,6 @@
 # Track B: performance log
 
-**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0732 s / 26.2 MB** (`run-763c4b4ded66`), at S 1,046: K = **42.06** and **81.2 speed points**. Its 9 runs read T 0.0732 to 0.0775, for a median K of 41.49.
+**Result:** the reference takes **56.35 s / 2,200 MB** on the board. Our best run of this build is **0.0732 s / 26.2 MB** (`run-763c4b4ded66`), at S 1,046: K = **42.06** and **81.2 speed points**. Its runs read T 0.0732 to 0.0775, for a median K of 41.49.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks b`. Output SHA-256 on seed 1: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
@@ -9,7 +9,7 @@
 - S is 1,046 code lines against the reference's 91, which costs (91/1046)^0.15, K x 0.69, about 7.9 speed points. It's the most code of any of our tracks. Each 100 lines move K by about 1.5%.
 - M scores nothing here. K takes min(M_ref / M, 50), and the board measured the reference at 2,199,961,600 bytes, so any M below 44.0 MB counts as 44.0. Ours has been below that since the design that stored postings (41.6 MB, `run-f39141d33527`), so cutting it from 42 to 27 MB with the block queries (D33) earned nothing by itself: K read 36.24 in that change's first run (`run-21faf3464957`), against 34.49 to 36.28 in the eight runs before it at S 1,015.
 - Local timing ranks the block queries the wrong way round. With block queries at anchors holding N/96, N/48 and N/24 documents, local cycles read 2.10G, 2.13G and 2.16G, and the board read T 0.0996, 0.0909 and 0.0942, one sample each (D36). Our guess, not confirmed, is that a block's columns and tallies go through a cache that two threads share on the box. Locally the whole run takes about 40 ms (D37, D38), and on the box T is 78 ms.
-- The board can't tell changes of under 1% apart: the 9 runs of this build span 0.0732 to 0.0775.
+- The board can't tell changes of under 1% apart: the runs of this build span 0.0732 to 0.0775.
 - The plan runs on one thread, after a parallel sample. Moving it onto threads was tried and dropped (D38), and we haven't timed it on the box for this design.
 - Printing keeps an order: threads claim batches of 1,024 queries, and each waits for the batch before it to reach the file. On an idle box that's flat against printing at known offsets, but a busy box stalls it (D26).
 
@@ -208,6 +208,7 @@ This PC's wall time is noisy, so thread cycles from `perf stat`, which repeat to
 | Each thread's own first ten ids per tally, so no locks in the scan | Fewer cache-line transfers, spending memory that scores nothing | T 0.0804 against 0.075, M 46.5 MB, K 39.73 against 41.46 | `run-35f97fe72a66`, `run-bd5defba895e`, `run-824503bf4037` | reverted (D41) |
 | A cache line per tally's limit, to end false sharing between the limits; a prefetch of a term's first hit word | Fewer misses, for memory that scores nothing | K 41.37 and 41.10, 3 runs each, against 41.80 over 5. Local cycles flat for both | `run-fbce98a5f127`, `run-c00fb88f9c97` | reverted |
 | Fewer lines: no phrase neighbour test (about 14 lines), no anchor kinds in the numbering (2 lines), struct literals and asserts on one line | S down with T flat | Cycles +1.8% and misses +5% without the neighbour test, +2.5% and +4% without the kinds, each more K lost than S gains. rustfmt expands the one-line literals, so those added lines | local, 7 to 9 alternating runs | not kept |
+| The corpus prefetched 8 or 32 blocks ahead, not 16 | A better lead on the box's slower cores | K 40.40 and 41.44, 3 runs each, against 41.49 over 14 | `run-5a72af8af7da`, `run-ac2c393d3cb9` | reverted |
 | One round of threads for parse and scan, the plan on threads, a prefault of the heap, mapped output, skipping the empty sets (12% of them), clearing only the columns used | Shorter serial parts and fewer misses | One round +1 ms, skipping empty sets +1.5%; the others no gain | local, D38 | not kept |
 
 ## The final design

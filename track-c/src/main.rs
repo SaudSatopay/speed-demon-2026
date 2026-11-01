@@ -74,7 +74,9 @@ impl Input {
     /// Reads `len` bytes at `at` to the start of `room`, or of a new buffer if they don't fit there
     /// (no generated record comes near that), with `PADDING` zeros after them.
     fn read<'a>(&self, at: usize, len: usize, room: &'a mut [u8]) -> &'a [u8] {
-        let text = match room.get_mut(..len + PADDING) {
+        // The kernel's copy runs fastest when source and destination agree within a cache line.
+        let skew = at.wrapping_sub(room.as_ptr() as usize) % 64;
+        let text = match room.get_mut(skew..skew + len + PADDING) {
             Some(room) => room,
             None => Vec::leak(vec![0; len + PADDING]),
         };
@@ -635,7 +637,7 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
     let (lines, segments) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
-        let mut room = [0u8; PIECE + PADDING];
+        let mut room = [0u8; PIECE + PADDING + 64];
         run_jobs(&lines, threads * SEGMENTS, |at| {
             let (pos, end) = lookup.part(threads * SEGMENTS, at, b"\n");
             names.parse_regions(lookup.read(pos, end - pos, &mut room), end - pos);

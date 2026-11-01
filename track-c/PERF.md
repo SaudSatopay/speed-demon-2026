@@ -73,6 +73,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 51 | C's entry point instead of std's | Std reads /proc/self/maps, installs handlers and allocates a signal stack before main: about 15 system calls the timer counts, and system calls cost far more on the box than locally. Finding from Track A | run-55bdb13c33fe | 0.0228 | 10.4 | 80.6 |
 | 52 | exp: one pass per record, with no list: one mask from the name's start, table work a record behind | A Fable agent's test of a leaner parser. Local: cycles level, instructions 295 -> 264, S 493 -> 512, and its stall analysis says the box's larger reorder buffer should favour it | pending | — | — | — |
 | 53 | Back to the two-stage parser | One pass per record gave T 0.0251 on the box against a steady 0.0228, though it matched locally with 10% fewer instructions | pending | — | — | — |
+| 54 | A piece's bytes line up with the file's within a cache line | The kernel's copy runs fastest when source and destination agree modulo 64; a finding from Track A | pending | — | — | — |
 
 ## Decision log
 
@@ -182,6 +183,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D52.** Test: keep only if K clearly beats 41 over samples.
 
 **D53.** Two-stage stays: without a list, one record's latencies serialize.
+
+**D54.** Take it: kernel cycles about -2% locally, S +2. Too small to see in one board run.
 
 ## What didn't work
 

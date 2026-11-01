@@ -381,7 +381,7 @@ fn reverse(forward: Graph, threads: usize) -> [Graph; 2] {
 }
 
 /// Nodes per region, a block of node numbers that one thread simplifies on its own.
-const REGION: usize = 1 << 13;
+const REGION: usize = 1 << 14;
 /// A node's neighbours in its region, at most, while simplifying.
 const WIDTH: usize = 8;
 const NO_ARC: u16 = u16::MAX;

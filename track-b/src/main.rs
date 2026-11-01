@@ -158,9 +158,9 @@ fn token_edges(file: &[u8], text: usize, edges: &mut Vec<u32>) -> usize {
     let (mut block, mut carry) = (0, 0);
     loop {
         // A thread takes long enough over a document that the hardware's prefetch rarely has the next one's
-        // lines ready, so each block prefetches the line 32 blocks on.
+        // lines ready, so each block prefetches the line 16 blocks on.
         // SAFETY: a prefetch has no other effect, whatever the address.
-        let ahead = file.as_ptr().wrapping_add(text + block + 2048);
+        let ahead = file.as_ptr().wrapping_add(text + block + 1024);
         unsafe { _mm_prefetch(ahead.cast(), _MM_HINT_T0) };
         let (tokens, line_feeds) = block_masks(file, text + block);
         // Only the bits below the first LF, if there is one.

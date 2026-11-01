@@ -81,9 +81,6 @@ impl Input {
             None => Vec::leak(vec![0; len + PADDING]),
         };
         self.1.read_exact_at(&mut text[..len], at as u64).unwrap();
-        for page in (0..len).step_by(4096) {
-            _ = self.1.read_at(&mut [0; 64], (at + page) as u64);
-        }
         text[len..].fill(0);
         text
     }
@@ -145,8 +142,6 @@ const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 const STACK: usize = 68 << 10;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
-/// Slots per group. A name's home is a group, and it may sit there or in the next one.
-const GROUP: usize = 16;
 /// Names longer than this are kept elsewhere: their slot holds a pointer and a length, and `LONG` in
 /// its last key word, which no key can equal, since names have no zero bytes (spec section 2.2). No
 /// generated name has been seen beyond 25 bytes.
@@ -158,9 +153,10 @@ static PADS: [u64; 8] = [0, 0, 0, 0, !0, !0, !0, !0];
 /// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
 /// name's bytes, padded with ones, and one bit per country that has seen this name. The tags, one byte
 /// per slot, zero while it's free and then 8 bits of the hash of its name, say which slot to open, so
-/// a lookup costs one cache miss, with no probing through other names' lines. One vector holds two
-/// groups' tags, so a name in its home group or the next costs the same, with no branch. Full ones
-/// spill two groups on. Names are compared in full, and never unescaped: the raw bytes encode the
+/// a lookup costs one cache miss, with no probing through other names' lines. A name's home is a slot,
+/// and one vector holds the tags of the 32 slots from there, so it costs the same in any of them, with
+/// no branch. Only when all are full does it move on 32 slots. A home for every slot, not every few,
+/// leaves far fewer names outside their first 32. Names are compared in full, and never unescaped: the raw bytes encode the
 /// value one to one. The slots are insert-only: a key's words go from zero to their final value once,
 /// and a key has no zero bytes, so a slot that compares equal is complete.
 struct NameTable<'a> {
@@ -171,13 +167,13 @@ struct NameTable<'a> {
     stacks: usize,                // Where the first worker's stack starts.
     index_of: Vec<AtomicU8>,      // Country indices by code, which takes every one in `[A-Z]{3}`.
     keys: Mutex<Vec<[u8; 3]>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
-    groups: usize, // Homes. The tags and slots have one more group, for the last home's window.
+    homes: usize,              // The tags and slots have 31 more, for the last home's window.
     full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
     fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
-        let tags = (slots / GROUP + 1) * GROUP;
+        let tags = slots + 31;
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
@@ -206,7 +202,7 @@ impl<'a> NameTable<'a> {
                 stacks: base.add(stacks_at) as usize,
                 index_of: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
                 keys: Mutex::new(Vec::with_capacity(256)),
-                groups: slots / GROUP,
+                homes: slots,
                 full: AtomicBool::new(false),
             }
         }
@@ -250,7 +246,7 @@ impl<'a> NameTable<'a> {
     }
 
     fn home(&self, hash: u32) -> usize {
-        (u64::from(hash) * self.groups as u64 >> 32) as usize
+        (u64::from(hash) * self.homes as u64 >> 32) as usize
     }
 
     /// One bit per slot of a window of tags, set where the tag is `tag`.
@@ -260,20 +256,20 @@ impl<'a> NameTable<'a> {
         unsafe { _mm256_movemask_epi8(same) as u32 }
     }
 
-    /// The tags of the two groups at `group`, which must be a home.
-    fn window(&self, group: usize) -> __m256i {
-        // SAFETY: `home` and the spill step stay below `groups`, and the tags have a group past the
-        // last home. x86-64-v3 has AVX2.
-        unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(group * GROUP).cast()) }
+    /// The tags of the 32 slots from `home`.
+    fn window(&self, home: usize) -> __m256i {
+        // SAFETY: `home` and the spill step stay below `homes`, and the tags have 31 more than that.
+        // x86-64-v3 has AVX2.
+        unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(home).cast()) }
     }
 
     /// Guesses the name's slot from the tags, and asks to own its line, for a write: a locked update
     /// then needs no second trip to take it from the core that wrote it last. A wrong guess costs
     /// `mark` a search. A name's tag is the low byte of its hash, or 1 for zero, which means free.
     fn guess_slot(&self, hash: u32) -> usize {
-        let group = self.home(hash);
-        let hits = Self::slots_with(self.window(group), (hash as u8).max(1));
-        let base = (group * GROUP + (hits.trailing_zeros() & 31) as usize) * SLOT_WORDS;
+        let home = self.home(hash);
+        let hits = Self::slots_with(self.window(home), (hash as u8).max(1));
+        let base = (home + (hits.trailing_zeros() & 31) as usize) * SLOT_WORDS;
         // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
         unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().add(base).cast()) };
         base
@@ -319,16 +315,16 @@ impl<'a> NameTable<'a> {
     #[cold]
     fn find(&self, text: &[u8], start: usize, len: usize) -> Option<usize> {
         let hash = Self::hash(text, start, len);
-        let (mut group, tag) = (self.home(hash), (hash as u8).max(1));
-        for _ in 0..2 * self.groups {
+        let (mut home, tag) = (self.home(hash), (hash as u8).max(1));
+        for _ in 0..self.homes / 16 + 2 {
             // One load answers both questions below, so a name can't get two slots. Each byte only
             // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
             // two threads insert one name, whichever saw the other's slot as taken saw its tag too,
             // and if neither did, they both want the same byte and one loses the exchange.
-            let window = self.window(group);
+            let window = self.window(home);
             let mut hits = Self::slots_with(window, tag);
             while hits != 0 {
-                let base = (group * GROUP + hits.trailing_zeros() as usize) * SLOT_WORDS;
+                let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
                 while self.words[base + 3].load(Acquire) == 0 {}
                 // SAFETY: `base` is where a slot's words start.
                 if unsafe { self.holds(base, text, start, len) } {
@@ -338,15 +334,15 @@ impl<'a> NameTable<'a> {
             }
             let free = Self::slots_with(window, 0);
             if free == 0 {
-                let next = group + 2; // Past this window, wrapping around.
-                group = if next < self.groups { next } else { 0 };
+                let next = home + 32; // Past this window, wrapping around.
+                home = if next < self.homes { next } else { 0 };
                 continue;
             }
             let at = free.trailing_zeros() as usize;
-            // Losing this race just means another look at the same group.
-            let slot = &self.tags[group * GROUP + at];
+            // Losing this race just means another look at the same window.
+            let slot = &self.tags[home + at];
             if slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
-                let base = (group * GROUP + at) * SLOT_WORDS;
+                let base = (home + at) * SLOT_WORDS;
                 let stored = &self.words[base..base + 4];
                 let mut key = [0u64, len as u64, 0, LONG];
                 if len > INLINE_BYTES {
@@ -524,7 +520,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // SAFETY: `found` has room for every record, the window is inside the tags, and prefetching
         // has no effect on memory anyway.
         unsafe {
-            let window = names.tags.as_ptr().add(names.home(hash) * GROUP);
+            let window = names.tags.as_ptr().add(names.home(hash));
             _mm_prefetch::<_MM_HINT_T0>(window.cast());
             _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
             found.get_unchecked_mut(record)[0] = hash;

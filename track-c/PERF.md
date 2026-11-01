@@ -137,6 +137,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 101 | exp: 12 segments per thread on the mapped file | Each segment now costs one release with a TLB shootdown to every thread, not two reads, so fewer may pay | pending | — | — | — |
 | 102 | exp: 6 segments per thread on the mapped file | 12 gave K 45.58 on one sample; this shows the trend of fewer releases against worse balance | pending | — | — | — |
 | 103 | exp: 12 segments per thread, sample 2 | One sample cannot decide; C moves 5 percent on one source | pending | — | — | — |
+| 104 | exp: 6 segments per thread, sample 2 | One sample cannot decide; C moves 5 percent on one source | pending | — | — | — |
 
 ## Decision log
 
@@ -346,6 +347,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D102.** Compare with 12 and 24
 
 **D103.** Median of three decides
+
+**D104.** Median of three decides
 
 ## What didn't work
 

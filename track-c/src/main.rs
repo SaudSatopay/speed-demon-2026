@@ -81,6 +81,7 @@ impl Input {
             None => Vec::leak(vec![0; len + PADDING]),
         };
         self.1.read_exact_at(&mut text[..len], at as u64).unwrap();
+        (0..4).for_each(|_| _ = self.1.read_at(&mut [0], at as u64));
         text[len..].fill(0);
         text
     }

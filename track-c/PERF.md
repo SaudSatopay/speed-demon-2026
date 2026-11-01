@@ -75,6 +75,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 53 | Back to the two-stage parser | One pass per record gave T 0.0251 on the box against a steady 0.0228, though it matched locally with 10% fewer instructions | pending | — | — | — |
 | 54 | A piece's bytes line up with the file's within a cache line | The kernel's copy runs fastest when source and destination agree modulo 64; a finding from Track A | pending | — | — | — |
 | 55 | 24 segments per thread instead of 8, regions stay at 8 parts; the join table loses its unused 48 KB | With 8 per thread, threads that ran out of segments sat idle while the last ones finished: first to last finish was 1.05 ms of 13.9 locally | pending | — | — | — |
+| 56 | exp: four extra 1-byte reads per piece | To time the fixed part of a read on the box: pieces of 16 KiB ran T 0.0290 against 0.0236 at 32 KiB, which suggests about 10 us per call, against 3.3 us in all locally | pending | — | — | — |
 
 ## Decision log
 
@@ -188,6 +189,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D54.** Take it: kernel cycles about -2% locally, S +2. Too small to see in one board run.
 
 **D55.** Paired local wall -2 to -4% over five runs at 16 to 48 segments, identical binaries -0.4%. 24 balances the idle time against two small reads and a short piece per segment
+
+**D56.** An experiment, reverted right after its run
 
 ## What didn't work
 

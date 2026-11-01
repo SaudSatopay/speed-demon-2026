@@ -43,7 +43,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, thread};
+use std::{arch::x86_64::*, fs::File, io::IoSlice, io::Write, os::fd::AsRawFd, thread};
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
 /// table doesn't depend on a slot that no term took, so this term also fills the unused slots of a
@@ -1330,14 +1330,14 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
 /// got.
 #[derive(Default)]
 struct Progress {
-    next_range: AtomicUsize,    // In bytes of the corpus.
+    next_range: AtomicUsize,                        // In bytes of the corpus.
     hits: Mutex<Vec<Vec<u64>>>, // Each thread's `Scan::hits`, once it has scanned...
     scanned: AtomicUsize,       // ...and how many have.
     next_total: AtomicUsize,    // The next tally to add up.
     totalled: AtomicUsize,      // How many threads have no more to add up.
-    next_batch: AtomicUsize,    // In queries, as is...
-    written: AtomicUsize,       // ...how many of them have reached the file.
-    next_release: AtomicUsize,  // In bytes of the corpus.
+    next_batch: AtomicUsize,    // In queries.
+    printed: Mutex<(usize, Vec<(usize, Vec<u8>)>)>, // How many threads are done printing, and the text by batch.
+    next_release: AtomicUsize,                      // In bytes of the corpus.
 }
 
 /// How much of the corpus a thread takes out of the address space at a time.
@@ -1425,9 +1425,9 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
     wait_for_all(&progress.totalled, threads);
 
     // Printing, each query's answer with what its term's tally adds to it.
-    let mut text = Vec::new();
+    let mut pieces = vec![];
     while let Some(batch) = claim(&progress.next_batch, BATCH, plan.queries.len()) {
-        text.clear();
+        let mut text = Vec::with_capacity(1 << 15);
         for query in batch.clone() {
             let mut line = *plan.answers[query].0.lock().unwrap();
             // NONE is no answer's number.
@@ -1450,14 +1450,28 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
             }
             *text.last_mut().expect("a line has numbers") = b'\n';
         }
-        while progress.written.load(Acquire) != batch.start {
-            thread::yield_now();
-        }
-        // `panic = "abort"`: a failed write ends the process rather than leaving the other
-        // threads waiting for their turn.
-        file.write_all(&text).expect("writing the results");
-        progress.written.store(batch.end, Release);
+        pieces.push((batch.start, text));
     }
+    // The last thread here writes it all at once, in one call to the kernel, which costs less than a call
+    // per batch in turn.
+    let mut printed = progress.printed.lock().unwrap();
+    printed.0 += 1;
+    printed.1.append(&mut pieces);
+    if printed.0 == threads {
+        printed.1.sort_unstable_by_key(|piece| piece.0);
+        let mut slices: Vec<_> = printed
+            .1
+            .iter()
+            .map(|piece| IoSlice::new(&piece.1))
+            .collect();
+        let mut rest = &mut slices[..];
+        while !rest.is_empty() {
+            // `panic = "abort"`: a failed write ends the process.
+            let written = file.write_vectored(rest).expect("writing the results");
+            IoSlice::advance_slices(&mut rest, written);
+        }
+    }
+    drop(printed);
     // The clock runs to exit, where one thread would take the corpus's pages out of the address space, one
     // by one. All the threads share that here.
     while let Some(part) = claim(&progress.next_release, RELEASE, docs.len()) {

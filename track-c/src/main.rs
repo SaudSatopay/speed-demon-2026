@@ -133,9 +133,9 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1_000_001;
-/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 91%
+/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 95%
 /// full. A test build makes it tiny, so that names run out of slots.
-const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
+const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 105_000 };
 /// Slots past the last home, where the names of the last homes can spill: more than a table this full
 /// can need, for a generated file.
 const SPARE: usize = 256;
@@ -314,7 +314,7 @@ type Found = [(u32, u32, u64); LISTED / 5];
 
 /// Segments per thread: when the segments run out, each thread still has its last to finish, and the
 /// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
-const SEGMENTS: usize = 1;
+const SEGMENTS: usize = 3;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
 /// Bytes ahead of a block to prefetch: past where the chunk's own loads and a page's end stop the core.

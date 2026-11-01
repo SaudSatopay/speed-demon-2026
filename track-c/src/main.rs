@@ -31,7 +31,6 @@ type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn madvise(at: *mut u8, len: usize, advice: i32) -> i32;
-    fn munmap(at: *mut u8, len: usize) -> i32;
     fn pthread_attr_init(attr: *mut [u64; 8]) -> i32;
     fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
     fn pthread_create(id: *mut u64, attr: *const [u64; 8], start: Start, arg: *mut u8) -> i32;
@@ -127,6 +126,9 @@ fn parse_three(words: [u64; 3]) -> [u64; 3] {
         let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
         let packed = _mm256_packus_epi32(quads, quads);
         let eights = _mm256_madd_epi16(packed, _mm256_set1_epi32(0x0001_2710));
+        // The second one is a region id, and `add_records` needs it inside the join table.
+        let cap = _mm256_set_epi32(-1, -1, -1, -1, -1, -1, REGION_IDS as i32 - 1, -1);
+        let eights = _mm256_min_epu32(eights, cap);
         let low = _mm256_extract_epi64::<0>(eights) as u64;
         let high = _mm256_extract_epi32::<4>(eights);
         [low & 0xFFFF_FFFF, low >> 32, high as u32 as u64]
@@ -168,13 +170,13 @@ struct NameTable<'a> {
     stacks: usize,                // Where the first worker's stack starts.
     index_of: Vec<AtomicU8>,      // Country indices by code, which takes every one in `[A-Z]{3}`.
     keys: Mutex<Vec<[u8; 3]>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
-    homes: usize,              // The tags and slots have 31 more, for the last home's window.
+    homes: usize, // The tags and slots have 32 more, for the last home's window and guess.
     full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
     fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
-        let tags = slots + 31;
+        let tags = slots + 32;
         let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
         let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
@@ -194,9 +196,6 @@ impl<'a> NameTable<'a> {
             // No huge page past the last whole one: whether one fits there depends on the address.
             madvise(base.add(bytes / huge * huge), huge, 15);
             madvise(base, bytes, 23);
-            let more = mmap(null_mut(), 5 * huge, read_write, private_anon, -1, 0);
-            madvise(more.add(more.align_offset(huge)), 4 * huge, 23);
-            munmap(more, 5 * huge);
             sched_setaffinity(0, 128, &allowed);
             NameTable {
                 records,
@@ -262,7 +261,7 @@ impl<'a> NameTable<'a> {
 
     /// The tags of the 32 slots from `home`.
     fn window(&self, home: usize) -> __m256i {
-        // SAFETY: `home` and the spill step stay below `homes`, and the tags have 31 more than that.
+        // SAFETY: `home` and the spill step stay below `homes`, and the tags have 32 more than that.
         // x86-64-v3 has AVX2.
         unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(home).cast()) }
     }
@@ -273,7 +272,7 @@ impl<'a> NameTable<'a> {
     fn guess_slot(&self, hash: u32) -> usize {
         let home = self.home(hash);
         let hits = Self::slots_with(self.window(home), (hash as u8).max(1));
-        let base = (home + (hits.trailing_zeros() & 31) as usize) * SLOT_WORDS;
+        let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
         // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
         unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().add(base).cast()) };
         base
@@ -365,11 +364,18 @@ impl<'a> NameTable<'a> {
         None
     }
 
-    /// Marks this name as seen in `country`, and returns whether it had been already.
+    /// Marks this name as seen in country `bit`, and adds one to `same` if it had been already.
     ///
     /// # Safety
     /// `guess` must be where a slot's words start.
-    unsafe fn mark(&self, guess: usize, text: &[u8], name: (usize, usize), country: u8) -> bool {
+    unsafe fn mark(
+        &self,
+        guess: usize,
+        text: &[u8],
+        name: (usize, usize),
+        bit: u8,
+        same: &mut i64,
+    ) {
         // SAFETY: the caller's promise, and `find` returns where a slot's words start. Its 256 bits
         // start 4 words in, and a byte can't index past them.
         unsafe {
@@ -379,23 +385,22 @@ impl<'a> NameTable<'a> {
             } else {
                 self.find(text, start, len)
             };
-            let Some(base) = found else { return true };
+            let Some(base) = found else { return };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
-            // write, and the prefetch has already asked to own the line. BTS finds the word itself.
-            let is_set: u8;
-            let (bits, bit) = (self.words.as_ptr().add(base + 4), usize::from(country));
-            asm!("lock bts [{}], {}", "setc {}", in(reg) bits, in(reg) bit, out(reg_byte) is_set);
-            is_set != 0
+            // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
+            // leaves the old bit in the carry.
+            let (words, bit) = (self.words.as_ptr(), usize::from(bit));
+            asm!("lock bts [{} + {} * 8 + 32], {}", "adc qword ptr [{}], 0",
+                in(reg) words, in(reg) base, in(reg) bit, in(reg) same);
         }
     }
 }
 
-/// A country's totals: its count with, above bit 32, how many of its records repeat a name; id sum;
-/// amount sum; lowest amount; highest amount; and name bytes with, above bit 32, note bytes. All the
-/// packed columns fit 32 bits (spec section 3), and one add does the work of two.
+/// A country's totals, one cache line: its count; id sum; amount sum; lowest amount; highest amount;
+/// name bytes; note bytes; and how many of its records repeat a name.
 #[repr(align(64))]
-struct Row([i64; 6]);
-const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0]);
+struct Row([i64; 8]);
+const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
@@ -410,14 +415,10 @@ const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 /// Bit `k` of each of the 64 positions in a block, at that position.
-static PLANES: [u64; 6] = [
-    0xAAAA_AAAA_AAAA_AAAA,
-    0xCCCC_CCCC_CCCC_CCCC,
-    0xF0F0_F0F0_F0F0_F0F0,
-    0xFF00_FF00_FF00_FF00,
-    0xFFFF_0000_FFFF_0000,
-    0xFFFF_FFFF_0000_0000,
-];
+const fn plane(k: u32) -> u64 {
+    !0 / ((1 << (1 << k)) + 1) << (1 << k)
+}
+static PLANES: [u64; 6] = [plane(0), plane(1), plane(2), plane(3), plane(4), plane(5)];
 
 /// Lists into `out` the positions just past the separators outside quotes in `blocks` blocks of `text`
 /// from `scan`, and returns how many. `odd` is all ones when the first block starts inside quotes,
@@ -554,11 +555,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let squeezed = _pext_u64(aligned, 0xFFFF_00FF_FFFF_FFFF) << 8;
             let [id, region, cents] = parse_three([id, region, squeezed]);
             let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
-            let region = (region as usize).min(REGION_IDS - 1);
-            _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast());
+            _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region as usize).cast());
             let guess = names.guess_slot(found.get_unchecked(record)[0]);
             *found.get_unchecked_mut(record) =
-                [guess, region, id as usize, cents as usize].map(|v| v as u32);
+                [guess, region as usize, id as usize, cents as usize].map(|v| v as u32);
         }
     }
     for record in 0..records {
@@ -578,19 +578,20 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         };
         // SAFETY: the first pass kept `region` inside the table, and `guess` came from `guess_slot`.
         let country = unsafe { names.regions.get_unchecked(region as usize) }.load(Relaxed);
-        let key = (name_at + 1, name.saturating_sub(2));
-        let repeat = unsafe { names.mark(guess as usize, text, key, country) };
         let cents = i64::from(cents as i32);
         let row = &mut rows[usize::from(country)].0;
-        row[0] += 1 + (i64::from(repeat) << 32);
+        row[0] += 1;
         row[1] += i64::from(id);
         row[2] += cents;
-        (row[3], row[4]) = (row[3].min(cents), row[4].max(cents));
+        // These hardly ever change, so branches beat conditional moves and two stores.
+        (cents < row[3]).then(|| row[3] = cents);
+        (cents > row[4]).then(|| row[4] = cents);
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
-        let name_bytes = (name - name_quotes / 2).saturating_sub(1) as i64;
-        let note_bytes = (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
-        row[5] += name_bytes + (note_bytes << 32);
+        row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
+        row[6] += (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
+        let key = (name_at + 1, name.saturating_sub(2));
+        unsafe { names.mark(guess as usize, text, key, country, &mut row[7]) };
     }
 }
 
@@ -659,7 +660,7 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
             }
         });
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
-            for i in [0, 1, 2, 5] {
+            for i in [0, 1, 2, 5, 6, 7] {
                 total[i] += row[i];
             }
             (total[3], total[4]) = (total[3].min(row[3]), total[4].max(row[4]));
@@ -669,10 +670,8 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
     if names.full.load(Relaxed) {
         return aggregate(records, lookup, threads, slots * 4);
     }
-    (
-        names.keys.into_inner().unwrap(),
-        totals.into_inner().unwrap(),
-    )
+    let keys = names.keys.into_inner().unwrap();
+    (keys, totals.into_inner().unwrap())
 }
 
 /// C's entry point, not std's: std's would read `/proc/self/maps` and install handlers first, none of
@@ -705,16 +704,14 @@ fn run() -> io::Result<()> {
     lines.push(("_UNMATCHED", &totals[0]));
     let mut out = BufWriter::new(File::create(format!("{out_dir}/aggregates.txt"))?);
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
-        let count = row[0] & 0xFFFF_FFFF;
-        write!(out, "{key} {count} {}", row[1])?;
+        write!(out, "{key} {} {}", row[0], row[1])?;
         // Printed as `W.CC`, with the sign apart, because integer division truncates toward zero,
         // which would lose the sign of -0.75. Zero never gets a sign.
         for cents in &row[2..5] {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
             write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100)?;
         }
-        let (new, name_bytes) = (count - (row[0] >> 32), row[5] & 0xFFFF_FFFF);
-        writeln!(out, " {new} {name_bytes} {}", row[5] >> 32)?;
+        writeln!(out, " {} {} {}", row[0] - row[7], row[5], row[6])?;
     }
     out.flush()
 }

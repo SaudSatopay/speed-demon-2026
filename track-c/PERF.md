@@ -80,6 +80,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 58 | A home for every slot instead of every 16, so the 32-slot windows overlap | 124,000 lookups a run were of names outside their home window, and each costs a mispredict and extra misses. A table with more slots cut that, but costs memory | pending | — | — | — |
 | 59 | exp: name slots of 52 bytes, 20 of key and 32 of bits, instead of a cache line; names over 20 bytes kept apart | M -13% locally (9.85 to 8.53). Names are short: over 20 raw bytes is 1 name in 80. Locally T +3.6%, so the box must decide | pending | — | — | — |
 | 60 | exp: four more huge pages mapped, touched and unmapped at the start | To time what zeroing and mapping huge pages costs on the box: locally 65 us per page. Memory reads high in this run | pending | — | — | — |
+| 61 | Rows unpacked to 8 words, one line each; min and max as branches; repeats added from BTS's carry; the locked write last in a record | The third loop had 103 instructions, with 5 register spills, 5 instructions turning the carry into a count and 8 for min and max, which hardly ever change | pending | — | — | — |
 
 ## Decision log
 
@@ -203,6 +204,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D59.** One sample or more, then keep or revert
 
 **D60.** An experiment, reverted right after its run
+
+**D61.** Instructions per record 290 to 272, cycles -3.4% over 15 runs each, S no higher. SLP off is flat
 
 ## What didn't work
 

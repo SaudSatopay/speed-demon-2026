@@ -206,17 +206,15 @@ fn parse_regions(text: &[u8], len: usize) {
 /// names rarely share them. BZHI reads only the low 8 bits of its count, so a name of 32 bytes or
 /// more can keep extra bytes. That's still the same word for the same name, and the key decides
 /// anyway. A test build swaps this for a constant, so that every key collides and any logic that
-/// trusts a hash without comparing the key shows up as a wrong answer.
-fn hash(text: &[u8], start: usize, len: usize) -> u32 {
+/// trusts a hash without comparing the key shows up as a wrong answer. Returns the name's home, and
+/// the hash's low byte for its tag.
+fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u8) {
     // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
     // CRC32 in SSE4.2, and x86-64-v3 includes both.
     let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
     let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
-    if cfg!(sd_const_hash) { 0 } else { crc }
-}
-
-fn home(hash: u32) -> usize {
-    (u64::from(hash) * HOMES as u64 >> 32) as usize
+    let hash = if cfg!(sd_const_hash) { 0 } else { crc };
+    ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u8)
 }
 
 /// One bit per slot of a window of tags, set where the tag is `tag`.
@@ -263,8 +261,8 @@ unsafe fn holds(at: usize, text: &[u8], start: usize, len: usize) -> bool {
 /// end of the table full, gets no slot.
 #[cold]
 fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
-    let hash = hash(text, start, len);
-    let (mut home, tag) = (home(hash), (hash as u8).max(1));
+    let (mut home, tag) = home_and_tag(text, start, len);
+    let tag = tag.max(1);
     while len <= INLINE_BYTES && home <= HOMES + SPARE - 32 {
         // One load answers both questions below, so a name can't get two slots. Each byte only
         // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
@@ -355,8 +353,8 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
             let inside = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
             odd_so_far = (inside as i64 >> 63) as u64;
-            let shuffled = |block| _mm256_shuffle_epi8(separator, block);
-            let left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, shuffled(block))) & !inside;
+            let class = |block| _mm256_shuffle_epi8(separator, block);
+            let mut left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, class(block))) & !inside;
             // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
             // writes 8 whatever the number, and moves on by the right amount. The positions of up to
             // 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every position at
@@ -370,11 +368,10 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
             let total = left.count_ones() as usize;
             if total > 8 {
-                let mut rest = left;
                 for i in 0..total {
                     *cursor.add(i) =
-                        at.offset_from(text.as_ptr()) as u32 + rest.trailing_zeros() + 1;
-                    rest &= rest.wrapping_sub(1);
+                        at.offset_from(text.as_ptr()) as u32 + left.trailing_zeros() + 1;
+                    left &= left.wrapping_sub(1);
                 }
             }
             cursor = cursor.add(total);
@@ -452,14 +449,13 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) 
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
-            let hash = hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
+            let (home, tag) = home_and_tag(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong
             // guess costs a search. A name's tag is the low byte of its hash, or 1 for zero, which
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
             // name in 256 less than a check.
-            let home = home(hash);
-            let hits = slots_with(window(home), hash as u8);
+            let hits = slots_with(window(home), tag);
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
@@ -519,11 +515,6 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, rows: &mut Rows) 
     }
 }
 
-/// Hands out the next numbered job below `count`, if any is left.
-fn next_job(next: &AtomicUsize, count: usize) -> Option<usize> {
-    Some(next.fetch_add(1, Relaxed)).filter(|&at| at < count)
-}
-
 /// Runs a closure, from a new thread's start.
 unsafe extern "C" fn start<F: Fn()>(work: *mut u8) -> *mut u8 {
     // SAFETY: `run_threads` passes a closure that outlives the thread.
@@ -540,8 +531,7 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize) {
         for (at, id) in ids.iter_mut().enumerate() {
             pthread_attr_init(&mut attr);
             pthread_attr_setstack(&mut attr, MEMORY.stacks[at].as_ptr() as *mut u8, STACK);
-            let arg = std::ptr::from_ref(work).cast_mut().cast();
-            assert!(pthread_create(id, &attr, start::<F>, arg) == 0);
+            assert!(pthread_create(id, &attr, start::<F>, work as *const F as *mut u8) == 0);
         }
         work();
         for id in ids {
@@ -566,11 +556,13 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
     LOCKED.lock().unwrap().0.reserve(256);
     let record_bytes = records.metadata().unwrap().len() as usize;
     let lookup_bytes = lookup.metadata().unwrap().len() as usize;
+    // The next numbered job below `count` from this counter, if any is left.
+    let claim = |job: &AtomicUsize, count| Some(job.fetch_add(1, Relaxed)).filter(|&at| at < count);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
         let mut room = [0u8; PIECE + PADDING + 64];
-        while let Some(at) = next_job(&lines, line_parts) {
+        while let Some(at) = claim(&lines, line_parts) {
             let (pos, end) = part(lookup, lookup_bytes, line_parts, at, b"\n");
             parse_regions(read(lookup, pos, end - pos, &mut room), end - pos);
             parsed.fetch_add(1, Release);
@@ -580,7 +572,7 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        while let Some(at) = next_job(&segments, threads * SEGMENTS) {
+        while let Some(at) = claim(&segments, threads * SEGMENTS) {
             let (pos, end) = part(records, record_bytes, threads * SEGMENTS, at, b"\r\n");
             parse_records(records, pos, end, &mut rows, &mut room);
         }
@@ -599,9 +591,8 @@ fn aggregate(records: &File, lookup: &File, threads: usize) -> Rows {
 /// which this program needs, and the timer counts all of it.
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
+    let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
+    let (data_dir, out_dir) = (arg(1, "/data"), arg(2, "/out"));
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));

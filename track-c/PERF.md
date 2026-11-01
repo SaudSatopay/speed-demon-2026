@@ -127,6 +127,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 91 | Chosen source restored | neither idea beat it over three samples | run-a80a4965a4fa | 0.0203 | 10.4 | 82.1 |
 | 92 | Twenty line cuts on cold paths: the input files as plain functions, main does its own work, one job claim call, one miss chain, one BOM line | S 446 to 426 is worth about 0.7 percent of K, and instructions fall 302.5 to 300.7 per record, so nothing hot pays for it | pending | — | — | — |
 | 93 | All memory is one zeroed 2 MiB aligned static in the image: no mmap, no NameTable struct, table functions are free functions, and the run ends in _exit | S 426 to 407 is worth about 0.7 percent of K. Local: instructions 300.7 to 289.7 per record in the counting build, paired T -2.5 percent, M flat at 9.70 | pending | — | — | — |
+| 94 | Helper merges: one function gives a name's home and tag, one closure for arguments and one for claiming a job, a full block uses up its own mask | S 407 to 399 is worth about 0.3 percent of K. Instructions per record unchanged at 289.7 in the counting build | pending | — | — | — |
 
 ## Decision log
 
@@ -316,6 +317,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D92.** Pending: kept only if its median K over 3 runs beats the chosen source
 
 **D93.** Pending: kept only if its median K over 3 runs beats the chosen source
+
+**D94.** Pending: kept only if its median K over 3 runs beats the chosen source
 
 ## What didn't work
 

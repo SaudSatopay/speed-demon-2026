@@ -408,40 +408,31 @@ fn round(log: &File, out: &Path, threads: usize, share: usize) -> std::io::Resul
         // Three stable passes sort by latency first and endpoint last, through one word of scratch per
         // record.
         tmp.resize(recs.len(), 0);
-        for i in 0..2 {
-            let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
-            for &record in recs.iter() {
-                low[(record >> 1 & 511) as usize] += 1;
-                high[(record >> 10 & 1023) as usize] += 1;
-                groups[(record >> ID_SHIFT) as usize] += 1;
-            }
-            // An endpoint that's new since the order was made means a new order.
-            let mut now = order.lock().unwrap();
-            if now.1.iter().map(|&id| groups[id] as usize).sum::<usize>() != recs.len() {
-                *now = Arc::new(order_ids(&table));
-            }
-            let order = now.clone();
-            drop(now);
-            pass(recs, tmp, &mut low, &all, |r| (r >> 1 & 511) as usize);
-            pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
-            pass(recs, tmp, &mut groups, &order.1, |r| r as usize >> ID_SHIFT);
-            // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
-            // ones are zero, which sorts before id 1.
-            let big = unsafe { from_raw_parts_mut(big.as_mut_ptr().cast::<u64>(), big.len() / 2) };
-            big.sort_unstable();
-            // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
-            // this vector never reallocates, and it's leaked rather than dropped.
-            // exp: the first time through, the text goes to a throwaway vector.
-            let mut text = if i == 0 {
-                Vec::with_capacity(1 << 20)
-            } else {
-                unsafe { Vec::from_raw_parts(recs.as_mut_ptr().cast(), 0, array.len() * 4) }
-            };
-            format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
-            if i == 1 {
-                ready.store(text.leak().len() + 1, Release);
-            }
+        let (mut low, mut high, mut groups) = ([0u32; 1024], [0u32; 1024], [0u32; IDS]);
+        for &record in recs.iter() {
+            low[(record >> 1 & 511) as usize] += 1;
+            high[(record >> 10 & 1023) as usize] += 1;
+            groups[(record >> ID_SHIFT) as usize] += 1;
         }
+        // An endpoint that's new since the order was made means a new order.
+        let mut now = order.lock().unwrap();
+        if now.1.iter().map(|&id| groups[id] as usize).sum::<usize>() != recs.len() {
+            *now = Arc::new(order_ids(&table));
+        }
+        let order = now.clone();
+        drop(now);
+        pass(recs, tmp, &mut low, &all, |r| (r >> 1 & 511) as usize);
+        pass(tmp, recs, &mut high, &all, |r| (r >> 10 & 1023) as usize);
+        pass(recs, tmp, &mut groups, &order.1, |r| r as usize >> ID_SHIFT);
+        // SAFETY: an even number of words, 8-aligned, that only this thread now touches. Unused
+        // ones are zero, which sorts before id 1.
+        let big = unsafe { from_raw_parts_mut(big.as_mut_ptr().cast::<u64>(), big.len() / 2) };
+        big.sort_unstable();
+        // SAFETY: the records are done with, and the whole array is ours. It has room for any text, so
+        // this vector never reallocates, and it's leaked rather than dropped.
+        let mut text = unsafe { Vec::from_raw_parts(recs.as_mut_ptr().cast(), 0, array.len() * 4) };
+        format_hour(hour, tmp, &groups, big, (&order.0, &order.1), &mut text);
+        ready.store(text.leak().len() + 1, Release);
     };
     // Appends the ready hours, in order, and frees them: `put` counts the hours out. A thread that
     // finds this busy leaves its hour to the thread in here, or to the next to finish one, or in the
@@ -517,6 +508,8 @@ fn main() -> std::io::Result<()> {
     let round = |share| round(&log, arg(2, "/out").as_ref(), threads, share);
     // A 48th of the log is several times the disorder that the spec's shards make. If it's not enough,
     // the second round has no hour due until the log is done.
-    _ = round(48)? || round(1)?;
+    // exp: the whole round runs twice, the second time over the first's file, so T less T without
+    // it is one round's wall time, and the rest is startup and exit.
+    _ = (round(48)? || round(1)?) && (round(48)? || round(1)?);
     Ok(())
 }

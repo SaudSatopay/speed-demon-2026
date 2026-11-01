@@ -321,27 +321,18 @@ const BLOCKS: usize = 16;
 const AHEAD: usize = 1024;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
-/// Bit `k` of each of the 64 positions in a block, at that position.
-const fn plane(k: u32) -> u64 {
-    !0 / ((1 << (1 << k)) + 1) << (1 << k)
-}
-static PLANES: [u64; 6] = [plane(0), plane(1), plane(2), plane(3), plane(4), plane(5)];
-
 /// Lists into `out` the positions just past the separators outside quotes in `blocks` blocks of `text`
 /// from `scan`, and returns how many. `odd` is all ones when the first block starts inside quotes,
 /// that is after an odd number of quotes, and comes back set for the block after. A function of its
 /// own, so that its constants get the registers that the loops around it would otherwise hold.
 #[inline(never)]
 fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mut u64) -> usize {
-    // Read once here, since the compiler would otherwise rebuild them in every block.
-    let planes = std::hint::black_box(&PLANES);
     // SAFETY: the blocks are inside the text, or the padding covers them. PCLMULQDQ is in the
     // build's target features. The carry-less multiply by all ones gives each bit the parity of the
     // quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels out. The
     // positions stay below `LISTED - 8`, as a chunk has `BLOCKS` blocks.
     unsafe {
         let mut cursor = out.as_mut_ptr();
-        let mut base = _mm256_set1_epi32(scan as i32 + 1);
         let mut odd_so_far = *odd;
         let mut at = text.as_ptr().add(scan);
         let end = at.add(blocks * 64);
@@ -359,28 +350,16 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             odd_so_far = (inside as i64 >> 63) as u64;
             let class = |block| _mm256_shuffle_epi8(separator, block);
             let mut left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, class(block))) & !inside;
-            // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
-            // writes 8 whatever the number, and moves on by the right amount. The positions of up to
-            // 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every position at
-            // that position, and PEXT gathers it for those bits, into a byte. Those bytes are a bit
-            // matrix with a row per bit of a position, and GFNI's multiply, given the columns one at
-            // a time, turns it around into a byte per position.
-            let matrix = planes.iter().fold(0, |m, &p| m << 8 | _pext_u64(p, left));
-            let columns = _mm_cvtsi64_si128(0x8040_2010_0804_0201u64 as i64);
-            let rows = _mm_cvtsi64_si128((matrix << 16) as i64);
-            let bytes = _mm256_cvtepu8_epi32(_mm_gf2p8affine_epi64_epi8::<0>(columns, rows));
-            _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
+            // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this writes
+            // 8 whatever the number, and moves on by the right amount: a zero mask writes junk there.
             let total = left.count_ones() as usize;
-            if total > 8 {
-                for i in 0..total {
-                    *cursor.add(i) =
-                        at.offset_from(text.as_ptr()) as u32 + left.trailing_zeros() + 1;
-                    left &= left.wrapping_sub(1);
-                }
+            let block_at = at.offset_from(text.as_ptr()) as u32;
+            for i in 0..total.max(8) {
+                *cursor.add(i) = block_at + left.trailing_zeros() + 1;
+                left &= left.wrapping_sub(1);
             }
             cursor = cursor.add(total);
             at = at.add(64);
-            base = _mm256_add_epi32(base, _mm256_set1_epi32(64));
         }
         *odd = odd_so_far;
         cursor.offset_from(out.as_ptr()) as usize

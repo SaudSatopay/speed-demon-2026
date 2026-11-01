@@ -130,6 +130,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 94 | Helper merges: one function gives a name's home and tag, one closure for arguments and one for claiming a job, a full block uses up its own mask | S 407 to 399 is worth about 0.3 percent of K. Instructions per record unchanged at 289.7 in the counting build | pending | — | — | — |
 | 95 | exp: records file mapped, pages released per segment, page tables touched first, one prefetch per block | Mapped lost in D19 to D24 when exit tore pages down serially on the clock; A found that worth 2.7 ms. No copy, smaller stacks | pending | — | — | — |
 | 96 | exp: mapped file, part and boundary merged, thread start without generics | Same design as d4f32c1, whose T and M tied the read design; these cold cuts cost nothing at run time | pending | — | — | — |
+| 97 | exp: positions by a fixed count of eight TZCNT steps instead of PEXT and GFNI | 14 lines. Local says T up 9 percent but local has misranked this track repeatedly and this was never run on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -325,6 +326,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D95.** Keep only if median K over 3 runs beats the current source
 
 **D96.** Keep only if median K over 3 runs beats the current source
+
+**D97.** Keep only if median K over 3 runs beats the current source
 
 ## What didn't work
 

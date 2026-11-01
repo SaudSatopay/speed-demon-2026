@@ -89,6 +89,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 53 | Back to the kept source, cb's K 40.81 lost, plus the heap starting at a 2 MiB boundary | Up to 2 MiB of the heap, with the term table, otherwise gets small pages by a random amount per run | run-eac18b24459b | 0.0734 | 28.0 | K median 41.59 over 4 runs, a tie for 2 more lines: reverted |
 | 54 | Back to the kept source, the aligned heap tied at 41.59, plus a filter of 16 bits per set that sends tokens of no query to an empty set | A quarter of tokens are in no query and simulate as 70% of the table's L2 misses; 128 KB is memory that scores nothing | run-5fd27e6c3b21 | 0.0824 | 27.1 | K 39.59 and 39.97; local instructions +13%, cycles +15%, misses flat: reverted |
 | 55 | Back to the kept source, the filter lost at K 39.8, with the term table's zeros from the kernel, not written serially | Ends a serial clear of 4 MB before the parse; the memory it might add is below 44 MB | run-84be12a7d568 | 0.0743 | 27.0 | K median 41.80 over 3 runs, against 41.59: kept |
+| 56 | The scan's lookup cut: a term's word by lzcnt with ways renumbered, a redundant length test and a min dropped | Instructions -2.2%, cycles -0.7 to -1.1% locally, no more lines | pending | — | — | — |
 
 ## Decision log
 
@@ -203,6 +204,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D55.** Local cycles +15%, so the board decides, by median K against 41.59
 
 **D56.** Judged by median K over 3 or more against 41.59
+
+**D57.** Judged by median K over 3 or more against 41.80
 
 ## What didn't work
 

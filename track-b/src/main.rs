@@ -213,7 +213,8 @@ fn keys_of(token: &[u8]) -> (u64, u32) {
     unsafe {
         let short = bytes.cast::<u64>().read_unaligned() | CASE_BITS;
         let long = bytes.add(8).cast::<u32>().read_unaligned() | CASE_BITS as u32;
-        let short = _bzhi_u64(short, 8 * len.min(9) as u32) | u64::from(len > 8) << 63;
+        let held = (len as u8 as i8).clamp(0, 8) as u32;
+        let short = _bzhi_u64(short, 8 * held) | u64::from(len > 8) << 63;
         let long = _bzhi_u32(long, 8 * len.saturating_sub(8) as u32) | u32::from(len > 12) << 31;
         (short, long)
     }
@@ -247,12 +248,12 @@ const TERMS_PER_SET: usize = 2;
 /// Four terms in one cache line, whose keys are compared at once, so a lookup has no branch on which of
 /// them it found, or whether it found one. The word of no way is what a lookup that finds none gets: 0 (no
 /// query uses this token), or `UNSURE` if the probe goes on. While the queries are read, its low bit is the
-/// set's lock. Only the first three ways have long keys, and terms that need one fill those in order, from
-/// the first. The others take the last way free, so the last way's long key is always 0.
+/// set's lock. Only the last three ways have long keys, and terms that need one fill those in order, from
+/// the last. The others take the first way free, so the first way's long key is always 0.
 #[repr(align(64))]
 struct TermSet {
     shorts: [u64; 4], // Short keys, 0 in the ways not used.
-    rest: [u32; 8],   // The ways' terms' numbers and flags, the word of no way, then the long keys.
+    rest: [u32; 8],   // The ways' words, last way first, the word of no way, then the long keys.
 }
 
 impl TermSet {
@@ -272,15 +273,15 @@ impl TermSet {
         unsafe {
             let keys = _mm_load_si128(self.rest.as_ptr().add(NO_WAY).cast());
             let same = _mm_cmpeq_epi32(keys, _mm_set1_epi32(long_key as i32));
-            // The word of no way comes first, and isn't a key.
-            _mm_movemask_ps(_mm_castsi128_ps(same)) as u32 >> 1 | u32::from(long_key == 0) << 3
+            // The word of no way comes first, in the place of the first way's key, which is always 0.
+            _mm_movemask_ps(_mm_castsi128_ps(same)) as u32 & 14 | u32::from(long_key == 0)
         }
     }
 
-    /// The word of the first of these ways, or else of no way, as the bit set past the four ways stops the
-    /// count at it. The `& 7` only spares a bounds check.
+    /// The word of the last of these ways, or else of no way: a count of zeros above four bits of ways.
     fn word(&self, ways: u32) -> u32 {
-        self.rest[(ways | 1 << NO_WAY).trailing_zeros() as usize & 7]
+        // SAFETY: `ways` has four bits, so there are 28 to 32 of those zeros.
+        unsafe { *self.rest.get_unchecked(ways.leading_zeros() as usize - 28) }
     }
 }
 
@@ -326,13 +327,13 @@ impl TermTable<'_> {
     fn ways_of_long_term(&self, set: &TermSet, token: &[u8], short: u64) -> u32 {
         let (ways, end) = (set.ways(short), token.len());
         let is_token = |way: &u32| {
-            let long = set.rest[NO_WAY + 1 + *way as usize];
+            let long = set.rest[NO_WAY + *way as usize];
             let term = self.text.get((long & !LONG) as usize..).unwrap_or(&[]);
             ways >> way & long >> 31 != 0
                 && token.eq_ignore_ascii_case(term.get(..end).unwrap_or(&[]))
                 && !term.get(end).is_some_and(u8::is_ascii_alphanumeric)
         };
-        (0..3).filter(is_token).map(|way| 1 << way).sum()
+        (1..4).filter(is_token).map(|way| 1 << way).sum()
     }
 
     /// Adds this query term, if it's new, and returns its number. With no room left in the table, that
@@ -367,19 +368,19 @@ impl TermTable<'_> {
                 let ways = self.ways_of(set, token, short, long);
                 // A token past the short key has more to compare.
                 let has_more = token.len() > 8;
-                let free = set.ways(0) & if has_more { 7 } else { 15 };
+                let free = set.ways(0) & if has_more { 14 } else { 15 };
                 let (mut term, room) = (set.word(ways) & TERM_BITS, free != 0);
                 if ways == 0 && room {
                     term = next_term.fetch_add(1, Relaxed) as u32;
                     if (term as usize) < FIRST_TERM + TERMS_PER_SET * self.sets.len() {
-                        let way = [free.ilog2(), free.trailing_zeros()][has_more as usize] as usize;
+                        let way = [free.trailing_zeros(), free.ilog2()][has_more as usize] as usize;
                         let at = (token.as_ptr() as usize - self.text.as_ptr() as usize) as u32;
                         if has_more {
                             let key = if long & LONG != 0 { LONG | at } else { long };
-                            set.rest[NO_WAY + 1 + way] = key;
+                            set.rest[NO_WAY + way] = key;
                         }
-                        let more = UNSURE | (way as u32 + 1) << WAY_SHIFT;
-                        set.rest[way] = term | u32::from(has_more) * more;
+                        let more = UNSURE | (way as u32) << WAY_SHIFT;
+                        set.rest[NO_WAY - 1 - way] = term | u32::from(has_more) * more;
                         AtomicU64::from_ptr(&raw mut set.shorts[way]).store(short, Release);
                     }
                 }
@@ -960,8 +961,8 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             // the rest of this looks.
             let pair = _mm256_loadu_si256(pairs.cast());
             let lens = _mm256_sub_epi32(_mm256_srli_epi64(pair, 32), pair);
-            let lens = _mm256_min_epu32(lens, _mm256_set1_epi64x(9));
-            // The token's bytes are those whose numbers are below its length, copied to each byte.
+            // The token's bytes are those whose numbers are below its length, copied to each byte as a signed
+            // number, which `keys_of` follows for the very long.
             let copies = _mm256_set_epi64x(0x0808_0808_0808_0808, 0, 0x0808_0808_0808_0808, 0);
             let numbers = _mm256_set1_epi64x(0x0706_0504_0302_0100);
             let held = _mm256_cmpgt_epi8(_mm256_shuffle_epi8(lens, copies), numbers);
@@ -1027,12 +1028,13 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             // Most are terms of up to 12 bytes, whose word is right if its way's long key is the rest of the
             // token, taken here as up to 8 bytes, zero-padded, so that a longer rest is a bigger number than
             // any long key. A word of no way reads that word in place of a long key, which no token's bytes
-            // equal, so those go to `find`, like tokens of up to 8 bytes or over 16. It gives 0 for the empty
+            // equal, so those go to `find`, like tokens of over 16 bytes, and of under 8, whose count of bits
+            // wraps, keeping all of them, and of 8, whose rest of 0 isn't that word. It gives 0 for the empty
             // pairs past the last token, which marks term 0, whose mark means nothing.
             let rest = text.as_ptr().add(start + 8).cast::<u64>().read_unaligned() | CASE_BITS;
             let rest = _bzhi_u64(rest, 8 * end.wrapping_sub(start + 8) as u32);
             let w = NO_WAY + (word >> WAY_SHIFT & 3) as usize;
-            if (end - start).wrapping_sub(9) > 7 || rest != u64::from(*set.rest.get_unchecked(w)) {
+            if rest != u64::from(*set.rest.get_unchecked(w)) {
                 let token = text.get_unchecked(start..end);
                 word = terms.find(token, *keys.get_unchecked(at), set);
                 *tokens.get_unchecked_mut(at) = word;

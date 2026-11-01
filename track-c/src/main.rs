@@ -343,7 +343,7 @@ type Found = [(u32, u32, u64); LISTED / 5];
 
 /// Segments per thread: when the segments run out, each thread still has its last to finish, and the
 /// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
-const SEGMENTS: usize = 24;
+const SEGMENTS: usize = 48;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
@@ -481,6 +481,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let (id_region, cents) = parse_three([id, region, word << (64 - field)]);
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
+            _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
             let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong

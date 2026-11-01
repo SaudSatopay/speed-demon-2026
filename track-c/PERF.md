@@ -113,6 +113,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 80 | exp: the locked set, no pin, and two line trims with the BOM branch kept | c-v91 re-sampled at T 0.0204 M 11.04, so T moves 2% and M 6% on one source, and the removals look neutral; this is a second sample of them | run-98bd53a6de8f | 0.0206 | 10.4 | 82.0 |
 | 81 | The slot guess written in the record loop, and three statements on fewer lines | Seven fewer lines locally (S 452 -> 446 on the board) with the same instructions per record, and a third sample of the locked set with no pin | run-13115bed748f | 0.0204 | 10.5 | 82.1 |
 | 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | pending | — | — | — |
+| 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | pending | — | — | — |
 
 ## Decision log
 
@@ -280,6 +281,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D81.** The slot guess is written in the record loop, and three statements are on fewer lines. Board `run-13115bed748f` (`bfba195`): T 0.0204, M 10.46, S 446 (-6), K 43.88, C over D 0.1348. Locally the instructions per record are the same. It is the third sample of the locked set with no pin, and the three agree at T 0.0204 to 0.0207. K 43.88 is the best of any scored run of this track. Outcome: kept; it is the last row of the journey.
 
 **D82.** pending the board
+
+**D83.** pending the board
 
 ## What didn't work
 

@@ -317,8 +317,6 @@ type Found = [(u32, u32, u64); LISTED / 5];
 const SEGMENTS: usize = 24;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
-/// Bytes ahead of a block to prefetch: past where the chunk's own loads and a page's end stop the core.
-const AHEAD: usize = 1024;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 /// Bit `k` of each of the 64 positions in a block, at that position.
@@ -351,7 +349,6 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         let separator = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
         let quote = _mm256_set1_epi8(b'"' as i8);
         while at < end {
-            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(AHEAD).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let ones = _mm_set1_epi8(-1);
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);

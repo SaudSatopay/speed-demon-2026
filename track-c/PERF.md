@@ -132,6 +132,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 96 | exp: mapped file, part and boundary merged, thread start without generics | Same design as d4f32c1, whose T and M tied the read design; these cold cuts cost nothing at run time | pending | — | — | — |
 | 97 | exp: positions by a fixed count of eight TZCNT steps instead of PEXT and GFNI | 14 lines. Local says T up 9 percent but local has misranked this track repeatedly and this was never run on the box | pending | — | — | — |
 | 98 | exp: back to PEXT and GFNI positions on the mapped file | TZCNT gave T 0.0208 and C over D 0.143 against 0.134, for 14 lines, so the box agrees with local here | pending | — | — | — |
+| 99 | exp: mapped file without the prefetch per block | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway. Two lines | pending | — | — | — |
 
 ## Decision log
 
@@ -331,6 +332,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D97.** Keep only if median K over 3 runs beats the current source
 
 **D98.** TZCNT rejected. Mapped file sampled again
+
+**D99.** Compare C over D and T with the mapped samples
 
 ## What didn't work
 

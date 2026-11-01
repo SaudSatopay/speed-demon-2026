@@ -78,6 +78,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 56 | exp: four extra 1-byte reads per piece | To time the fixed part of a read on the box: pieces of 16 KiB ran T 0.0290 against 0.0236 at 32 KiB, which suggests about 10 us per call, against 3.3 us in all locally | pending | — | — | — |
 | 57 | exp: 64 bytes again from each page of a piece | To tell the per-page cost of a read from the per-byte cost on the box: four small reads per piece cost only about 0.5 us each, while reading each piece twice costs about 11 us | pending | — | — | — |
 | 58 | A home for every slot instead of every 16, so the 32-slot windows overlap | 124,000 lookups a run were of names outside their home window, and each costs a mispredict and extra misses. A table with more slots cut that, but costs memory | pending | — | — | — |
+| 59 | exp: name slots of 52 bytes, 20 of key and 32 of bits, instead of a cache line; names over 20 bytes kept apart | M -13% locally (9.85 to 8.53). Names are short: over 20 raw bytes is 1 name in 80. Locally T +3.6%, so the box must decide | pending | — | — | — |
 
 ## Decision log
 
@@ -197,6 +198,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D57.** An experiment, reverted right after its run
 
 **D58.** Cycles per record -3%, mispredicts 0.38 to 0.33, S -1, M the same. One name, one slot still holds: 1,800 repeat runs on seed 2, 144 hostile runs. Tag groups of 8, 4 and 2 measure the same or between
+
+**D59.** One sample or more, then keep or revert
 
 ## What didn't work
 

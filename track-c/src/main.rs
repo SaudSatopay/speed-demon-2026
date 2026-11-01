@@ -21,7 +21,7 @@
 
 use std::arch::{asm, x86_64::*};
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering::*};
 use std::{fs::File, os::unix::fs::FileExt, ptr::null_mut, sync::Mutex, thread};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
@@ -140,14 +140,16 @@ const REGION_IDS: usize = 1_000_001;
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
 const STACK: usize = 68 << 10;
-/// Words per slot, which is one cache line: four words of key, then 256 bits.
-const SLOT_WORDS: usize = 8;
+/// Words per slot: five of key, then 256 bits.
+const SLOT_WORDS: usize = 13;
 /// Names longer than this are kept elsewhere: their slot holds a pointer and a length, and `LONG` in
-/// its last key word, which no key can equal, since names have no zero bytes (spec section 2.2). No
-/// generated name has been seen beyond 25 bytes.
-const INLINE_BYTES: usize = 32;
-const LONG: u64 = 1;
-/// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones.
+/// its last key word, which no key can equal, since names have no zero bytes (spec section 2.2). About
+/// 1 name in 80 is, and none has been seen beyond 27 bytes. `KEPT` holds thousands of them, so that the
+/// workers don't touch the heap.
+const INLINE_BYTES: usize = 20;
+const LONG: u32 = 1;
+const KEPT: usize = 32 << 10;
+/// A 32-byte load at `32 - len` bytes in has `len` zero bytes, and the rest all ones.
 static PADS: [u64; 8] = [0, 0, 0, 0, !0, !0, !0, !0];
 
 /// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
@@ -161,21 +163,22 @@ static PADS: [u64; 8] = [0, 0, 0, 0, !0, !0, !0, !0];
 /// and a key has no zero bytes, so a slot that compares equal is complete.
 struct NameTable<'a> {
     records: &'a Input,
-    words: &'static [AtomicU64],
+    words: &'static [AtomicU32],
     tags: &'static [AtomicU8],
     regions: &'static [AtomicU8], // The join table, country indices by region id.
     stacks: usize,                // Where the first worker's stack starts.
     index_of: Vec<AtomicU8>,      // Country indices by code, which takes every one in `[A-Z]{3}`.
     keys: Mutex<Vec<[u8; 3]>>, // Index 0 is `_UNMATCHED`, and codes take the next as they appear.
     homes: usize,              // The tags and slots have 31 more, for the last home's window.
+    kept: AtomicUsize,
     full: AtomicBool,
 }
 
 impl<'a> NameTable<'a> {
     fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
         let tags = slots + 31;
-        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
-        let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
+        let (tags_at, regions_at) = (tags * SLOT_WORDS * 4, tags * SLOT_WORDS * 4 + tags);
+        let stacks_at = (regions_at + REGION_IDS + KEPT).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
         let (read_write, private_anon, huge) = (3, 0x22, 1 << 21);
         let (mut allowed, mut here) = ([0u64; 16], [0u64; 16]);
@@ -203,6 +206,7 @@ impl<'a> NameTable<'a> {
                 index_of: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
                 keys: Mutex::new(Vec::with_capacity(256)),
                 homes: slots,
+                kept: AtomicUsize::new(0),
                 full: AtomicBool::new(false),
             }
         }
@@ -270,8 +274,13 @@ impl<'a> NameTable<'a> {
         let home = self.home(hash);
         let hits = Self::slots_with(self.window(home), (hash as u8).max(1));
         let base = (home + (hits.trailing_zeros() & 31) as usize) * SLOT_WORDS;
-        // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
-        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().add(base).cast()) };
+        // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway. A slot
+        // can straddle two lines.
+        unsafe {
+            let slot = self.words.as_ptr().add(base).cast::<i8>();
+            _mm_prefetch::<_MM_HINT_ET0>(slot);
+            _mm_prefetch::<_MM_HINT_ET0>(slot.add(51));
+        }
         base
     }
 
@@ -281,7 +290,7 @@ impl<'a> NameTable<'a> {
         // the other load inside the table. x86-64-v3 has AVX2.
         unsafe {
             let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
-            let pad = at(PADS.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
+            let pad = at(PADS.as_ptr().cast::<u8>().add(32 - len));
             _mm256_or_si256(at(text.as_ptr().add(start)), pad)
         }
     }
@@ -297,16 +306,17 @@ impl<'a> NameTable<'a> {
             let stored = self.words.as_ptr().add(base);
             if len > INLINE_BYTES {
                 // The pointer and length may only be read once `LONG` shows they are in place.
-                if (*stored.add(3)).load(Acquire) != LONG {
+                if (*stored.add(4)).load(Acquire) != LONG {
                     return false;
                 }
-                let (at, long) = ((*stored).load(Relaxed), (*stored.add(1)).load(Relaxed));
-                let name = std::slice::from_raw_parts(at as *const u8, long as usize);
+                let at = stored.cast::<*const u8>().read_unaligned();
+                let name = std::slice::from_raw_parts(at, (*stored.add(2)).load(Relaxed) as usize);
                 return name == &text[start..start + len];
             }
             let key = Self::key(text, start, len);
-            let differ = _mm256_xor_si256(key, _mm256_loadu_si256(stored.cast()));
-            _mm256_testz_si256(differ, differ) == 1
+            let head = _mm_xor_si128(_mm256_castsi256_si128(key), _mm_loadu_si128(stored.cast()));
+            let tail = _mm256_extract_epi32::<4>(key) as u32 ^ (*stored.add(4)).load(Relaxed);
+            _mm_testz_si128(head, head) == 1 && tail == 0
         }
     }
 
@@ -325,7 +335,7 @@ impl<'a> NameTable<'a> {
             let mut hits = Self::slots_with(window, tag);
             while hits != 0 {
                 let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
-                while self.words[base + 3].load(Acquire) == 0 {}
+                while self.words[base + 4].load(Acquire) == 0 {}
                 // SAFETY: `base` is where a slot's words start.
                 if unsafe { self.holds(base, text, start, len) } {
                     return Some(base);
@@ -343,22 +353,41 @@ impl<'a> NameTable<'a> {
             let slot = &self.tags[home + at];
             if slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
                 let base = (home + at) * SLOT_WORDS;
-                let stored = &self.words[base..base + 4];
-                let mut key = [0u64, len as u64, 0, LONG];
+                let stored = &self.words[base..base + 5];
+                let mut key = [0u32; 8];
                 if len > INLINE_BYTES {
-                    key[0] = Vec::leak(text[start..start + len].to_vec()).as_ptr() as u64;
+                    let kept = self.keep(&text[start..start + len]);
+                    key[..5].copy_from_slice(&[
+                        kept as u32,
+                        (kept >> 32) as u32,
+                        len as u32,
+                        0,
+                        LONG,
+                    ]);
                 } else {
                     // SAFETY: the array is 32 bytes long. x86-64-v3 has AVX2.
                     let bytes = Self::key(text, start, len);
                     unsafe { _mm256_storeu_si256(key.as_mut_ptr().cast(), bytes) };
                 }
-                (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
-                stored[3].store(key[3], Release);
+                (0..4).for_each(|i| stored[i].store(key[i], Relaxed));
+                stored[4].store(key[4], Release);
                 return Some(base);
             }
         }
         self.full.store(true, Relaxed);
         None
+    }
+
+    /// Puts a long name somewhere it stays, and returns where.
+    fn keep(&self, name: &[u8]) -> u64 {
+        let at = self.kept.fetch_add(name.len(), Relaxed);
+        if at + name.len() > KEPT {
+            return Vec::leak(name.to_vec()).as_ptr() as u64;
+        }
+        let room = (self.stacks - KEPT + at) as *mut u8;
+        // SAFETY: `KEPT` bytes before the stacks are for this, and this thread has its share to itself.
+        unsafe { room.copy_from_nonoverlapping(name.as_ptr(), name.len()) };
+        room as u64
     }
 
     /// Marks this name as seen in `country`, and returns whether it had been already.
@@ -367,7 +396,8 @@ impl<'a> NameTable<'a> {
     /// `guess` must be where a slot's words start.
     unsafe fn mark(&self, guess: usize, text: &[u8], name: (usize, usize), country: u8) -> bool {
         // SAFETY: the caller's promise, and `find` returns where a slot's words start. Its 256 bits
-        // start 4 words in, and a byte can't index past them.
+        // start 5 words in, and a byte can't index past them. Each word is 4-byte aligned, so no locked
+        // write splits across lines.
         unsafe {
             let (start, len) = name;
             let found = if self.holds(guess, text, start, len) {
@@ -379,8 +409,8 @@ impl<'a> NameTable<'a> {
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself.
             let is_set: u8;
-            let (bits, bit) = (self.words.as_ptr().add(base + 4), usize::from(country));
-            asm!("lock bts [{}], {}", "setc {}", in(reg) bits, in(reg) bit, out(reg_byte) is_set);
+            let (bits, bit) = (self.words.as_ptr().add(base + 5), u32::from(country));
+            asm!("lock bts dword ptr [{}], {:e}", "setc {}", in(reg) bits, in(reg) bit, out(reg_byte) is_set);
             is_set != 0
         }
     }

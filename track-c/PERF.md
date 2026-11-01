@@ -98,6 +98,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 76 | Back to segments, with the locked set for names with no slot, and line trims: BOM by arithmetic, quotes counted in a closure | Piece claims cost about 3% of T in two samples, C over D 0.141 against 0.136, so they go; the locked set changes only cold paths and is 13 lines shorter, and the trims 8 more | pending | — | — | — |
 | 77 | exp: only the locked set for names with no slot, with the BOM branch and the old quote count back | The trims gave T 0.0212 and C over D 0.146, so this takes them out to see whether the locked set alone keeps T 0.0200 | pending | — | — | — |
 | 78 | exp: the main thread is no longer pinned while it touches the mapping | Eight lines for a guard against a move in the first millisecond; if the main thread rarely moves, M stays and S falls | pending | — | — | — |
+| 79 | Best source again, c-v91, as a second sample | Every build since has T near 0.0206 against its one sample of 0.0200, so this shows whether that was luck or the box drifting | pending | — | — | — |
 
 ## Decision log
 
@@ -257,6 +258,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D77.** pending the board
 
 **D78.** pending the board
+
+**D79.** pending the board
 
 ## What didn't work
 

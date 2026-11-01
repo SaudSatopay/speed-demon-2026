@@ -18,7 +18,7 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 - It relies on three spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, every line is well formed, and a seed has 1,842 endpoints. A line outside the window either aborts, when its hour falls outside the 72, or is counted in a wrong hour, as the hour comes only from the bits that differ inside the window. An endpoint table past 4,094 lines of keys aborts.
 - The spec promises no bound on how late a line can come. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. A line for an hour already claimed stops the run and starts it again with no early finish, which about doubles T. The worst disorder on our seeds is 1/315 of the log, and 280 full runs saw no restart.
 - Readers never wait for a thread that falls behind, so on a busy machine records pile up: M rises by about 2 MB, while T stays about 1.5 times better than with a wait.
-- S is 362 code lines, against the reference's 56.
+- S is 377 code lines, against the reference's 56.
 
 ## Approach
 

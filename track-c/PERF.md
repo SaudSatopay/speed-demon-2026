@@ -114,6 +114,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 81 | The slot guess written in the record loop, and three statements on fewer lines | Seven fewer lines locally (S 452 -> 446 on the board) with the same instructions per record, and a third sample of the locked set with no pin | run-13115bed748f | 0.0204 | 10.5 | 82.1 |
 | 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | pending | — | — | — |
 | 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | pending | — | — | — |
+| 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | pending | — | — | — |
 
 ## Decision log
 
@@ -283,6 +284,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D82.** pending the board
 
 **D83.** pending the board
+
+**D84.** chosen final source unless a later run beats it
 
 ## What didn't work
 

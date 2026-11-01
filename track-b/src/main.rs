@@ -691,13 +691,13 @@ fn list_phrases(plan: &mut Plan, anchored: &[(u32, (u32, u32))], new_number: &[u
 /// check at each term's occurrences.
 fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let df = sample_terms(docs, &plan.terms, threads);
-    // A query goes by blocks if its anchors hold about N/24 documents in all, where running it on every
+    // A query goes by blocks if its anchors hold about N/48 documents in all, where running it on every
     // block starts to cost less than its checks at all those documents. A term in such a query has a row
     // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
     // cost less than listing its first occurrence in each document that holds it. Any choice gives
     // the same answers. `df[0]` is about how many documents the sample has.
     let by_blocks =
-        |anchors: &[u32]| anchors.iter().map(|&t| df[t as usize]).sum::<u32>() * 24 >= df[0];
+        |anchors: &[u32]| anchors.iter().map(|&t| df[t as usize]).sum::<u32>() * 48 >= df[0];
     let rowed = |term: u32| df[term as usize] * 48 >= df[0];
     // How each term is stored, and what its word holds beyond its number.
     let (mut store_of, mut flags) = (vec![NEITHER; df.len()], vec![0; df.len()]);

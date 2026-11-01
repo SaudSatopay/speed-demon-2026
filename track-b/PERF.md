@@ -66,6 +66,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 32 | Queries with common anchors answered in the scan, 256 documents at a time, in vectors, with no bitmaps of the corpus and no chains | Bitmaps and chains held 18 of 42 MB, and were only read after the scan. A pass over a query's terms costs the same in vectors over a block's columns, which a thread reuses, and M is K^0.20 | pending | — | — | — |
 | 33 | exp: block queries at anchors holding N/48 documents, not N/96 | A thread's columns take 216 KB of L2 at N/96, read and cleared each block, and the box's L2 is 1.25 MB per core for two threads. Local cycles rank instruction cuts, not this | pending | — | — | — |
 | 34 | exp: block queries at anchors holding N/24 documents, not N/48 | N/48 read T 0.0909 against 0.0996 at N/96, though local cycles rose 1.5%, so what a block's queries cost on the box isn't what local cycles say | pending | — | — | — |
+| 35 | Block queries at anchors holding N/48 documents | Board: N/96 T 0.0996, N/48 T 0.0909, N/24 T 0.0942, one sample each, and local cycles ranked them the other way round: 2.10G, 2.13G, 2.16G | pending | — | — | — |
 
 ## Decision log
 
@@ -138,6 +139,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D34.** Measurement of what columns cost on the box. N/48 has 28% fewer columns, for +1.5% local cycles. Against T 0.0996.
 
 **D35.** Measurement. N/24 has fewer queries and columns again. Against T 0.0909.
+
+**D36.** Decided by the board, and a second sample of N/48. Fewer block queries cost less on the box than local cycles say, as a block's columns and tallies go through a cache shared by two threads at 2.5 GHz, and N/24 leaves more checks. No new lines.
 
 ## What didn't work
 

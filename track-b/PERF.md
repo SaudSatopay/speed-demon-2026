@@ -80,6 +80,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 44 | Back to the build without a cache line per tally's limit | A line per limit: median K 41.37 over 3 runs at M 29.6 MB, against 41.63 over 4 for this source | run-763c4b4ded66 | 0.0732 | 26.2 | K 42.06, the source of step 42 |
 | 45 | exp: a prefetch of a term's first hit word, beside the one of its checks | check_bools writes hits with no prefetch, and it has 24% of the cache misses. Local cycles flat | run-c00fb88f9c97 | 0.0766 | 28.3 | K median 41.10 over 3 runs: rejected |
 | 46 | Back to the build without the prefetch of hits | Prefetch of hits: median K 41.10 over 3 runs, against 41.80 over 5 for this source | pending, same source as step 42 | — | — | — |
+| 47 | exp: the corpus prefetched 8 blocks ahead, not 16 | The distance was tuned on a faster PC. The box runs at 2.5 GHz with memory about as fast, so a block takes longer there and a shorter lead may arrive in time and evict less | pending | — | — | — |
 
 ## Decision log
 
@@ -176,6 +177,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D46.** Experiment: judged by median K over at least 3 board runs
 
 **D47.** Reverted
+
+**D48.** Experiment: judged by median K over at least 3 board runs against 41.49 over 10
 
 ## What didn't work
 

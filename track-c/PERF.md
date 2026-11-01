@@ -192,6 +192,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 156 | c-f40 table freed before output, sample 1 | local peak steady at 9.44 MB, worst of 5 sets M | pending | — | — | — |
 | 157 | c-f40 sample 2 | second sample | pending | — | — | — |
 | 158 | c-f40 sample 3 | third sample | pending | — | — | — |
+| 159 | c-p4 packed slots at three huge pages plus small ones, sample 1 | memory: local peak 8.12 MB | pending | — | — | — |
 
 ## Decision log
 
@@ -511,6 +512,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D157.** exp: judged over 3 samples against c64f 46.87
 
 **D158.** exp: judged over 3 samples against c64f 46.87
+
+**D159.** exp: local T +5 to 10 percent, so the board decides
 
 ## What didn't work
 

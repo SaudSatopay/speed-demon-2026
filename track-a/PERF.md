@@ -69,6 +69,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 47 | exp: every piece read twice | Where the time goes on the box | pending | — | — | — |
 | 48 | exp: each hour finished twice | Where the time goes on the box | pending | — | — | — |
 | 49 | exp: the round run twice | Where the time goes on the box | pending | — | — | — |
+| 50 | Back to the build before the measurements | The phase measurements are done | pending | — | — | — |
 
 ## Decision log
 
@@ -166,6 +167,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D41. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
 
 **D42. Measurement only: T minus T without this is that phase's wall time on the box. Reverted when the series ends.
+
+**D43. Revert the experiments.
 
 **A19. Bound pending ready-hour output and recycle buffers.** Context: parallel workers can finish later hours before the next required hour, so formatted text can accumulate while writes stay ordered. Chose a 1 MiB cap on pending buffer capacities, except the next required hour may complete to avoid deadlock; a Condvar wakes workers as output advances, and a bounded pool recycles cleared Vecs. Evidence: full 44/44, thread 234/234, constant-hash tiny 20/20, and offline Docker/pre-push 44/44 (30 MB). Sample counts stay nearly flat (360.1 -> 360.4 instructions/request; 1.67 mispredicts unchanged). Nine alternating fresh-cgroup full runs lower median peak 20.37 -> 20.18 MB, paired median reduction 0.18 MB, with unchanged 10,113,024-byte output. Official board `run-c642196285de` measured T 0.025 s, M 22.3 MB and K 43.85, versus prior best `run-aff4e4cbccae` at T 0.025 s, M 21.0 MB and K 44.89. Outcome: rejected and source reverted because K fell and memory rose.
 

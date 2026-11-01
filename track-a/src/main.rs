@@ -508,8 +508,6 @@ fn main() -> std::io::Result<()> {
     let round = |share| round(&log, arg(2, "/out").as_ref(), threads, share);
     // A 48th of the log is several times the disorder that the spec's shards make. If it's not enough,
     // the second round has no hour due until the log is done.
-    // exp: the whole round runs twice, the second time over the first's file, so T less T without
-    // it is one round's wall time, and the rest is startup and exit.
-    _ = (round(48)? || round(1)?) && (round(48)? || round(1)?);
+    _ = round(48)? || round(1)?;
     Ok(())
 }

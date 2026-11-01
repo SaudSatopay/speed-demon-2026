@@ -97,6 +97,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 62 | Tuning meant for older CPUs lifted: no zeroing instruction before each bit count, three-part LEAs kept whole | Found on C by reading its hot loop's assembly: for the generic target, LLVM clears the output of TZCNT, LZCNT and POPCNT first, against a false dependency that the box's cores don't have | run-31de111c1289 | 0.0186 | 16.1 | 86.3 |
 | 63 | Cold paths marked in the parse, the error flag loaded at the record, no per-line minimum, digits by a saturating subtract, and a big rank's lookup only when needed | Instructions were still falling short of cycles on the parse's common path, and each rank lookup and minimum ran for lines that never needed it | run-72e32e5bf5cf (with `e7232af`) | 0.0192 | 16.0 | 85.9 |
 | 64 | exp: reads lined up in a cache line, on a fixed base | A cache change, flat locally, which only the board can judge: reads that start on a line's boundary copied faster on the box in D55 and D60 | run-5079da8ddddb (with `8f4bd27`) | 0.0184 | 16.0 | 86.3 |
+| 65 | exp: the log mapped with one prefetch per line, and all threads sharing the release of its pages before exit | The clock runs to exit, and exit releases a mapped log's pages one by one on one thread. Earlier mapped builds carried that cost, and they lost to pread by 1 ms or more, so test mapping without it. The kernel's pread path is about 45% of thread time on the box | pending | — | — | — |
 
 ## Decision log
 
@@ -227,6 +228,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D63.** Local, seed 1: user cycles 278.7M to 268.5M, instructions 491.5M to 456.0M, mispredicts flat at 0.86M, M flat, S +9. Grid 44/44, threads 234/234, const-hash 39/39, stress 0 wrong in 300. Also measured and dropped: two radix passes with a fix-up (cycles +3.9 to +7.5%, S +19), a free list of arrays (-1.6% with 4 spares, S +14; -5% with all of them, M +5.5 MB), MADV_POPULATE_WRITE (cycles flat, M up), grouped frees, 16 KiB pieces (kernel cycles +10 to 19%), counting errors in the count scan (-0.7%), non-PIE, exit at the last write.
 
 **D64.** Measurement, S +4, against T 0.0187 to 0.0192 at S 373. Grid, threads, const-hash, stress pass.
+
+**D65.** Experiment, to judge the input path on the board with 3 samples. The log is mapped; one prefetch per line, 1,536 bytes ahead; threads that are done take its pages out of the address space with MADV_DONTNEED, 8 MiB at a time from the log's start, so exit finds few left. Local: paired wall -1.5 ms of 15.2 under load, the release itself flat there.
 
 ## What didn't work
 

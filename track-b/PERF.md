@@ -198,6 +198,7 @@ This PC's wall time is noisy, so thread cycles from `perf stat`, which repeat to
 | A table of 1<<17 sets, one of 1<<15, non-temporal prefetch of sets, sets prefetched a document ahead | Fewer misses | Worse by 4%, 6%, 2% and 3% | local, D37 | not kept |
 | Each thread's own first ten ids per tally, so no locks in the scan | Fewer cache-line transfers, spending memory that scores nothing | T 0.0804 against 0.075, M 46.5 MB, K 39.73 against 41.46 | `run-35f97fe72a66`, `run-bd5defba895e`, `run-824503bf4037` | reverted (D41) |
 | A cache line per tally's limit, to end false sharing between the limits; a prefetch of a term's first hit word | Fewer misses, for memory that scores nothing | K 41.37 and 41.10, 3 runs each, against 41.80 over 5. Local cycles flat for both | `run-fbce98a5f127`, `run-c00fb88f9c97` | reverted |
+| Fewer lines: no phrase neighbour test (about 14 lines), no anchor kinds in the numbering (2 lines), struct literals and asserts on one line | S down with T flat | Cycles +1.8% and misses +5% without the neighbour test, +2.5% and +4% without the kinds, each more K lost than S gains. rustfmt expands the one-line literals, so those added lines | local, 7 to 9 alternating runs | not kept |
 | One round of threads for parse and scan, the plan on threads, a prefault of the heap, mapped output, skipping the empty sets (12% of them), clearing only the columns used | Shorter serial parts and fewer misses | One round +1 ms, skipping empty sets +1.5%; the others no gain | local, D38 | not kept |
 
 ## The final design

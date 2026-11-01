@@ -160,6 +160,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 124 | exp: 3seg, sample 10 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
 | 125 | exp: h125k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 | 126 | exp: h140k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
+| 127 | exp: h125k, sample 2 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 
 ## Decision log
 
@@ -415,6 +416,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D125.** Median of three decides against 46.13
 
 **D126.** Median of three decides against 46.13
+
+**D127.** Median of three decides against 46.13
 
 ## What didn't work
 

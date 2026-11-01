@@ -188,6 +188,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 152 | c64f 64-byte slots at 104500 homes, sample 1 | memory: local peak 10.26 to 9.47 MB, S -3 | pending | — | — | — |
 | 153 | c-pack2 sample 2 | second sample | pending | — | — | — |
 | 154 | c64f sample 2 | second sample | pending | — | — | — |
+| 155 | c64f sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -499,6 +500,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D153.** exp: judged over 3 samples against c-c3
 
 **D154.** exp: judged over 3 samples against c-c3
+
+**D155.** exp: judged over 3 samples against c64f 46.87
 
 ## What didn't work
 

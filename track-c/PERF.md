@@ -194,6 +194,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 158 | c-f40 sample 3 | third sample | pending | — | — | — |
 | 159 | c-p4 packed slots at three huge pages plus small ones, sample 1 | memory: local peak 8.12 MB | pending | — | — | — |
 | 160 | c64f restored | c64f median K 46.64 over 4, c-f40 46.66 over 3 for one more line, so level | pending | — | — | — |
+| 161 | c-k1 find walks hits and free slots in one loop, plain spin, 11 lines cut, sample 1 | S 352 to 341 with hot code unchanged | pending | — | — | — |
 
 ## Decision log
 
@@ -517,6 +518,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D159.** exp: local T +5 to 10 percent, so the board decides
 
 **D160.** c64f is the chosen source
+
+**D161.** exp: judged over 3 samples against c64f 46.64
 
 ## What didn't work
 

@@ -613,6 +613,7 @@ struct Plan<'a> {
     terms: TermTable<'a>,
     queries: Vec<Query>,
     steps: Vec<u32>,     // All the queries' steps, one query after another.
+    range_size: usize,   // How many bytes of the corpus a thread claims at a time.
     rowed_count: usize,  // How many terms have rows...
     sparse_count: usize, // ...and how many have columns without them.
     // A term's phrases are `phrases[phrase_start[t].0..phrase_start[t + 1].0]`. If it's just one, of two or more
@@ -690,6 +691,9 @@ const DF_CAP: u32 = 255;
 /// check at each term's occurrences.
 fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     let df = sample_terms(docs, &plan.terms, threads);
+    // About a block's documents, a little under, as a block that a range cuts short costs a whole pass.
+    let sampled = (1 << 21).min(docs.len());
+    plan.range_size = sampled / df[0].max(1) as usize * (BLOCK_DOCS as usize - 8) + 1;
     // A query goes by blocks if its anchors hold about N/32 documents in all, where running it on every
     // block starts to cost less than its checks at all those documents. A term in such a query has a row
     // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
@@ -1352,9 +1356,6 @@ fn wait_for_all(here: &AtomicUsize, threads: usize) {
 /// all are done. Then the totals, before any printing. Then threads claim batches of queries in order, and
 /// each waits for the batch before it to reach the file.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progress, threads: usize) {
-    // 48 ranges per thread: enough that a thread slowed for a while holds no one up, and that all
-    // finish within a small part of the scan.
-    let range_size = docs.len() / (threads * 48) + 1;
     // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();
     scan.hits.resize(plan.tallies.len(), 0);
@@ -1364,7 +1365,7 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
     let mut lists = DocLists::default();
     lists.present = vec![0; plan.terms.count + 64];
     let mut rows = vec![[0; 64]; plan.rowed_count.div_ceil(64)];
-    while let Some(range) = claim(&progress.next_range, range_size, docs.len()) {
+    while let Some(range) = claim(&progress.next_range, plan.range_size, docs.len()) {
         let (mut first_doc, mut in_block) = (0, 0);
         for_each_doc(docs, range.start, range.end, |doc, text, edges| {
             first_doc = if in_block == 0 { doc } else { first_doc };

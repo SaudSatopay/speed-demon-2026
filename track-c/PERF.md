@@ -135,6 +135,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 99 | exp: mapped file without the prefetch per block | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway. Two lines | pending | — | — | — |
 | 100 | exp: text prefetch back on the mapped file | Without it four samples gave median T 0.0201 and K 45.04 | pending | — | — | — |
 | 101 | exp: 12 segments per thread on the mapped file | Each segment now costs one release with a TLB shootdown to every thread, not two reads, so fewer may pay | pending | — | — | — |
+| 102 | exp: 6 segments per thread on the mapped file | 12 gave K 45.58 on one sample; this shows the trend of fewer releases against worse balance | pending | — | — | — |
 
 ## Decision log
 
@@ -340,6 +341,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D100.** No-prefetch rejected, two lines do not pay
 
 **D101.** Follow up only if clearly above the mapped samples
+
+**D102.** Compare with 12 and 24
 
 ## What didn't work
 

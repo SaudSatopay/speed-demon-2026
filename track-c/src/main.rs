@@ -19,7 +19,7 @@
 
 #![no_main]
 
-use std::arch::x86_64::*;
+use std::arch::{asm, x86_64::*};
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
 use std::{fs::File, os::unix::fs::FileExt, ptr::null_mut, sync::Mutex, thread};
@@ -43,7 +43,7 @@ unsafe extern "C" {
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
 const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
-const PIECE: usize = 1 << 15;
+const PIECE: usize = 1 << 14;
 
 /// An input file, read in parts: its size, and the file.
 struct Input(usize, File);
@@ -144,13 +144,9 @@ const REGION_IDS: usize = 1_000_001;
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 72 << 10;
-/// Words per name, in the keys and again in the bits: a key, and 256 bits, one per country.
-const SLOT_WORDS: usize = 4;
-/// Marks per batch, which fills a cache line.
-const BATCH: usize = 16;
-/// Parts of the bits, each with its own lock: a thread rarely has to wait for one, and 2,048 names each.
-const PARTS: usize = 64;
+const STACK: usize = 52 << 10;
+/// Words per slot, which is one cache line: four words of key, then 256 bits.
+const SLOT_WORDS: usize = 8;
 /// Names longer than this are kept elsewhere: their slot holds a pointer and a length, and `LONG` in
 /// its last key word, which no key can equal, since names have no zero bytes (spec section 2.2). No
 /// generated name has been seen beyond 25 bytes.
@@ -172,8 +168,6 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 struct NameTable<'a> {
     records: &'a Input,
     words: &'static [AtomicU64],
-    bits: &'static [AtomicU64],
-    locks: &'static [Lock],
     tags: &'static [AtomicU8],
     regions: &'static [AtomicU8], // The join table, country indices by region id.
     stacks: usize,                // Where the first worker's stack starts.
@@ -186,10 +180,8 @@ struct NameTable<'a> {
 impl<'a> NameTable<'a> {
     fn new(records: &'a Input, slots: usize, threads: usize) -> Self {
         let tags = slots + 32;
-        let (bits_at, tags_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 16);
-        let regions_at = tags_at + tags;
-        let locks_at = (regions_at + REGION_IDS).next_multiple_of(64);
-        let stacks_at = (locks_at + PARTS * 64).next_multiple_of(4096);
+        let (tags_at, regions_at) = (tags * SLOT_WORDS * 8, tags * SLOT_WORDS * 8 + tags);
+        let stacks_at = (regions_at + REGION_IDS).next_multiple_of(4096);
         let bytes = stacks_at + (threads - 1) * STACK;
         let (read_write, private_anon, huge) = (3, 0x22, 1 << 21);
         let (mut allowed, mut here) = ([0u64; 16], [0u64; 16]);
@@ -211,8 +203,6 @@ impl<'a> NameTable<'a> {
             NameTable {
                 records,
                 words: std::slice::from_raw_parts(base.cast(), tags * SLOT_WORDS),
-                bits: std::slice::from_raw_parts(base.add(bits_at).cast(), tags * SLOT_WORDS),
-                locks: std::slice::from_raw_parts(base.add(locks_at).cast(), PARTS),
                 tags: std::slice::from_raw_parts(base.add(tags_at).cast(), tags),
                 regions: std::slice::from_raw_parts(base.add(regions_at).cast(), REGION_IDS),
                 stacks: base.add(stacks_at) as usize,
@@ -280,7 +270,8 @@ impl<'a> NameTable<'a> {
         unsafe { _mm256_loadu_si256(self.tags.as_ptr().add(home).cast()) }
     }
 
-    /// Guesses the name's slot from the tags, and asks for its key's line. A wrong guess costs a
+    /// Guesses the name's slot from the tags, and asks to own its line, for a write: a locked update
+    /// then needs no second trip to take it from the core that wrote it last. A wrong guess costs a
     /// search. A name's tag is the low byte of its hash, or 1 for zero, which means free; here a zero
     /// finds a free slot, which is a wrong guess too, and costs one name in 256 less than a check.
     /// It returns the slot's offset in bytes.
@@ -288,7 +279,7 @@ impl<'a> NameTable<'a> {
         let hits = Self::slots_with(self.window(home), tag);
         let at = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
         // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.words.as_ptr().byte_add(at).cast()) };
+        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().byte_add(at).cast()) };
         at as u32
     }
 
@@ -376,56 +367,6 @@ impl<'a> NameTable<'a> {
         }
         self.full.store(true, Relaxed);
         0
-    }
-}
-
-/// A part of the bits is taken with this, on a cache line of its own.
-#[repr(align(64))]
-struct Lock(AtomicBool);
-
-/// One thread's marks of names seen in countries, waiting to be written. A locked write per record is
-/// the largest single cost on the scoring box, so a thread collects a cache line of marks for one part
-/// of the bits, and writes them under one lock. A mark is its bit number: 256 bits per name.
-struct Marks {
-    filling: [[u32; BATCH]; PARTS],
-    filled: [u8; PARTS],
-}
-
-impl Marks {
-    /// Marks a name, by its key's offset, as seen in a country.
-    fn mark(&mut self, names: &NameTable, at: usize, country: u8, rows: &mut Rows) {
-        let part = (at >> 16) % PARTS;
-        let filled = usize::from(self.filled[part]);
-        self.filling[part][filled] = (at as u32) << 3 | u32::from(country);
-        self.filled[part] += 1;
-        if filled + 1 == BATCH {
-            self.write(names, part, rows);
-        }
-    }
-
-    /// Writes a part's marks, and adds one to a country's repeats for each whose bit was set already.
-    #[inline(never)]
-    fn write(&mut self, names: &NameTable, part: usize, rows: &mut Rows) {
-        let marks = &self.filling[part][..usize::from(self.filled[part])];
-        self.filled[part] = 0;
-        for &mark in marks {
-            let word = &names.bits[mark as usize >> 6];
-            // SAFETY: prefetching has no effect on memory, and it saves waiting under the lock.
-            unsafe { _mm_prefetch::<_MM_HINT_ET0>(std::ptr::from_ref(word).cast()) };
-        }
-        let lock = &names.locks[part].0;
-        while lock.swap(true, Acquire) {
-            while lock.load(Relaxed) {
-                thread::yield_now();
-            }
-        }
-        for &mark in marks {
-            let (word, bit) = (&names.bits[mark as usize >> 6], mark & 63);
-            let old = word.load(Relaxed);
-            word.store(old | 1 << bit, Relaxed);
-            rows[mark as usize & 255].0[6] += (old >> bit & 1) as i64;
-        }
-        lock.store(false, Release);
     }
 }
 
@@ -518,14 +459,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
 }
 
 /// Parses the records in `pos..end`, adding each to its country's row.
-fn parse_records(
-    mut pos: usize,
-    end: usize,
-    names: &NameTable,
-    rows: &mut Rows,
-    room: &mut [u8],
-    marks: &mut Marks,
-) {
+fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
     let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
@@ -546,14 +480,7 @@ fn parse_records(
                 count += 1;
             }
             let records = (count - 1) / 5;
-            add_records(
-                text,
-                &listed[..=records * 5],
-                &mut found,
-                names,
-                rows,
-                marks,
-            );
+            add_records(text, &listed[..=records * 5], &mut found, names, rows);
             // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
             // copy moves them, where a call to copy just the right number would cost more.
             listed.copy_within(records * 5..records * 5 + 8, 0);
@@ -569,14 +496,7 @@ fn parse_records(
 
 /// Adds up a chunk of whole records from `text`, given where they start and the positions just past
 /// each one's five separators.
-fn add_records(
-    text: &[u8],
-    listed: &[u32],
-    found: &mut Found,
-    names: &NameTable,
-    rows: &mut Rows,
-    marks: &mut Marks,
-) {
+fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable, rows: &mut Rows) {
     let records = listed.len() / 5;
     let positions = |record: usize| {
         // SAFETY: the caller passes `records * 5 + 1` positions.
@@ -675,7 +595,11 @@ fn add_records(
             } else {
                 names.find(text, start, name.saturating_sub(2))
             };
-            marks.mark(names, at, country, rows);
+            // Nine records in ten set a new bit, so a plain load first would rarely save the locked
+            // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
+            // leaves the old bit in the carry, which adds one to the row's repeats if it had been set.
+            asm!("lock bts [{} + {} + 32], {}", "adc qword ptr [{} + 48], 0",
+                in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
         }
     }
 }
@@ -744,19 +668,12 @@ fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> T
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        let mut marks = Marks {
-            filling: [[0; BATCH]; PARTS],
-            filled: [0; PARTS],
-        };
         run_jobs(&segments, threads * SEGMENTS, |at| {
             let (pos, end) = records.part(threads * SEGMENTS, at, b"\r\n");
             if !names.full.load(Relaxed) {
-                parse_records(pos, end, &names, &mut rows, &mut room, &mut marks);
+                parse_records(pos, end, &names, &mut rows, &mut room);
             }
         });
-        for part in 0..PARTS {
-            marks.write(&names, part, &mut rows);
-        }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             for i in [0, 2, 4, 5, 6, 7] {
                 total[i] += row[i];

@@ -529,7 +529,9 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
             // A byte order mark can only start a record here, and no record otherwise starts with it.
-            (*text.get_unchecked(start) == 0xEF).then(|| start += 3);
+            if *text.get_unchecked(start) == 0xEF {
+                start = std::hint::black_box(start + 3); // Keeps it a branch: one record in 4,000.
+            }
             // Moves the digits of the field at `start` to the top of a word, with zeros below them.
             let id = load_u64(text, start) << (8 * (start + 1 - name_at) as u32 & 63);
             // At most 7 digits (spec section 2.2), and the comma below them counts as a zero.
@@ -562,7 +564,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         // These hardly ever change, so branches beat conditional moves and two stores.
         (cents < row[1]).then(|| row[1] = cents);
         (cents > row[3]).then(|| row[3] = cents);
-        let (name, both) = (note_at - name_at - 1, region_at - name_at - 1);
+        let (name, both) = (
+            (note_at - name_at - 1) as u32 as usize,
+            region_at - name_at - 1,
+        );
         // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
         // for a count of 64.
         let (name_quotes, quotes) = if both <= 64 {
@@ -577,10 +582,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         };
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
-        let less_delimiter = |field: usize| (field - usize::from(field != 0)) as i64;
-        let name_field = name - name_quotes / 2;
-        row[5] += less_delimiter(name_field);
-        row[7] += less_delimiter(both - 1 - quotes / 2 - name_field);
+        row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
+        row[7] += (both - name - 1 - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
         let (start, len) = (name_at + 1, name.wrapping_sub(2));
         // SAFETY: `guess` came from `guess_slot`, and `find` returns a slot too. The name starts
         // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.

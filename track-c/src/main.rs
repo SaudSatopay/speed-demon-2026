@@ -160,10 +160,10 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 /// a lookup costs one cache miss, with no probing through other names' lines. A name's home is a slot,
 /// and one vector holds the tags of the 32 slots from there, so it costs the same in any of them, with
 /// no branch. Only when all are full does it move on 32 slots. A home for every slot, not every few,
-/// leaves far fewer names outside their first 32. Names are compared in full, and never unescaped: the raw bytes encode the
-/// value one to one. The slots are insert-only: a key's words go from zero to their final value once,
-/// and a key has no zero bytes, so a slot that compares equal is complete. A name that gets no slot
-/// goes to a locked set instead. A full window stays full, so that name never gets one later.
+/// leaves far fewer names outside their first 32. Names are compared in full, as raw bytes, which
+/// encode the value one to one. The slots are insert-only: a key's words go from zero to their final
+/// value once, and a key has no zero bytes, so a slot that compares equal is complete. A name that
+/// gets no slot goes to a locked set instead. A full window stays full, so it never gets one later.
 struct NameTable<'a> {
     records: &'a Input,
     words: &'static [AtomicU64],
@@ -529,7 +529,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
         row[7] += (both - name - 1 - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
         let (start, len) = (name_at + 1, name.wrapping_sub(2));
-        // SAFETY: `guess` came from `guess_slot`, and `find` returns a slot too. The name starts
+        // SAFETY: `guess` came from the first pass, and `find` returns a slot too. The name starts
         // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.
         unsafe {
             let at = if len <= INLINE_BYTES

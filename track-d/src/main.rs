@@ -3,11 +3,11 @@
 //! Threads parse the mapped graph twice, in batches with prefetching. The first pass counts each
 //! node's edges and keeps a few neighbours, enough to renumber the nodes so that neighbours sit close
 //! in memory. The second places the edges into a compressed adjacency array, so no temporary edge
-//! list is ever held. The queries come next, and with them known, low-degree nodes that none of them
-//! starts or ends at are removed, joining their neighbours by shortcuts. Sweeping the smaller array,
-//! where neighbours are close, then fills the reverse array with hardly a cache miss. Threads then claim queries from an atomic counter, each
-//! with its own search state, and run a two-ended Dijkstra that gives both sides equal work. Answers
-//! go into a slot per query, so the output order doesn't depend on scheduling.
+//! list is ever held. With the queries known, low-degree nodes that none of them starts or ends at are
+//! removed, joining their neighbours by shortcuts. Sweeping the smaller array, where neighbours are
+//! close, then fills the reverse array with hardly a cache miss. Threads claim queries from an atomic
+//! counter, each with its own search state, and run a two-ended Dijkstra that gives both sides equal
+//! work. Answers go into a slot per query, so the output order doesn't depend on scheduling.
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -224,12 +224,12 @@ fn local_numbering(records: &[AtomicU32], bits: u32, threads: usize) -> (Words, 
     (numbers, out_counts)
 }
 
-/// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
-/// An arc packs its neighbour and its weight into 32 bits, with as many weight bits as the node count
-/// leaves. The highest value means the weight is in `heavy`, sorted by arc number once the graph is
-/// built.
+/// Heavy weights as threads find them, by arc number, until `seal` moves them into `heavy`.
 static SPILLED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 
+/// A compressed adjacency array: the arcs leaving `node` are `arcs[offsets[node]..offsets[node + 1]]`.
+/// An arc packs its neighbour and its weight into 32 bits, with as many weight bits as the node count
+/// leaves. The highest value means the weight is in `heavy`, sorted by arc number once it's built.
 struct Graph {
     offsets: Words,
     arcs: Words,

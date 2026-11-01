@@ -1,13 +1,14 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Ours is in the last row of [the journey](#the-journey).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-73a8aecd2907`: **0.0200 s / 10.4 MB**, K **44.29** and **82.3** speed points. That's one of 5 runs of the final source, which gave T 0.0200 to 0.0215 s, M 10.3 to 10.7 MB and a median K of 44.00 (D84).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
 - S is 446 code lines on the board's last run, against the reference's 108, which costs about 5 speed points. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: one pass took out 56 cold lines, and S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise below. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`).
-- T moved between 0.0200 and 0.0207 over today's board runs from `7d61093` on, except `e7232af`, which we rejected at 0.0212. On one source, `7d61093` and its second sample `7ca3b51`, T was 0.0200 and 0.0204 and M 10.44 and 11.04 MB, so gains under about 3% in T need several samples.
+- T moved between 0.0200 and 0.0207 over today's board runs from `7d61093` on, except `e7232af`, `c036bab` and `a17ec2a`, which we rejected at 0.0212, 0.0211 and 0.0215. On one source, `7d61093` and its second sample `7ca3b51`, T was 0.0200 and 0.0204 and M 10.44 and 11.04 MB, so gains under about 3% in T need several samples.
+- On Sunday Nov 1, NickTrapp leads this track with K 47.50 at T 0.018, M 12.8 and S 303. Against us, their lines are worth about 6% of K and their time about 5%, and we get about 4% back on M. We don't know how they reach that T with that S: the board shows only the numbers.
 
 ## What the box taught us
 
@@ -19,6 +20,8 @@ The box is an Intel i5-13500: Golden Cove P-cores, a 48 KB L1 that two threads s
 - **Claiming pieces instead of segments loses about 3%.** `5cf2c6d` and `9364e41` had each thread claim one 31 KiB piece at a time (`run-eac7456d8237`, `run-7614b1a9fa91`): T 0.0206 and 0.0207 against 0.0200, C over D 0.1420 and 0.1410 against 0.1364, and K 43.26 and 43.39 against 43.74, though they were 10 and 23 lines shorter. Rejected.
 - **The BOM by arithmetic loses too.** `e7232af` dropped the byte order mark branch and counted quotes in a closure: T 0.0212 and C over D 0.1464 in one run (`run-a1af68b512ae`), for 7 lines fewer than `28c4157` (T 0.0206, `run-8bd4c7d3275e`). Rejected.
 - **One source moves about 2% in T and up to 6% in M.** `bfba195` (the locked set for names with no slot, no pin, line trims) gave T 0.0204, M 10.46, S 446 and K 43.88, the best K of any scored run of this track (`run-13115bed748f`). `7ca3b51` ran `7d61093`'s source again and gave T 0.0204, M 11.04 and K 42.89 (`run-6cee893dbf6c`), against T 0.0200, M 10.44 and K 43.74 the first time.
+- **The region prefetch pays, though the tag prefetch didn't.** `a17ec2a` dropped it (`run-34c6a4bf2815`): T 0.0215 and C over D 0.148, for one line less. The join table is nine times the size of the tags, which may be why, but we didn't measure that. Rejected.
+- **More segments don't pay.** `c036bab` used 48 segments per thread instead of 24 (`run-4b4240212d91`): T 0.0211 and C over D 0.1435. First to last finish is only about 600 us, so halving it could gain little, and each segment costs two small reads and a short piece. One sample, so it may be noise, but nothing says it helps. Rejected.
 
 ## Where the reference spends its time
 
@@ -112,9 +115,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 79 | Best source again, c-v91, as a second sample | Every build since has T near 0.0206 against its one sample of 0.0200, so this shows whether that was luck or the box drifting | run-6cee893dbf6c | 0.0204 | 11.0 | 81.6 |
 | 80 | exp: the locked set, no pin, and two line trims with the BOM branch kept | c-v91 re-sampled at T 0.0204 M 11.04, so T moves 2% and M 6% on one source, and the removals look neutral; this is a second sample of them | run-98bd53a6de8f | 0.0206 | 10.4 | 82.0 |
 | 81 | The slot guess written in the record loop, and three statements on fewer lines | Seven fewer lines locally (S 452 -> 446 on the board) with the same instructions per record, and a third sample of the locked set with no pin | run-13115bed748f | 0.0204 | 10.5 | 82.1 |
-| 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | pending | — | — | — |
-| 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | pending | — | — | — |
-| 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | pending | — | — | — |
+| 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | run-34c6a4bf2815 | 0.0215 | 10.4 | 81.6 |
+| 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | run-4b4240212d91 | 0.0211 | 10.3 | 81.8 |
+| 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | run-918ea96eea72 | 0.0200 | 10.7 | 82.2 |
 
 ## Decision log
 
@@ -281,11 +284,11 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D81.** The slot guess is written in the record loop, and three statements are on fewer lines. Board `run-13115bed748f` (`bfba195`): T 0.0204, M 10.46, S 446 (-6), K 43.88, C over D 0.1348. Locally the instructions per record are the same. It is the third sample of the locked set with no pin, and the three agree at T 0.0204 to 0.0207. K 43.88 is the best of any scored run of this track. Outcome: kept; it is the last row of the journey.
 
-**D82.** pending the board
+**D82.** exp: No prefetch of the region byte, because the tag prefetch loop had done nothing on the box. Board `run-34c6a4bf2815` (`a17ec2a`): T 0.0215, M 10.42, S 445 (-1), K 42.78, C over D 0.1482, against T 0.0200 to 0.0204 and C over D 0.126 to 0.138 for the source with it. Outcome: reverted, since one line doesn't pay for T up 5%.
 
-**D83.** pending the board
+**D83.** exp: 48 segments per thread instead of 24, with the region prefetch back, to halve the 600 us between the first and last thread's finish. Board `run-4b4240212d91` (`c036bab`): T 0.0211, M 10.28, S 446, K 43.22, C over D 0.1435. Outcome: reverted, since T rose where it should have fallen, on one sample, and the most it could gain is small.
 
-**D84.** chosen final source unless a later run beats it
+**D84.** Best source again, `~/sd-scan/c/c-v102` in our notes: 24 segments and the region prefetch. Board `run-918ea96eea72` (`b8d9d47`): T 0.0200, M 10.70, S 446, K 44.04. This source first ran at `bfba195` (`run-13115bed748f`, K 43.88), and its best is at `8e7eee2` (`run-73a8aecd2907`, K 44.29, the best of any scored run of this track). Over its 5 runs up to Nov 1: T 0.0200 to 0.0215, M 10.31 to 10.70, median K 44.00. Outcome: the final source.
 
 ## What didn't work
 
@@ -294,7 +297,6 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Counting distinct names in a second phase, one partition per thread, with no shared writes per record | Nearly every record sets a new country bit in a shared cache line, and the box's cross-core traffic is slow, so T should fall a lot | T 0.055 -> 0.059 s, M 14.2 -> 37.4 MB, K 24.35 -> 19.08. Shared bits weren't the bottleneck | run-be17f3a6a2e0 | reverted |
 | PREFETCHW for the name table's slot line | Most records write a line another core owns | ab.sh -3.6%, inside 16% noise, for S +5; the same idea did nothing on Track D | local | not applied |
 | Parsing `regions.csv` on several threads, with atomic table entries, a lock for new codes, and the table sized from the last line | The serial parse is about 4% of the run, about +2% K for about 12 lines | Regions phase, 41 paired runs: 1,193 -> 949 us at 12 threads, 1,194 -> 609 us at 4, 1,215 -> 598 us at 6; thread spawns eat the rest. Whole run unchanged (31,770 -> 31,946 us at 4 threads, 32,298 -> 32,086 at 6). S 339 -> 356 costs 0.74% K, and the phase's best case gives back +0.9%. Scorer, 3 runs each, median K 24.02 -> 24.24, with a range of 3% per side | local | reverted |
-
 | Parallel regions parser on current code: atomic byte table, code lock and region blocks | Cut the serial stage by parsing disjoint sorted-id ranges in parallel | Quick 59/59, thread sweep 324/324, constant-hash 29/29; counts 393.2 -> 393.0 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.85 misses. 41-pair full A/B was +3.5% (20.7% spread); three-run scorer K 26.63 -> 26.63 while S rose 315 -> 369 | local scratch | reverted |
 | Serial region-table preallocation from the sorted last id | Avoid repeated vector growth while parsing regions | Correctness gates pass; counts 393.2 -> 392.6 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.60 misses. 41-pair A/B +0.3% inside 27.9% spread. Matched scorer pairs disagreed: K 26.41 -> 27.34, then 26.99 -> 26.62; peak memory was not consistently lower and S rose 315 -> 326 | local scratch | reverted |
 
@@ -306,10 +308,22 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 
 ## How we know it's correct
 
-- Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 10 answer-preserving rewrites of the input and 4 limit cases.
-- A constant-hash test build, where every key collides, gives the same answers on tiny.
-- **Reproduce it yourself:** `python3 tools/verify.py` (Docker, git and Python only).
+- Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 20 answer-preserving rewrites of the input and 4 limit cases.
+- A constant-hash test build, where every key collides and the table has only 32 homes, so that names run out of slots and take the locked-set path, gives the same answers.
+- `quick.sh --threads "1 2 3 7 12 64"` on every build moves every cut, because segment sizes follow the thread count.
+- **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
+- The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `077d9b5`, run with `--full` on 2026-11-01 09:40 UTC against the organisers' harness at `7a9057b`:
+
+| Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
+|---|---|---|---|---|
+| C | 35/35 | 20/20 | 4/4 | yes |
 
 ## With another 24 hours
 
-To be written at freeze.
+The box showed that line fills per record set T here, more than instructions or the lock, so that's where we'd look.
+
+- **Tag windows that don't straddle a line.** A 32-byte window of tags from any slot crosses a cache line 31 times in 64. Homes on multiples of 32 would never cross, at the cost of more names outside their first window, in a table about 91% full. Never tried.
+- **`T0` for the slot prefetch.** It asks to own the line now (`ET0`). On a line many cores write, asking for it to read first might queue less. One word to test, and never tried on the box.
+- **Lines.** S is worth about 1% of K per 28 lines, and it's the largest part of what separates us from the leader. Removals of the big blocks mostly lost on the box, so what's left is many small ones, each needing several samples to tell from noise.
+- **A local machine like the box.** Local cycles on a Zen 4 ranked cache and lock changes wrongly, so each real answer took a board slot. A Golden Cove machine would have let us test far more of them.

@@ -184,6 +184,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 148 | c-c4 sample 3 | third sample | pending | — | — | — |
 | 149 | c-p1 populate each segment before parsing, sample 1 | faults per 16 pages cost kernel time, and text prefetch stops at unmapped pages | pending | — | — | — |
 | 150 | c-c3 restored | populate sample T 0.0196 K 45.92, no gain in one run, not proven worse | pending | — | — | — |
+| 151 | c-pack2 48-byte short slots packed across lines, 64-byte long ones, sample 1 | memory: local peak 10.22 to 8.65 MB | pending | — | — | — |
 
 ## Decision log
 
@@ -487,6 +488,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D149.** exp: judged over 3 samples against c-c3 46.40
 
 **D150.** c-c3 is the chosen source, median K 46.40 over 4
+
+**D151.** exp: judged over 3 samples against c-c3
 
 ## What didn't work
 

@@ -43,7 +43,7 @@ unsafe extern "C" {
 /// Zero bytes after the text in a buffer, so that block loads can run past its end.
 const PADDING: usize = 128;
 /// Bytes per read: little enough to stay in the caches, enough that a read costs little per record.
-const PIECE: usize = 1 << 14;
+const PIECE: usize = 1 << 15;
 
 /// An input file, read in parts: its size, and the file.
 struct Input(usize, File);
@@ -144,7 +144,7 @@ const REGION_IDS: usize = 1_000_001;
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
 /// Bytes of stack per thread, enough for its rows, buffer and lists.
-const STACK: usize = 52 << 10;
+const STACK: usize = 68 << 10;
 /// Words per slot, which is one cache line: four words of key, then 256 bits.
 const SLOT_WORDS: usize = 8;
 /// Names longer than this are kept elsewhere: their slot holds a pointer and a length, and `LONG` in
@@ -379,7 +379,7 @@ const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
-/// A record's home and hash, then its guessed slot, cents, and id and region together.
+/// A record's guessed slot, cents, and id and region together.
 type Found = [(u32, u32, u64); LISTED / 5];
 
 /// Segments per thread: when the segments run out, each thread still has its last to finish, and the
@@ -503,28 +503,9 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
         let six = unsafe { listed.as_ptr().add(record * 5).cast::<[u32; 6]>() };
         unsafe { six.read_unaligned() }.map(|position| position as usize)
     };
-    // The tags are the one load in a record's chain that the caches don't answer at once, and a
-    // thread's share of the core can't run far enough ahead to cover it, so each record's window is
-    // asked for a loop before its use, and the hash kept for that. The window may straddle two lines.
-    // A name is two bytes shorter than its field. An empty one without quotes wraps around here, and
-    // that only makes it a wrong guess, in one record out of 200.
-    for record in 0..records {
-        let [_, name_at, note_at, ..] = positions(record);
-        let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
-        // SAFETY: `found` has room for every record, the window is inside the tags, and prefetching
-        // has no effect on memory anyway.
-        unsafe {
-            let home = names.home(hash);
-            let window = names.tags.as_ptr().add(home);
-            _mm_prefetch::<_MM_HINT_T0>(window.cast());
-            _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
-            let slot = found.get_unchecked_mut(record);
-            (slot.0, slot.1) = (home as u32, hash);
-        }
-    }
     let (words, regions) = (names.words.as_ptr(), names.regions.as_ptr());
     for record in 0..records {
-        let [mut start, name_at, _, region_at, amount_at, _] = positions(record);
+        let [mut start, name_at, note_at, region_at, amount_at, _] = positions(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
@@ -545,8 +526,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
-            let (home, hash, _) = *found.get_unchecked(record);
-            let guess = names.guess_slot(home as usize, hash as u8);
+            let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
+            let guess = names.guess_slot(names.home(hash), hash as u8);
             let cents = (cents as i32 ^ negative) - negative;
             *found.get_unchecked_mut(record) = (guess, cents as u32, id_region);
         }

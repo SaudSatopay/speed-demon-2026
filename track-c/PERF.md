@@ -118,6 +118,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | run-34c6a4bf2815 | 0.0215 | 10.4 | 81.6 |
 | 83 | exp: 48 segments per thread instead of 24, region prefetch back | No region prefetch gave T 0.0215, so it stays; first to last finish is about 600 us, and twice the segments should halve that for a little more reading | run-4b4240212d91 | 0.0211 | 10.3 | 81.8 |
 | 84 | Best source again, c-v102 | 48 segments per thread gave T 0.0211, C over D 0.1435, and no region prefetch T 0.0215, C over D 0.148, so both go | run-918ea96eea72 | 0.0200 | 10.7 | 82.2 |
+| 85 | T0 for the slot prefetch | ask to read the line first, it might queue less on a contended line | pending | — | — | — |
 
 ## Decision log
 
@@ -289,6 +290,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D83.** exp: 48 segments per thread instead of 24, with the region prefetch back, to halve the 600 us between the first and last thread's finish. Board `run-4b4240212d91` (`c036bab`): T 0.0211, M 10.28, S 446, K 43.22, C over D 0.1435. Outcome: reverted, since T rose where it should have fallen, on one sample, and the most it could gain is small.
 
 **D84.** Best source again, `~/sd-scan/c/c-v102` in our notes: 24 segments and the region prefetch. Board `run-918ea96eea72` (`b8d9d47`): T 0.0200, M 10.70, S 446, K 44.04. This source first ran at `bfba195` (`run-13115bed748f`, K 43.88), and its best is at `8e7eee2` (`run-73a8aecd2907`, K 44.29, the best of any scored run of this track). Over its 5 runs up to Nov 1: T 0.0200 to 0.0215, M 10.31 to 10.70, median K 44.00. Outcome: the final source.
+
+**D85.** Test T0 in place of ET0 on the board, three samples.
 
 ## What didn't work
 

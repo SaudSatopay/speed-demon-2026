@@ -112,6 +112,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 79 | Best source again, c-v91, as a second sample | Every build since has T near 0.0206 against its one sample of 0.0200, so this shows whether that was luck or the box drifting | run-6cee893dbf6c | 0.0204 | 11.0 | 81.6 |
 | 80 | exp: the locked set, no pin, and two line trims with the BOM branch kept | c-v91 re-sampled at T 0.0204 M 11.04, so T moves 2% and M 6% on one source, and the removals look neutral; this is a second sample of them | run-98bd53a6de8f | 0.0206 | 10.4 | 82.0 |
 | 81 | The slot guess written in the record loop, and three statements on fewer lines | Seven fewer lines locally (S 452 -> 446 on the board) with the same instructions per record, and a third sample of the locked set with no pin | run-13115bed748f | 0.0204 | 10.5 | 82.1 |
+| 82 | exp: no prefetch of the region byte | The tag prefetch loop did nothing on the box, so this one may not either; one line and a few instructions per record | pending | — | — | — |
 
 ## Decision log
 
@@ -277,6 +278,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D80.** exp: The locked set, no pin and two line trims, with the BOM branch kept. Board `run-98bd53a6de8f` (`8f4bd27`): T 0.0206, M 10.40, S 452, K 43.62, C over D 0.1351. Against the two samples of `7d61093`'s source (T 0.0200 and 0.0204) that is level in T, for 31 lines fewer (S 483). Outcome: kept.
 
 **D81.** The slot guess is written in the record loop, and three statements are on fewer lines. Board `run-13115bed748f` (`bfba195`): T 0.0204, M 10.46, S 446 (-6), K 43.88, C over D 0.1348. Locally the instructions per record are the same. It is the third sample of the locked set with no pin, and the three agree at T 0.0204 to 0.0207. K 43.88 is the best of any scored run of this track. Outcome: kept; it is the last row of the journey.
+
+**D82.** pending the board
 
 ## What didn't work
 

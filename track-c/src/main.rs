@@ -481,7 +481,6 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
             let (id_region, cents) = parse_three([id, region, word << (64 - field)]);
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
-            _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
             let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong

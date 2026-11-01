@@ -144,6 +144,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 108 | exp: 6 segments per thread, sample 4 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
 | 109 | exp: 3 segments per thread, sample 2 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
 | 110 | exp: 6 segments per thread, sample 5 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
+| 111 | exp: 3 segments per thread, sample 3 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
 
 ## Decision log
 
@@ -367,6 +368,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D109.** Median of three decides
 
 **D110.** Median of three decides
+
+**D111.** Median of three decides
 
 ## What didn't work
 

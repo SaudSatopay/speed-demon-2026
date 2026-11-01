@@ -3,8 +3,7 @@
 //! Threads claim segments of the file from a shared cursor. Segments are cut just after a CRLF,
 //! because the spec promises that a CR appears nowhere else, so that is always a record boundary, and
 //! no quote counting is needed. The file is mapped, because a copy of it would take as long as much of
-//! the parse, and the threads give its pages back between them when they're done, because the exit
-//! would otherwise release them all on one thread, on the clock. The parser has two stages, because a
+//! the parse. The parser has two stages, because a
 //! parser that finds each field from the end of the last one is limited by that chain of loads, not
 //! by its instructions. The first stage walks fixed 64-byte blocks, and lists every comma and line end
 //! outside quotes. The second reads each record's fields from its five listed positions, and no record
@@ -526,7 +525,6 @@ extern "C" fn main() -> i32 {
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
-    let released = AtomicUsize::new(0);
     let work = || {
         while let Some((pos, end)) = part(lookup, &lines, line_parts, b"\n") {
             parse_regions(&lookup[pos..], end - pos);
@@ -541,17 +539,6 @@ extern "C" fn main() -> i32 {
         // the threads done first sit idle. Fine ones keep that short, and cost no shootdown.
         while let Some((pos, end)) = part(records, &segments, threads * 12, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
-        }
-        // Parsing is over, so each release can only stop threads still on their last segment, which a
-        // release per segment would do all run. Threads share the releases: the exit would do them on
-        // one. Any pages still in use just map again.
-        let chunk = records.len().div_ceil(threads * 3).next_multiple_of(4096);
-        let mut from = released.fetch_add(chunk, Relaxed);
-        while from < records.len() {
-            let len = chunk.min(records.len() - from);
-            // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
-            unsafe { madvise(records.as_ptr().add(from), len, 4) };
-            from = released.fetch_add(chunk, Relaxed);
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);

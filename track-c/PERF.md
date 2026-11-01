@@ -181,6 +181,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 145 | c-c3 sample 2 | second sample | pending | — | — | — |
 | 146 | c-c4 sample 2 | second sample | pending | — | — | — |
 | 147 | c-c3 sample 3 | third sample | pending | — | — | — |
+| 148 | c-c4 sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -478,6 +479,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D146.** exp: judged over 3 samples each, c-c3 against c-c4
 
 **D147.** exp: judged over 3 samples each, c-c3 against c-c4
+
+**D148.** exp: judged over 3 samples each, c-c3 against c-c4
 
 ## What didn't work
 

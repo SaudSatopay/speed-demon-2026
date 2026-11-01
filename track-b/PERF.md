@@ -83,6 +83,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 47 | exp: the corpus prefetched 8 blocks ahead, not 16 | The distance was tuned on a faster PC. The box runs at 2.5 GHz with memory about as fast, so a block takes longer there and a shorter lead may arrive in time and evict less | pending | — | — | — |
 | 48 | exp: the corpus prefetched 32 blocks ahead, in place of 8 | 8 blocks ahead read median K 40.40 over 3 runs against 41.49 over 14 at 16, so T is sensitive to this distance. This tests the other side | pending | — | — | — |
 | 49 | Back to the corpus prefetched 16 blocks ahead | 8 blocks ahead: median K 40.40 over 3 runs. 32 blocks ahead: 41.44 over 3. 16 blocks: 41.49 over 14 | pending | — | — | — |
+| 50 | Line cuts with no change of behaviour: a helper for locks and one for ids inlined, and a few statements shortened | A fresh read of the code found them. S -16 by rustfmt's count, instructions flat at +0.07% | pending | — | — | — |
 
 ## Decision log
 
@@ -185,6 +186,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D49.** Experiment: judged by median K over at least 3 board runs against 41.49
 
 **D50.** Reverted: 16 blocks stays
+
+**D51.** Kept for S, as nothing else changes
 
 ## What didn't work
 

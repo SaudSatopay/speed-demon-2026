@@ -42,7 +42,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 use std::{arch::x86_64::*, fs::File, io::Write, mem::zeroed, os::fd::AsRawFd, thread};
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
@@ -372,8 +372,7 @@ impl TermTable<'_> {
                 if ways == 0 && room {
                     term = next_term.fetch_add(1, Relaxed) as u32;
                     if (term as usize) < FIRST_TERM + TERMS_PER_SET * self.sets.len() {
-                        let way =
-                            [free.ilog2(), free.trailing_zeros()][usize::from(has_more)] as usize;
+                        let way = [free.ilog2(), free.trailing_zeros()][has_more as usize] as usize;
                         let at = (token.as_ptr() as usize - self.text.as_ptr() as usize) as u32;
                         if has_more {
                             let key = if long & LONG != 0 { LONG | at } else { long };
@@ -447,12 +446,6 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize) -> Plan<'_> {
 /// `look_up` takes this many tokens at a time for their keys, and twice this for their words.
 const LANES: usize = 4;
 
-/// The id that starts the line at `line`.
-fn id_at(docs: &[u8], line: usize) -> u32 {
-    let digits = docs[line..].iter().take_while(|&&byte| byte != b'\t');
-    digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'))
-}
-
 /// Visits the documents that start in the range `start..end` of the corpus, passing each one's id, its text
 /// and what follows, and its tokens' edges in that, then `2 * LANES` empty pairs of edges, so that `look_up`
 /// can read that many pairs at a time.
@@ -461,7 +454,9 @@ fn for_each_doc(docs: &[u8], start: usize, end: usize, mut visit: impl FnMut(u32
     while line > 0 && line < end && docs[line - 1] != b'\n' {
         line += 1;
     }
-    let (mut edges, mut id) = (Vec::new(), id_at(docs, line));
+    let digits = docs[line..].iter().take_while(|&&byte| byte != b'\t');
+    let mut id = digits.fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
+    let mut edges = Vec::new();
     while line < end {
         // The first token is the id, and the ids go up by one.
         let next = token_edges(docs, line, &mut edges) + 1;
@@ -559,8 +554,7 @@ fn make_check(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check {
         blocked |= u64::from(earlier.contains(&term)) * index_bits[slot];
     }
     let truth = ((table & !blocked) >> 32) as u32;
-    let [a, b, c, d, e, _] = terms;
-    let terms = [a, b, c, d, e];
+    let terms = *terms.first_chunk().expect("six slots");
     Check { truth, terms }
 }
 
@@ -631,12 +625,6 @@ struct Plan<'a> {
     tallies: Vec<Tally>,
 }
 
-/// Takes a lock. Only a panicking thread could poison the lock, and a panic aborts the process here,
-/// so there's no error to handle.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Puts a document among the smallest of a tally's answer. Returns `TOO_BIG` if it's past the limit, as all
 /// the thread's later ones will be too. This is cold beside the check that leads here, and keeping it out
 /// of line lets that check be inlined.
@@ -646,7 +634,7 @@ fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
     if doc >= tally.1.load(Relaxed) {
         return TOO_BIG;
     }
-    let mut answer = lock(&plan.answers[tally.0 as usize].0);
+    let mut answer = plan.answers[tally.0 as usize].0.lock().unwrap();
     insert_smallest(&mut answer.ids, doc);
     tally.1.store(answer.ids[SMALLEST - 1], Relaxed);
     0
@@ -826,12 +814,9 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
         *term = new_number[*term as usize] + u32::from(long) * term_count as u32;
     }
     let (starts, checks) = group(2 * term_count, checks.iter().copied());
-    let put = |word: u64, (at, term): (&u32, u32)| word | u64::from(term) << at;
+    let or = |word: u64, (at, term): (&u32, u32)| word | u64::from(term) << at;
     let pack = |&(_, Check { truth, terms }): &(u32, Check)| {
-        PACKED_AT
-            .iter()
-            .zip(terms)
-            .fold(u64::from(truth & 255), put)
+        PACKED_AT.iter().zip(terms).fold(u64::from(truth as u8), or)
     };
     let (short, long) = checks.split_at(starts[term_count] as usize);
     plan.short_checks = short.iter().map(pack).collect();
@@ -1045,9 +1030,8 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             // pairs past the last token, which marks term 0, whose mark means nothing.
             let rest = text.as_ptr().add(start + 8).cast::<u64>().read_unaligned() | CASE_BITS;
             let rest = _bzhi_u64(rest, 8 * end.wrapping_sub(start + 8) as u32);
-            let long = NO_WAY + (word >> WAY_SHIFT & 3) as usize;
-            if (end - start).wrapping_sub(9) > 7 || rest != u64::from(*set.rest.get_unchecked(long))
-            {
+            let w = NO_WAY + (word >> WAY_SHIFT & 3) as usize;
+            if (end - start).wrapping_sub(9) > 7 || rest != u64::from(*set.rest.get_unchecked(w)) {
                 let token = text.get_unchecked(start..end);
                 word = terms.find(token, *keys.get_unchecked(at), set);
                 *tokens.get_unchecked_mut(at) = word;
@@ -1149,7 +1133,7 @@ fn check_phrases(ats: &[u32], tokens: &[u32], plan: &Plan, doc: u32, counted: &m
             // An anchor can occur twice in a document, but the document counts once.
             if run.is_some_and(same) && !counted.contains(query) {
                 counted.push(*query);
-                let mut answer = lock(&plan.answers[*query as usize].0);
+                let mut answer = plan.answers[*query as usize].0.lock().unwrap();
                 (answer.count, answer.sum) = (answer.count + 1, answer.sum + u64::from(doc));
                 insert_smallest(&mut answer.ids, doc);
             }
@@ -1221,11 +1205,7 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
 /// that set in if asked. The step's top two bits index this: OR, AND, NOT.
 #[repr(align(32))]
 struct StepMasks([[u64; 8]; 3]);
-static STEP_MASKS: StepMasks = StepMasks([
-    [!0, !0, !0, !0, !0, !0, !0, !0],
-    [0; 8],
-    [!0, !0, !0, !0, 0, 0, 0, 0],
-]);
+static STEP_MASKS: StepMasks = StepMasks([[!0; 8], [0; 8], [!0, !0, !0, !0, 0, 0, 0, 0]]);
 
 /// Puts documents of a block's result among the smallest of a tally's answer, up to the first past its limit.
 #[cold]
@@ -1403,10 +1383,10 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
             lists.present.fill(0);
         }
     }
-    lock(&progress.hits).push(scan.hits);
+    progress.hits.lock().unwrap().push(scan.hits);
     wait_for_all(&progress.scanned, threads);
     let address = |hits: &Vec<u64>| hits.as_ptr();
-    let scans: Vec<_> = lock(&progress.hits).iter().map(address).collect();
+    let scans: Vec<_> = progress.hits.lock().unwrap().iter().map(address).collect();
 
     // Adds the threads' counts and ids of each tally into its answer. All threads' hits for a tally are
     // summed before its answer is locked, so an answer is visited once per tally, not once per thread as
@@ -1417,7 +1397,7 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
         // SAFETY: each thread's `hits` has every tally.
         let at_hits = |hits: &*const u64| unsafe { *hits.add(at) } & !TOO_BIG;
         let hits: u64 = scans.iter().map(at_hits).sum();
-        let mut answer = lock(&plan.answers[plan.tallies[at].0 as usize].0);
+        let mut answer = plan.answers[plan.tallies[at].0 as usize].0.lock().unwrap();
         answer.count += hits >> SUM_BITS;
         answer.sum += hits & ((1 << SUM_BITS) - 1);
     }
@@ -1429,10 +1409,10 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
     while let Some(batch) = claim(&progress.next_batch, BATCH, plan.queries.len()) {
         text.clear();
         for query in batch.clone() {
-            let mut line = *lock(&plan.answers[query].0);
+            let mut line = *plan.answers[query].0.lock().unwrap();
             // NONE is no answer's number.
             if let Some(term_answer) = plan.answers.get(plan.shared_answer[query] as usize) {
-                let Answer { count, sum, ids } = *lock(&term_answer.0);
+                let Answer { count, sum, ids } = *term_answer.0.lock().unwrap();
                 (line.count, line.sum) = (line.count + count, line.sum + sum);
                 ids.iter().for_each(|&d| insert_smallest(&mut line.ids, d));
             }
@@ -1506,9 +1486,8 @@ pub extern "C" fn main() -> i32 {
     let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
     // One round of threads scans, then answers, as starting threads again costs more than a short wait.
     let progress = Progress::default();
-    on_threads(threads, || {
-        scan_and_answer(docs, &plan, &file, &progress, threads)
-    });
+    let work = || scan_and_answer(docs, &plan, &file, &progress, threads);
+    on_threads(threads, work);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)
 }

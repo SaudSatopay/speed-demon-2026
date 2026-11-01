@@ -167,6 +167,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 131 | exp: h115k, sample 4 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 | 132 | exp: cuts, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 | 133 | exp: tags16, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
+| 134 | exp: cuts, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
 
 ## Decision log
 
@@ -436,6 +437,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D132.** Median of three decides
 
 **D133.** Median of three decides
+
+**D134.** Median of three decides
 
 ## What didn't work
 

@@ -67,6 +67,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 33 | exp: block queries at anchors holding N/48 documents, not N/96 | A thread's columns take 216 KB of L2 at N/96, read and cleared each block, and the box's L2 is 1.25 MB per core for two threads. Local cycles rank instruction cuts, not this | pending | — | — | — |
 | 34 | exp: block queries at anchors holding N/24 documents, not N/48 | N/48 read T 0.0909 against 0.0996 at N/96, though local cycles rose 1.5%, so what a block's queries cost on the box isn't what local cycles say | pending | — | — | — |
 | 35 | Block queries at anchors holding N/48 documents | Board: N/96 T 0.0996, N/48 T 0.0909, N/24 T 0.0942, one sample each, and local cycles ranked them the other way round: 2.10G, 2.13G, 2.16G | pending | — | — | — |
+| 36 | Marks as stamps with no clearing per document, a one-multiply hash, ids from a counter, per-thread sample counts, a fourth way for short terms, phrases compared in one vector, the second pass 8 words at a time, and the corpus prefetched 16 blocks ahead | On the box T is thread cycles over 12 threads at 2.5 GHz, and about 35 mispredicts per document came mostly from each stage's loop exit, so whole stages could go | pending | — | — | — |
 
 ## Decision log
 
@@ -141,6 +142,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D35.** Measurement. N/24 has fewer queries and columns again. Against T 0.0909.
 
 **D36.** Decided by the board, and a second sample of N/48. Fewer block queries cost less on the box than local cycles say, as a block's columns and tallies go through a cache shared by two threads at 2.5 GHz, and N/24 leaves more checks. No new lines.
+
+**D37.** Local, seed 1, 12 threads, on the N/96 build: cycles 2.109G to 1.763G (seed 2 2.084G to 1.759G), instructions 3.337G to 2.885G, mispredicts 8.63M to 4.85M, wall 47.4 to 41.0 ms, S +45. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300. Dropped, no gain: batched tallies, SWAR print, LF block apart, block-sized ranges, phrase pre-prefetch, 1 and 4 MiB samples. Worse: table of 1<<17 sets +4%, 1<<15 +6%, NTA on sets +2%, sets prefetched a document ahead +3%. The corpus prefetch is the one cache change here, for the board to judge.
 
 ## What didn't work
 

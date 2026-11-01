@@ -161,6 +161,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 125 | exp: h125k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 | 126 | exp: h140k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 | 127 | exp: h125k, sample 2 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
+| 128 | exp: h140k, sample 2 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
 
 ## Decision log
 
@@ -418,6 +419,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D126.** Median of three decides against 46.13
 
 **D127.** Median of three decides against 46.13
+
+**D128.** Median of three decides against 46.13
 
 ## What didn't work
 

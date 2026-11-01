@@ -64,6 +64,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 30 | The same machine code with named structs instead of tuples, named constants, and every comment checked against the code | A reader had to remember what `.0` and `.1` held across a dozen record types, and some comments no longer told the truth | pending | — | — | — |
 | 31 | 48 ranges per thread instead of 16, and tuning meant for older CPUs lifted | With 16 ranges a thread's last one takes about 5 ms of the box's time, so threads finish that far apart and wait; C gained 2 to 4% from the same change. For the generic target LLVM also clears the output of TZCNT and POPCNT first, against a false dependency the box's cores don't have | pending | — | — | — |
 | 32 | Queries with common anchors answered in the scan, 256 documents at a time, in vectors, with no bitmaps of the corpus and no chains | Bitmaps and chains held 18 of 42 MB, and were only read after the scan. A pass over a query's terms costs the same in vectors over a block's columns, which a thread reuses, and M is K^0.20 | pending | — | — | — |
+| 33 | exp: block queries at anchors holding N/48 documents, not N/96 | A thread's columns take 216 KB of L2 at N/96, read and cleared each block, and the box's L2 is 1.25 MB per core for two threads. Local cycles rank instruction cuts, not this | pending | — | — | — |
 
 ## Decision log
 
@@ -132,6 +133,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D32.** No lines. Local paired wall -1.0 ms of 57, and wall's spread fell from about 7% to 2%, with cycles flat. Instructions: 3.572G -> 3.539G from the tuning, then 3.563G with more ranges. Hits stay ascending within a thread, as ranges are claimed in order.
 
 **D33.** Local, seed 1, 12 threads: memory peak 42 to 27 MB, cycles 2.35G to 2.11G, instructions 3.56G to 3.34G, S 1015 to 1004. Each block query is now cheap beside checks at its anchors' documents, so a query goes by blocks at anchors holding N/96 documents in all, where N/24 of any one was the line, and rows start at N/48. Ranges need no rounding, since threads share no bitmap words, which also ends tokenizing up to 63 documents again at each range's start. Grid, threads and const-hash by the gate, stress 0 wrong in 300.
+
+**D34.** Measurement of what columns cost on the box. N/48 has 28% fewer columns, for +1.5% local cycles. Against T 0.0996.
 
 ## What didn't work
 

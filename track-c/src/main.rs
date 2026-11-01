@@ -3,13 +3,14 @@
 //! Threads claim segments of the file from a shared cursor. Segments are cut just after a CRLF,
 //! because the spec promises that a CR appears nowhere else, so that is always a record boundary, and
 //! no quote counting is needed. A thread reads its segment in small pieces into its own buffer, which
-//! stays in its caches and needs no page mapped. Inside a piece, each record is found from its own
-//! start, in three loads: the id's word, one 64-byte block over the name and the note, which holds both
-//! for 98 records in 100, and one vector over the short tail. Nothing is unescaped: a quoted field's
-//! raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length follows
-//! from counting its quotes. Each thread sums into its own rows. One shared table counts the distinct
-//! names per country; a record's lines in it are asked for as it is parsed, and it is added up while
-//! the next record is parsed.
+//! stays in its caches and needs no page mapped. Inside a piece the parser has two stages, because a
+//! parser that finds each field from the end of the last one is limited by that chain of loads, not
+//! by its instructions. The first stage walks fixed 64-byte blocks, and lists every comma and line end
+//! outside quotes. The second reads each record's fields from its five listed positions, and no record
+//! waits for the one before it. Nothing is unescaped: a quoted field's raw bytes, with its `""` pairs
+//! intact, encode its value one to one, and the value's length follows from counting its quotes. Each
+//! thread sums into its own rows. One shared table counts the distinct names per country, and a chunk
+//! of records has its cache lines prefetched before any of it is added up.
 //!
 //! All the memory is one mapping, touched by the main thread while it's pinned to one CPU. The kernel
 //! charges a memory group's pages to each CPU in batches, and what a CPU has charged but not used yet
@@ -393,201 +394,149 @@ const EMPTY_ROW: Row = Row([0, 0, 0, i64::MAX, i64::MIN, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
+/// A record's guessed slot, region, id and cents.
+type Found = [[u32; 4]; LISTED / 5];
 
 /// Segments per thread.
 const SEGMENTS: usize = 8;
+/// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
+const BLOCKS: usize = 16;
+/// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
+const LISTED: usize = BLOCKS * 64 + 16;
+/// Bit `k` of each of the 64 positions in a block, at that position.
+static PLANES: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
 
-impl NameTable<'_> {
-    /// Asks for the tags that `guess_slot` reads for this hash, which may straddle two lines.
-    fn prefetch_tags(&self, hash: u32) {
-        // SAFETY: the window is inside the tags, and prefetching has no effect on memory anyway.
-        unsafe {
-            let window = self.tags.as_ptr().add(self.home(hash) * GROUP);
-            _mm_prefetch::<_MM_HINT_T0>(window.cast());
-            _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
-        }
-    }
-}
-
-/// A record parsed but not yet added up. Its region's country and its name's tags were asked for as
-/// it was parsed, its slot when it was put here, and it's added while the next record is parsed, once
-/// the slot's line has had time to arrive.
-struct Pending {
-    name: (usize, usize), // Where the name's bytes start and how many, less the delimiting quotes.
-    guess: usize,
-    region: usize,
-    id: u32,
-    cents: i32,
-    bytes: i64, // The name's bytes with, above bit 32, the note's, as the row keeps them.
-}
-
-impl Pending {
-    /// Marks the name as seen in the region's country, and adds the record to the country's row.
-    fn add(self, text: &[u8], names: &NameTable, rows: &mut Rows) {
-        // SAFETY: `region` was kept inside the join table, and `guess` came from `guess_slot`.
-        let country = unsafe { names.regions.get_unchecked(self.region) }.load(Relaxed);
-        let repeat = unsafe { names.mark(self.guess, text, self.name, country) };
-        let (row, cents) = (&mut rows[usize::from(country)].0, i64::from(self.cents));
-        row[0] += 1 + (i64::from(repeat) << 32);
-        row[1] += i64::from(self.id);
-        row[2] += cents;
-        // A country's extremes settle after a few records, so these branches hardly ever go wrong,
-        // where the branchless form would write both words every time.
-        if cents < row[3] {
-            row[3] = cents;
-        }
-        if cents > row[4] {
-            row[4] = cents;
-        }
-        row[5] += self.bytes;
-    }
-}
-
-/// Two masks of the 64 bytes at `at`: the quotes, and the commas outside quotes, given `odd` all ones
-/// if the block starts inside quotes. Also returns that for the block after. The carry-less multiply
-/// by all ones gives each bit the parity of the quotes up to it, and that's odd exactly inside quotes,
-/// since a `""` pair cancels out.
-///
-/// # Safety
-/// The 64 bytes at `at` must be inside the text or its padding.
-unsafe fn block(text: &[u8], at: usize, odd: u64) -> (u64, u64, u64) {
-    // SAFETY: the caller's promise. PCLMULQDQ is in the build's target features.
-    unsafe {
-        let at = text.as_ptr().add(at);
-        let quotes = byte_mask(at, b'"', b'"');
-        let ones = _mm_set1_epi8(-1);
-        let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
-        let inside = _mm_cvtsi128_si64(parity) as u64 ^ odd;
-        (
-            quotes,
-            byte_mask(at, b',', b',') & !inside,
-            (inside as i64 >> 63) as u64,
-        )
-    }
-}
-
-/// Where the name and the note end, just past their commas, and how many quotes each has, for a
-/// record whose two fields run past one block from `at`: walks on block by block, with the quote
-/// parity carried over, then counts the quotes the slow way. `None` if the text ends first.
-#[cold]
-fn long_fields(text: &[u8], at: usize, len: usize) -> Option<([usize; 2], [usize; 2])> {
-    let (mut ends, mut found, mut scan, mut odd) = ([0; 2], 0, at, 0);
-    while scan < len {
-        // SAFETY: `scan` is inside the text, so the padding covers the block.
-        let (_, mut seps, next) = unsafe { block(text, scan, odd) };
-        while seps != 0 && found < 2 {
-            ends[found] = scan + seps.trailing_zeros() as usize + 1;
-            (seps, found) = (seps & (seps - 1), found + 1);
-        }
-        if found == 2 {
-            let count = |from, to| text[from..to].iter().filter(|&&c| c == b'"').count();
-            return Some((ends, [count(at, ends[0]), count(ends[0], ends[1])]));
-        }
-        (scan, odd) = (scan + 64, next);
-    }
-    None
-}
-
-/// Steps over a byte order mark. A cold function of its own, so that the test for a mark compiles to
-/// a branch that's almost never taken, rather than arithmetic that every record's loads wait for.
-#[cold]
+/// Lists into `out` the positions just past the separators outside quotes in `blocks` blocks of `text`
+/// from `scan`, and returns how many. `odd` is all ones when the first block starts inside quotes,
+/// that is after an odd number of quotes, and comes back set for the block after. A function of its
+/// own, so that its constants get the registers that the loops around it would otherwise hold.
 #[inline(never)]
-fn past_bom(pos: usize) -> usize {
-    pos + 3
+fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mut u64) -> usize {
+    // Read once here, since the compiler would otherwise rebuild them in every block.
+    let planes = std::hint::black_box(&PLANES);
+    // SAFETY: the blocks are inside the text, or the padding covers them. PCLMULQDQ is in the
+    // build's target features. The carry-less multiply by all ones gives each bit the parity of the
+    // quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels out. The
+    // positions stay below `LISTED - 8`, as a chunk has `BLOCKS` blocks.
+    unsafe {
+        let mut cursor = out.as_mut_ptr();
+        let mut base = _mm256_set1_epi32(scan as i32 + 1);
+        let mut odd_so_far = *odd;
+        let mut at = text.as_ptr().add(scan);
+        let end = at.add(blocks * 64);
+        while at < end {
+            let quotes = byte_mask(at, b'"', b'"');
+            let ones = _mm_set1_epi8(-1);
+            let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
+            let inside = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
+            odd_so_far = (inside as i64 >> 63) as u64;
+            let left = byte_mask(at, b',', b'\n') & !inside;
+            // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
+            // writes 8 whatever the number, and moves on by the right amount. The positions of the
+            // lowest 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every
+            // position at that position, PEXT gathers it for the set ones, and PDEP spreads those
+            // into bit `k` of each byte.
+            let packed = planes.iter().enumerate().fold(0, |packed, (k, &plane)| {
+                packed | _pdep_u64(_pext_u64(plane, left), 0x0101_0101_0101_0101) << k
+            });
+            let bytes = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(packed as i64));
+            _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
+            let total = left.count_ones() as usize;
+            let mut rest = _pdep_u64(!0 << 8, left);
+            for i in 8..total {
+                *cursor.add(i) = at.offset_from(text.as_ptr()) as u32 + rest.trailing_zeros() + 1;
+                rest &= rest.wrapping_sub(1);
+            }
+            cursor = cursor.add(total);
+            at = at.add(64);
+            base = _mm256_add_epi32(base, _mm256_set1_epi32(64));
+        }
+        *odd = odd_so_far;
+        cursor.offset_from(out.as_ptr()) as usize
+    }
 }
 
 /// Parses the records in `pos..end`, adding each to its country's row.
 fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
+    // The positions just past commas and line ends outside quotes, after a record's start, so a
+    // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
+    let (mut listed, mut found) = ([0u32; LISTED], [[0u32; 4]; LISTED / 5]);
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
         let text = names.records.read(pos, len, room);
-        let done = add_records(text, len, pos + len == end, names, rows);
+        // A piece starts at a record's start, so outside quotes.
+        let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
+        listed[0] = 0;
+        while scan < len {
+            let blocks = BLOCKS.min((len - scan).div_ceil(64));
+            count += separators(text, scan, blocks, &mut listed[count..], &mut odd_so_far);
+            scan += blocks * 64;
+            // The final record may have no terminator (spec section 2.1). This costs little to ask.
+            if scan >= len && pos + len == end && count % 5 == 0 {
+                listed[count] = len as u32 + 1;
+                count += 1;
+            }
+            let records = (count - 1) / 5;
+            add_records(text, &listed[..=records * 5], &mut found, names, rows);
+            // Under 5 positions are left, and the list has 8 free past `count`, so one fixed
+            // copy moves them, where a call to copy just the right number would cost more.
+            listed.copy_within(records * 5..records * 5 + 8, 0);
+            count -= records * 5;
+        }
         // What's left is the start of a record the piece cut short. A record longer than a piece gets
         // a longer piece.
+        let done = listed[0] as usize;
         piece = if done > 0 { PIECE } else { 2 * piece };
         pos += done;
     }
 }
 
-/// Adds up the whole records in the `len` bytes of a piece, and returns where the first record it
-/// couldn't finish starts: the piece cut it short. With `last` the piece reaches the end of the file,
-/// where the final record may have no terminator (spec section 2.1), and ends with the text.
-///
-/// Each record is found from its own start, in three loads that each tell where the next begins: the
-/// id's word, one block over the name and the note, and one vector over the tail. The loads that the
-/// caches may not answer at once, the name's tags, the region's country and the name's slot, are asked
-/// for as early as each can be, and the record is added up while the next one is parsed.
-fn add_records(text: &[u8], len: usize, last: bool, names: &NameTable, rows: &mut Rows) -> usize {
-    let (mut pos, mut pending) = (0, None::<Pending>);
-    // Where a record's LF may be at the latest: inside the text, or, at the end of the file, anywhere
-    // past it, since `trailing_zeros` puts a missing one 32 bytes past the tail's start.
-    let limit = if last { usize::MAX } else { len - 1 };
-    // The id's length in bits, as predicted from the record before: ids count up, so it changes a
-    // handful of times in a file, and the prediction lets the loads over the name start before the
-    // id's word has arrived. A wrong prediction, or a byte order mark, costs a mispredicted branch.
-    let mut id_bits = 56;
-    while pos < len {
-        // A byte order mark can only start a record here, and no record otherwise starts with it.
-        // SAFETY: `pos` is inside the text, and the padding covers the word after a mark.
-        let start = if unsafe { *text.get_unchecked(pos) } == 0xEF {
-            past_bom(pos)
-        } else {
-            pos
-        };
-        // The id's digits have bit 4 set and the comma after them doesn't, so the first clear bit ends
-        // them, in multiples of 8.
-        let word = unsafe { load_u64(text, start) };
-        let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
-        if bits != id_bits {
-            id_bits = bits;
-            continue;
+/// Adds up a chunk of whole records from `text`, given where they start and the positions just past
+/// each one's five separators.
+fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable, rows: &mut Rows) {
+    let records = listed.len() / 5;
+    let positions = |record: usize| {
+        // SAFETY: the caller passes `records * 5 + 1` positions.
+        let six = unsafe { listed.as_ptr().add(record * 5).cast::<[u32; 6]>() };
+        unsafe { six.read_unaligned() }.map(|position| position as usize)
+    };
+    // The tags are the one load in a record's chain that the caches don't answer at once, and a
+    // thread's share of the core can't run far enough ahead to cover it, so each record's window is
+    // asked for a loop before its use, and the hash kept for that. The window may straddle two lines.
+    for record in 0..records {
+        let [_, name_at, note_at, ..] = positions(record);
+        let name = note_at - name_at - 1;
+        let hash = NameTable::hash(text, name_at + 1, name.saturating_sub(2));
+        // SAFETY: `found` has room for every record, the window is inside the tags, and prefetching
+        // has no effect on memory anyway.
+        unsafe {
+            let window = names.tags.as_ptr().add(names.home(hash) * GROUP);
+            _mm_prefetch::<_MM_HINT_T0>(window.cast());
+            _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
+            found.get_unchecked_mut(record)[0] = hash;
         }
-        // Shifted by the rest, the digits sit at the top of the word, with zeros below, as
-        // `parse_three` wants them.
-        let (id, name_at) = (word << (64 - id_bits), start + id_bits as usize / 8 + 1);
-        // The name and the note end at the two commas outside quotes after the id's. One block holds
-        // both for 98 records in 100, and then its quote mask counts the quotes in each. BZHI keeps
-        // every bit for a count of 64.
-        // SAFETY: `name_at` is at most 12 bytes past the text, and the padding covers the block.
-        let (quotes, seps, _) = unsafe { block(text, name_at, 0) };
-        let past = |bits: u64| name_at + bits.trailing_zeros() as usize + 1;
-        let below =
-            |end| unsafe { _bzhi_u64(quotes, (end - name_at) as u32) }.count_ones() as usize;
-        let ([note_at, region_at], [name_quotes, note_quotes]) = if seps & seps.wrapping_sub(1) != 0
-        {
-            let ends = [past(seps), past(seps & seps.wrapping_sub(1))];
-            (ends, [below(ends[0]), below(ends[1]) - below(ends[0])])
-        } else {
-            let Some(found) = long_fields(text, name_at, len) else {
-                break;
-            };
-            found
-        };
-        // A value is its field, less its delimiting quotes, less one for each `""`, with empty fields
-        // of no quotes or two both coming to nothing.
-        let (name, note) = (note_at - name_at - 1, region_at - note_at - 1);
-        let name_bytes = (name - name_quotes / 2).saturating_sub(1) as i64;
-        let note_bytes = (note - note_quotes / 2).saturating_sub(1) as i64;
-        let key = (name_at + 1, name.saturating_sub(2));
-        let hash = NameTable::hash(text, key.0, key.1);
-        names.prefetch_tags(hash);
-        // The tail, `region,amount` and the terminator, has no quotes and at most 18 bytes (spec
-        // sections 2.2 and 2.3), so one vector finds its comma and its LF: 32 past the start for none.
-        // SAFETY: `region_at` is inside the text, and the padding covers the vector.
-        let tail = unsafe { _mm256_loadu_si256(text.as_ptr().add(region_at).cast()) };
-        let first = |byte: u8| unsafe {
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(tail, _mm256_set1_epi8(byte as i8)))
-        };
-        let amount_at = region_at + (first(b',') as u32).trailing_zeros() as usize + 1;
-        let end = region_at + (first(b'\n') as u32).trailing_zeros() as usize;
-        if end > limit {
-            break; // The piece cut the record short.
-        }
-        // SAFETY: the record is whole, so its fields are inside the text, and the padding covers the
-        // loads past them. PEXT is in BMI2, and prefetching has no effect on memory.
-        let (id, region, cents) = unsafe {
-            let region = load_u64(text, region_at) << (64 - 8 * (amount_at - 1 - region_at) as u32);
+    }
+    for record in 0..records {
+        let [mut start, name_at, _, region_at, amount_at, _] = positions(record);
+        // SAFETY: every position is inside the text, or just after it, so the padding covers the
+        // loads. `region` stays inside the join table. Prefetching has no effect on memory.
+        unsafe {
+            // Moves the digits at `start` to the top of a word, with zeros below them.
+            let digits = |start, end| load_u64(text, start) << (64 - 8 * (end - start) as u32);
+            // A byte order mark can only start a record here, and no record otherwise starts with it.
+            if *text.get_unchecked(start) == 0xEF {
+                start += 3;
+            }
+            let id = digits(start, name_at - 1);
+            let region = digits(region_at, amount_at - 1);
             // Amounts are at most 8 bytes, and negative ones at most 7 (spec section 2.2), so one load
             // holds one with what follows it. Its digits, point and sign have bit 5 set, and the CR,
             // LF or padding after it doesn't, which finds its end with no branch to mispredict. The
@@ -601,26 +550,42 @@ fn add_records(text: &[u8], len: usize, last: bool, names: &NameTable, rows: &mu
             let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
             let region = (region as usize).min(REGION_IDS - 1);
             _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region).cast());
-            (id as u32, region, cents as i32)
-        };
-        if let Some(previous) = pending.take() {
-            previous.add(text, names, rows);
+            let guess = names.guess_slot(found.get_unchecked(record)[0]);
+            *found.get_unchecked_mut(record) =
+                [guess, region, id as usize, cents as usize].map(|v| v as u32);
         }
-        let (guess, bytes) = (names.guess_slot(hash), name_bytes + (note_bytes << 32));
-        pending = Some(Pending {
-            name: key,
-            guess,
-            region,
-            id,
-            cents,
-            bytes,
-        });
-        pos = end + 1;
     }
-    if let Some(previous) = pending {
-        previous.add(text, names, rows);
+    for record in 0..records {
+        let [_, name_at, note_at, region_at, ..] = positions(record);
+        let [guess, region, id, cents] = found[record];
+        let (name, note) = (note_at - name_at - 1, region_at - note_at - 1);
+        let both = region_at - name_at - 1;
+        // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
+        // for a count of 64.
+        let (name_quotes, quotes) = if both <= 64 {
+            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), b'"', b'"') };
+            let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
+            (below(name), below(both))
+        } else {
+            let count = |at: usize, len| text[at..at + len].iter().filter(|&&c| c == b'"').count();
+            (count(name_at, name), count(name_at, both))
+        };
+        // SAFETY: the first pass kept `region` inside the table, and `guess` came from `guess_slot`.
+        let country = unsafe { names.regions.get_unchecked(region as usize) }.load(Relaxed);
+        let key = (name_at + 1, name.saturating_sub(2));
+        let repeat = unsafe { names.mark(guess as usize, text, key, country) };
+        let cents = i64::from(cents as i32);
+        let row = &mut rows[usize::from(country)].0;
+        row[0] += 1 + (i64::from(repeat) << 32);
+        row[1] += i64::from(id);
+        row[2] += cents;
+        (row[3], row[4]) = (row[3].min(cents), row[4].max(cents));
+        // A value is its field, less its delimiting quotes, less one for each `""`, with empty
+        // fields of no quotes or two both coming to nothing.
+        let name_bytes = (name - name_quotes / 2).saturating_sub(1) as i64;
+        let note_bytes = (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
+        row[5] += name_bytes + (note_bytes << 32);
     }
-    pos
 }
 
 /// Runs the numbered jobs below `count` that `next` hasn't handed out yet, sharing them with however

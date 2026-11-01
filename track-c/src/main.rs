@@ -21,7 +21,7 @@
 #![no_main]
 
 use std::arch::{asm, x86_64::*};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
 use std::{collections::BTreeSet, fs::File, hint::black_box, io::BufWriter, io::Write};
 use std::{mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex, thread};
 
@@ -150,8 +150,8 @@ const INLINE_BYTES: usize = 32;
 static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 
 /// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
-/// name's bytes, padded with ones, and one bit per country that has seen this name. The tags, one byte
-/// per slot, zero while it's free and then 8 bits of the hash of its name, say which slot to open, so
+/// name's bytes, padded with ones, and one bit per country that has seen this name. The tags, two bytes
+/// per slot, zero while it's free and then 16 bits of the hash of its name, say which slot to open, so
 /// a lookup costs one cache miss, with no probing through other names' lines. A name's home is a slot,
 /// and one vector holds the tags of the 32 slots from there, so it costs the same in any of them, with
 /// no branch. Only when all are full does it move on 32 slots. A home for every slot, not every few,
@@ -164,7 +164,7 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 #[repr(C, align(2097152))]
 struct Memory {
     words: [AtomicU64; (HOMES + SPARE) * SLOT_WORDS],
-    tags: [AtomicU8; HOMES + SPARE],
+    tags: [AtomicU16; HOMES + SPARE],
     regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
     index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
     stacks: [[AtomicU64; STACK / 8]; THREADS],
@@ -205,20 +205,37 @@ fn parse_regions(text: &'static [u8], len: usize) {
 /// more can keep extra bytes. That's still the same word for the same name, and the key decides
 /// anyway. A test build swaps this for a constant, so that every key collides and any logic that
 /// trusts a hash without comparing the key shows up as a wrong answer. Returns the name's home, and
-/// the hash's low byte for its tag.
-fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u8) {
+/// the hash's low 16 bits for its tag.
+fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
     // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
     // CRC32 in SSE4.2, and x86-64-v3 includes both.
     let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
     let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
     let hash = if cfg!(sd_const_hash) { 0 } else { crc };
-    ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u8)
+    ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u16)
 }
 
-/// One bit per slot of a window of tags, set where the tag is `tag`.
-fn slots_with(tags: __m256i, tag: u8) -> u32 {
+/// One bit per slot of the 32 from `home`, set where the tag is `tag`. Tags are aligned, so a vector
+/// load can't tear one, and a tag of 16 bits rarely matches another name before its own.
+fn slots_with(window: [__m256i; 2], tag: u16) -> u32 {
     // SAFETY: x86-64-v3 has AVX2.
-    unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(tags, _mm256_set1_epi8(tag as i8))) as u32 }
+    unsafe {
+        let is = |tags| _mm256_cmpeq_epi16(tags, _mm256_set1_epi16(tag as i16));
+        let bytes = _mm256_packs_epi16(is(window[0]), is(window[1]));
+        _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xD8>(bytes)) as u32
+    }
+}
+
+/// The tags of the 32 slots from `home`.
+///
+/// # Safety
+/// `home` must stay 32 below the end of the tags.
+unsafe fn window(home: usize) -> [__m256i; 2] {
+    // SAFETY: the caller keeps the loads inside the tags. x86-64-v3 has AVX2.
+    unsafe {
+        let at = MEMORY.tags.as_ptr().add(home).cast::<__m256i>();
+        [_mm256_loadu_si256(at), _mm256_loadu_si256(at.add(1))]
+    }
 }
 
 /// The key of a name of at most `INLINE_BYTES`.
@@ -254,12 +271,12 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
     let (mut home, tag) = home_and_tag(text, start, len);
     let tag = tag.max(1);
     while len <= INLINE_BYTES && home <= HOMES + SPARE - 32 {
-        // One load answers both questions below, so a name can't get two slots. Each byte only
+        // Loads of one window answer both questions below, so a name can't get two slots. Each tag only
         // ever changes from zero to its final tag, and everyone takes the lowest free slot. If
         // two threads insert one name, whichever saw the other's slot as taken saw its tag too,
         // and if neither did, they both want the same byte and one loses the exchange.
-        // SAFETY: `home` stays 32 below the end of the tags. x86-64-v3 has AVX2.
-        let window = unsafe { _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast()) };
+        // SAFETY: `home` stays 32 below the end of the tags.
+        let window = unsafe { window(home) };
         let mut hits = slots_with(window, tag);
         while hits != 0 {
             let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
@@ -437,9 +454,8 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // update then needs no second trip to take it from the core that wrote it last. A wrong
             // guess costs a search. A name's tag is the low byte of its hash, or 1 for zero, which
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
-            // name in 256 less than a check.
-            let window = _mm256_loadu_si256(MEMORY.tags.as_ptr().add(home).cast());
-            let hits = slots_with(window, tag);
+            // name in 65,536 less than a check.
+            let hits = slots_with(window(home), tag);
             let guess = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;

@@ -1,14 +1,14 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-73a8aecd2907`: **0.0200 s / 10.4 MB**, K **44.29** and **82.3** speed points. That's one of 5 runs of the final source, which gave T 0.0200 to 0.0215 s, M 10.3 to 10.7 MB and a median K of 44.00 (D84).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-ec2daf493b37`: **0.0197 s / 10.4 MB**, K **45.42** and **82.9** speed points. That's one of 1 runs of the final source, which gave T 0.0197 to 0.0197 s, M 10.4 to 10.4 MB and a median K of 45.42 (D94).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
-- S is 446 code lines on the board's last run, against the reference's 108, which costs about 5 speed points. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: one pass took out 56 cold lines, and S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise below. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`).
+- S is 399 code lines on the board's last run, against the reference's 108, which costs about 4 speed points. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: one pass took out 56 cold lines, and S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise below. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). The last pass took out 47 more with T inside the noise (D92 to D94).
 - T moved between 0.0200 and 0.0207 over today's board runs from `7d61093` on, except `e7232af`, `c036bab` and `a17ec2a`, which we rejected at 0.0212, 0.0211 and 0.0215. On one source, `7d61093` and its second sample `7ca3b51`, T was 0.0200 and 0.0204 and M 10.44 and 11.04 MB, so gains under about 3% in T need several samples.
-- On Sunday Nov 1, NickTrapp leads this track with K 47.50 at T 0.018, M 12.8 and S 303. Against us, their lines are worth about 6% of K and their time about 5%, and we get about 4% back on M. We don't know how they reach that T with that S: the board shows only the numbers.
+- On Sunday Nov 1, NickTrapp leads this track with K 47.50 at T 0.018, M 12.8 and S 303. Against us, their lines are worth about 4% of K and their time about 5%, and we get about 4% back on M. We don't know how they reach that T with that S: the board shows only the numbers.
 
 ## What the box taught us
 
@@ -314,11 +314,11 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D91.** Rejected: T0 median K 43.73 (41.66, 43.96, 43.73). Rejected: homes on multiples of 32, median K 43.18 (43.18, 43.28, 41.48). The chosen source stands at median K 44.02.
 
-**D92.** Pending: kept only if its median K over 3 runs beats the chosen source
+**D92.** Twenty line cuts on cold paths. Instructions fell from 302.5 to 300.7 per record in the counting build. Board: K 44.41, 44.10, 44.28 at S 426, median 44.28 against 44.00 for the source before it. Outcome: kept.
 
-**D93.** Pending: kept only if its median K over 3 runs beats the chosen source
+**D93.** All memory is one zeroed static aligned to 2 MiB, so the mapping's setup, the `NameTable` struct and `self` go. `.bss` starts on a 2 MiB boundary too, and `exit` writes its first byte, which cost one whole huge page (local peak 9.70 to 12.06 MB), so the run ends in `_exit`, and the locked state is a static that isn't all zeros, which keeps it out of that extent. The box's kernel, 6.12, honours the alignment for a static PIE. Local: instructions 300.7 to 289.7 per record, paired T -2.5%, peak 9.70 MB. Board `run-0766e5fe11fd`: T 0.0203, M 10.25, S 407, K 44.68. Outcome: kept, with D94 on top.
 
-**D94.** Pending: kept only if its median K over 3 runs beats the chosen source
+**D94.** Helpers merged: one function gives a name's home and tag, closures for the arguments and for claiming a job. Instructions per record unchanged. Board: K 45.42 at S 399, median 45.42 against 44.00. Outcome: kept.
 
 ## What didn't work
 
@@ -329,10 +329,11 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Parsing `regions.csv` on several threads, with atomic table entries, a lock for new codes, and the table sized from the last line | The serial parse is about 4% of the run, about +2% K for about 12 lines | Regions phase, 41 paired runs: 1,193 -> 949 us at 12 threads, 1,194 -> 609 us at 4, 1,215 -> 598 us at 6; thread spawns eat the rest. Whole run unchanged (31,770 -> 31,946 us at 4 threads, 32,298 -> 32,086 at 6). S 339 -> 356 costs 0.74% K, and the phase's best case gives back +0.9%. Scorer, 3 runs each, median K 24.02 -> 24.24, with a range of 3% per side | local | reverted |
 | Parallel regions parser on current code: atomic byte table, code lock and region blocks | Cut the serial stage by parsing disjoint sorted-id ranges in parallel | Quick 59/59, thread sweep 324/324, constant-hash 29/29; counts 393.2 -> 393.0 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.85 misses. 41-pair full A/B was +3.5% (20.7% spread); three-run scorer K 26.63 -> 26.63 while S rose 315 -> 369 | local scratch | reverted |
 | Serial region-table preallocation from the sorted last id | Avoid repeated vector growth while parsing regions | Correctness gates pass; counts 393.2 -> 392.6 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.60 misses. 41-pair A/B +0.3% inside 27.9% spread. Matched scorer pairs disagreed: K 26.41 -> 27.34, then 26.99 -> 26.62; peak memory was not consistently lower and S rose 315 -> 326 | local scratch | reverted |
+| A plain TZCNT loop in place of PEXT and GFNI for the position lists | 13 fewer lines, worth about 0.5% of K, if the box ignored the extra instructions as it has others | 61 paired local runs: T +8.7%, about 4% of K. Every block runs it, so we didn't spend box runs on it | local | not applied |
 
 ## The final design
 
-The file is cut into 24 segments per thread, which threads claim from a shared counter and read in 32 KiB pieces. Each piece is parsed in two stages: fixed 64-byte blocks list the separators (quote parity by carry-less multiply, positions by PEXT and one GFNI matrix multiply), then each record reads its fields from the list, in two passes over a chunk of 16 blocks. One shared name table keeps a cache line per name (32 bytes of key, one bit per country) behind vector tags over 32-slot windows, and names with no slot go to a locked set. All memory is one mapping that the main thread populates before any other thread starts, and the workers run on stacks in it. See the [README](README.md#approach). Local counts (counts.sh, on Zen 4, so only instruction counts carry over to the box): 227 instructions per record after `2bfc56f`, down from 258 (D69, D70), about 8 fewer once the first two loops merged (row 73), and 0.33 mispredicts per record when last counted (D58).
+The file is cut into 24 segments per thread, which threads claim from a shared counter and read in 32 KiB pieces. Each piece is parsed in two stages: fixed 64-byte blocks list the separators (quote parity by carry-less multiply, positions by PEXT and one GFNI matrix multiply), then each record reads its fields from the list, in two passes over a chunk of 16 blocks. One shared name table keeps a cache line per name (32 bytes of key, one bit per country) behind vector tags over 32-slot windows, and names with no slot go to a locked set. All memory is one zeroed static, aligned for huge pages, that the main thread populates before any other thread starts, and the workers run on stacks in it. See the [README](README.md#approach). Local counts (counts.sh, on Zen 4, so only instruction counts carry over to the box): 227 instructions per record after `2bfc56f`, down from 258 (D69, D70), about 8 fewer once the first two loops merged (row 73), and 0.33 mispredicts per record when last counted (D58).
 
 A separate review tried to break the code of steps 49 and 50: fresh seeds and hostile inputs against the reference (records straddling every position of a piece boundary, names over the table's capacity, records over 1 MiB, thread counts from 1 to 64) gave about 940 comparisons and 7,300 repeat runs with no wrong output, and found one crash on a spec-legal input with names over 32 bytes, since fixed (see the journey). The long-name path it crashed in was replaced later by the locked set (steps 75 to 81).
 
@@ -343,7 +344,7 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 - `quick.sh --threads "1 2 3 7 12 64"` on every build moves every cut, because segment sizes follow the thread count.
 - **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `077d9b5`, run with `--full` on 2026-11-01 09:40 UTC against the organisers' harness at `7a9057b`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `429da80`, run with `--full` on 2026-11-01 11:40 UTC against the organisers' harness at `adb9316`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|
@@ -354,5 +355,5 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 The box showed that line fills per record set T here, more than instructions or the lock, so that's where we'd look.
 
 - **Already tested, both lost (D91).** `T0` for the slot prefetch: K 41.66, 43.96, 43.73, median 43.73. Homes on multiples of 32, so that tag windows never straddle a line: K 43.18, 43.28, 41.48, median 43.18. The chosen source's median is 44.00 over 7 runs, and it has ranged from 42.71 to 44.95 with no change, so T0's 0.6% is a lack of gain rather than a proven loss. Aligned homes are about 1.9% down.
-- **Lines.** S is worth about 1% of K per 28 lines, and it's the largest part of what separates us from the leader. Removals of the big blocks mostly lost on the box, so what's left is many small ones, each needing several samples to tell from noise.
+- **Lines.** S is worth about 1% of K per 28 lines, and it's still the largest part of what separates us from the leader. The last pass took out 47 by removing the hand-built mapping and its struct and by merging helpers. What's left that we know of trades T for lines, like the TZCNT loop under [What didn't work](#what-didnt-work).
 - **A local machine like the box.** Local cycles on a Zen 4 ranked cache and lock changes wrongly, so each real answer took a board slot. A Golden Cove machine would have let us test far more of them.

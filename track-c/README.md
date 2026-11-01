@@ -16,6 +16,7 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 
 - It relies on sections 2.2 and 2.3 of the spec: a mid-file BOM only ever starts a record, a CR only ever starts a CRLF, numbers fit in 8 bytes, and there are at most 240 countries. A file with no CRLF would still be right, but wouldn't get split across threads. Names may hold any bytes but zero.
 - Positions in a piece fit 32 bits, so a single record can't reach 4 GB.
+- There are stacks for 64 threads besides the main one, so `SD_THREADS` above 65 stops with a panic.
 - A name longer than 32 bytes, or one that finds no free slot, is counted in a locked set instead of the table. That is right but slower, and no generated name has been seen beyond 25 bytes.
 - The table, tags and join table are 8.2 MB, which keeps M above the 7.3 MB where more savings stop counting.
 - The code calls PEXT, BZHI, the carry-less multiply, PREFETCHW and GFNI directly, so it only runs on a CPU that has them, as the scoring box's does. `.cargo/config.toml` sets the build to match.
@@ -26,7 +27,7 @@ Threads claim segments of the file from a shared counter, 24 segments per thread
 
 The region table becomes an array from region id to country index, with indices given out as codes first appear; the threads fill it together before any record is parsed, and the output is sorted when it's written. Nothing is unescaped: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length follows from counting its quotes. One lock-free table, shared by all threads, counts distinct names. A slot is one cache line: the name, up to 32 bytes, padded with ones, and one bit per country. A name's home is one of 110,000 slots, and one 32-byte vector of tags covers the 32 slots from there, so a single load says both whether the name is there and which slot is free; a full window sends the search on by 32. A name longer than 32 bytes, or one that finds every window to the end of the table full, gets no slot and goes to a locked set instead, so the table never restarts.
 
-All the memory is one mapping: slots, tags, join table and the workers' stacks. The main thread populates it with one `madvise` call before any other thread starts, and isn't pinned to a CPU. The workers run on stacks in that mapping, through raw `pthread_create`, so on a generated file at 12 threads they take no page faults and never use the heap. (Fewer threads make the parts of `regions.csv` bigger than the read buffer, and a name with no slot or a record longer than a piece also allocates: slower, not wrong.)
+All the memory is one static: slots, tags, join table, the table of country codes and the workers' stacks. It's zeros in the program's image, and its 2 MiB alignment gets it huge pages. The main thread populates it with one `madvise` call before any other thread starts, and isn't pinned to a CPU. The workers run on stacks in that static, through raw `pthread_create`, so on a generated file at 12 threads they take no page faults and never use the heap. (Fewer threads make the parts of `regions.csv` bigger than the read buffer, and a name with no slot or a record longer than a piece also allocates: slower, not wrong.) The run ends in `_exit`, because the handlers that `exit` runs write the first byte of the zeroed part of the image, which would cost a whole huge page.
 
 ## Why it's fast
 
@@ -55,7 +56,7 @@ Each of the spec's 20 edge cases falls out of the field rules. An empty unquoted
 
 ## Dependencies
 
-None. `mmap`, `madvise` and the `pthread` calls are declared directly against glibc, which `std` already links, and the vector operations come from `std::arch`.
+None. `madvise`, `_exit` and the `pthread` calls are declared directly against glibc, which `std` already links, and the vector operations come from `std::arch`.
 
 ## Build and run
 

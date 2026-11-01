@@ -84,6 +84,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 48 | exp: the corpus prefetched 32 blocks ahead, in place of 8 | 8 blocks ahead read median K 40.40 over 3 runs against 41.49 over 14 at 16, so T is sensitive to this distance. This tests the other side | pending | — | — | — |
 | 49 | Back to the corpus prefetched 16 blocks ahead | 8 blocks ahead: median K 40.40 over 3 runs. 32 blocks ahead: 41.44 over 3. 16 blocks: 41.49 over 14 | pending | — | — | — |
 | 50 | Line cuts with no change of behaviour: a helper for locks and one for ids inlined, and a few statements shortened | A fresh read of the code found them. S -16 by rustfmt's count, instructions flat at +0.07% | pending | — | — | — |
+| 51 | exp: short checks filtered into a list before any write to hits, and group collects its items once | About half of 8.9M short checks are false, and each still wrote its hit word. Local: instructions -1.58%, cycles -2.9 to -4.7%, misses -3.4%, S -8 at first measure. group's second pass over its items was serial work in the plan | pending | — | — | — |
 
 ## Decision log
 
@@ -188,6 +189,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D50.** Reverted: 16 blocks stays
 
 **D51.** Kept for S, as nothing else changes
+
+**D52.** Experiment: judged by median K over at least 3 board runs
 
 ## What didn't work
 

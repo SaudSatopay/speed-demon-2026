@@ -561,11 +561,11 @@ fn make_check(steps: &[u32], anchor: u32, earlier: &[u32]) -> Check {
 /// Sorts items by their keys, below `keys`. Returns where each key's items start, then the number of items
 /// twice, and the items, which stay in order within a key. A key's count goes two entries on, the sums make
 /// that its start one entry on, and placing its items moves that to the next key's start.
-fn group<T>(keys: usize, all: impl Clone + Iterator<Item = (u32, T)>) -> (Vec<u32>, Vec<T>) {
-    let mut from = vec![0; keys + 2];
-    all.clone().for_each(|(key, _)| from[key as usize + 2] += 1);
+fn group<T: Copy>(keys: usize, all: impl Iterator<Item = (u32, T)>) -> (Vec<u32>, Vec<T>) {
+    let (mut from, all) = (vec![0; keys + 2], all.collect::<Vec<_>>());
+    all.iter().for_each(|&(key, _)| from[key as usize + 2] += 1);
     (0..keys).for_each(|key| from[key + 2] += from[key + 1]);
-    let mut grouped: Vec<T> = all.clone().map(|item| item.1).collect();
+    let mut grouped: Vec<T> = all.iter().map(|item| item.1).collect();
     for (key, item) in all {
         grouped[from[key as usize + 1] as usize] = item;
         from[key as usize + 1] += 1;
@@ -1194,10 +1194,18 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
             }
         }
     }
-    for &at in &short[..listed] {
-        // SAFETY: the list came from `anchor_lists`.
-        let check = unsafe { *plan.short_checks.get_unchecked(at as usize) };
-        add(counts_packed(check, present, stamp), at as usize);
+    let mut kept = 0;
+    for at in 0..listed {
+        // SAFETY: the list came from `anchor_lists`, and `kept` is at most `at`.
+        unsafe {
+            let at = *short.get_unchecked(at);
+            let check = *plan.short_checks.get_unchecked(at as usize);
+            *short.get_unchecked_mut(kept) = at;
+            kept += counts_packed(check, present, stamp) as usize;
+        }
+    }
+    for &at in &short[..kept] {
+        add(1, at as usize);
     }
 }
 

@@ -77,6 +77,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 41 | Back to the build where threads share the release of the corpus's pages | First ten ids per thread: T 0.0804, M 46.5 MB, K 39.73 over 3 runs, against K 41.46 over 4 for this source | run-c81ac5a14d50 | 0.0761 | 27.8 | K the source of step 39 again |
 | 42 | exp: ranges of a little under a block's documents, from the sample's mean document length | A range cut a block short about every second block, and a short block costs a whole pass over the columns: about 18% more passes than documents need | run-1f4332f9431a | 0.0733 | 28.0 | K median K 41.80 over 3 runs: kept |
 | 43 | exp: each tally's shared limit in a cache line of its own | A limit that one thread lowers throws out seven neighbours from the other threads' caches, 322,000 times on seed 1. This spends 2.6 MB that scores nothing, and M stays under 44 MB. Local cycles are flat, but they rank cache changes wrongly here | pending | — | — | — |
+| 44 | Back to the build without a cache line per tally's limit | A line per limit: median K 41.37 over 3 runs at M 29.6 MB, against 41.63 over 4 for this source | pending | — | — | — |
 
 ## Decision log
 
@@ -167,6 +168,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D43.** Kept, on the board: median K 41.80 over 3 runs against 41.46, S +2. A range of 1/576 of the corpus held about 434 documents, one full block and one cut short, and a short block costs a whole pass over the columns. Now a range is 247 documents' worth of bytes at the sample's mean length. Local paired wall read +7.1% inside 35% noise, and an earlier local test of block-sized ranges had shown no gain, so again only the board shows this. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300, verify 38/38.
 
 **D44.** Experiment: judged by median K over at least 3 board runs
+
+**D45.** Reverted: no gain from the false sharing it removed
 
 ## What didn't work
 

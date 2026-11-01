@@ -50,6 +50,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 26 | Map the graph file again | Reading it in pieces gave T 0.1501 against about 0.151, for 18 more lines: D's parse is too small a part of its run | run-cd677a8bdf1c | 0.1622 | 42.6 | 70.7 |
 | 27 | 28 fewer lines: offsets close up in the region pass, no shrink between queries, shorter helpers | S 648 costs K, and measuring each block showed every large one pays for itself, so only small cuts are left: removing simplify costs 9% K, tier 3 alone also 9% | superseded before it ran | — | — | — |
 | 28 | REGION 2^13 -> 2^14 (board test) | Fewer boundary nodes kept by simplify; +6 MB of per-thread Local arrays. Local timing too noisy to judge. | pending | — | — | — |
+| 29 | REGION back to 2^13 (2^14 lost: board T 0.1507, M 48.7 MB, K 26.34 against about 27.2); BATCH 32 -> 64 (board test) | Wider batches overlap more cache misses in parse and build, at 1.5 KB more stack. | pending | — | — | — |
 
 ## Decision log
 
@@ -110,6 +111,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D28. Trim, keep the design.** Measuring each block showed every large one pays for itself, so only small cuts are left: offsets close up in the region pass, no shrink between queries, shorter helpers. Evidence: S 648 -> 620, instructions -1%, mispredicts +0.16 per edge, M the same; grid, sweep and constant-hash all pass. Over 78 board runs up to Nov 1: T 0.144 to 0.166, median K 27.29, best K 27.65 (`run-6f599535a090`). Outcome: the final source.
 
 **D29.** Board test only: keep if median K beats the current source over 3 runs, else restore.
+
+**D30.** Board test only: keep if median K beats the current source over 3 runs, else restore to BATCH 32.
 
 ## What didn't work
 

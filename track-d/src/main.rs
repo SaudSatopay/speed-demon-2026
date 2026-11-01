@@ -105,7 +105,7 @@ fn for_ranges(len: usize, threads: usize, work: impl Fn(usize, usize) + Sync) {
 
 /// Edges parsed before any is used. A batch can prefetch all its cache lines and let them arrive
 /// together, instead of stalling on each in turn.
-const BATCH: usize = 32;
+const BATCH: usize = 64;
 
 /// Passes every edge line to `visit` as (tail, head, weight), in batches, from several threads. A
 /// line belongs to the range holding its first byte.
@@ -381,7 +381,7 @@ fn reverse(forward: Graph, threads: usize) -> [Graph; 2] {
 }
 
 /// Nodes per region, a block of node numbers that one thread simplifies on its own.
-const REGION: usize = 1 << 14;
+const REGION: usize = 1 << 13;
 /// A node's neighbours in its region, at most, while simplifying.
 const WIDTH: usize = 8;
 const NO_ARC: u16 = u16::MAX;

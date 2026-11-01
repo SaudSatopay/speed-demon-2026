@@ -93,6 +93,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 71 | No lock per record: marks wait in batches per part of the bits, and a batch is written under one lock. Keys and bits in separate tables | An extra lock per record cost T +9% on the box, while removing 10% of the instructions gave -2% | pending | — | — | — |
 | 72 | Back to c-v88 (batched locks: T 0.0244), with 16 KiB read pieces and a smaller stack | Two threads share a 48 KiB L1 on the box, so a 32 KiB piece per thread doesn't fit; a second line fill per record cost +22% T, so fills look like the limit | pending | — | — | — |
 | 73 | Back to 32 KiB pieces (16 KiB: T 0.0207, M 13.28). The first loop merged into the second: tags read without a prefetch | Instructions -8 and S about -13; the tag lines are L2 hits on the box, which its reorder window should cover | pending | — | — | — |
+| 74 | exp: threads claim one 31 KiB piece at a time, each finding its own cuts in the text it read | First to last finish is about 600 us with 24 segments per thread, and each segment costs two small reads. Claiming pieces should close the gap and drop those reads; also 10 fewer lines | pending | — | — | — |
 
 ## Decision log
 
@@ -242,6 +243,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D72.** exp: keep if T holds near 0.020 with M lower
 
 **D73.** exp: keep if K beats 43.70 over samples
+
+**D74.** pending the board
 
 ## What didn't work
 

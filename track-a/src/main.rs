@@ -149,6 +149,11 @@ unsafe fn load<T: Copy>(text: &[u8], pos: usize) -> T {
     unsafe { text.as_ptr().add(pos).cast::<T>().read_unaligned() }
 }
 
+/// A call to this marks the branch it's on as rare, so that the per-line path gets the registers and the
+/// straight run of code.
+#[cold]
+fn cold() {}
+
 /// One bit per byte of two blocks, set where they're equal.
 fn equal_bytes(a: [__m256i; 2], b: [__m256i; 2]) -> u64 {
     // SAFETY: the build targets x86-64-v3, which has AVX2.
@@ -242,13 +247,14 @@ unsafe fn parse_latency(text: &[u8], pos: usize) -> (u32, usize) {
     // SAFETY: the build targets x86-64-v3, which has SSE4.1.
     let mut value = unsafe {
         let aligned = _mm_cvtsi64_si128((word << (64 - 8 * digits)) as i64);
-        let bytes = _mm_and_si128(aligned, _mm_set1_epi8(15));
+        let bytes = _mm_subs_epu8(aligned, _mm_set1_epi8(48));
         let pairs = _mm_maddubs_epi16(bytes, _mm_set1_epi16(10 + (1 << 8)));
         let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(100 + (1 << 16)));
         let eight = _mm_packus_epi32(quads, quads);
         _mm_cvtsi128_si32(_mm_madd_epi16(eight, _mm_set1_epi32(10000 + (1 << 16)))) as u64
     };
     while digits >= 8 && text[pos + digits] != b'\n' {
+        cold();
         value = value * 10 + u64::from(text[pos + digits] - b'0');
         digits += 1;
     }
@@ -293,6 +299,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                 let stamp: u64 = unsafe { load(text, line + 6) };
                 let method: u8 = unsafe { load(text, line + 31) };
                 if stamp != last_stamp {
+                    cold();
                     // The old hour's place goes back, and the new hour's comes out.
                     (blocks[hour], last_stamp, hour) = (place, stamp, hour_index(stamp));
                     place = blocks[hour];
@@ -313,19 +320,20 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                 let spaces = equal_bytes(key, gap);
                 // Endpoints average 34 bytes, and 94% of them end within 64, so the second block is
                 // read only when the first has no space: there, the first's trailing zeros are 64.
-                // SAFETY: the padding covers it.
-                let far = || unsafe { equal_bytes(load(text, at + 64), gap) }.trailing_zeros();
-                let more = if spaces == 0 { far() } else { 0 };
-                let len = (spaces.trailing_zeros() + more) as usize;
+                let mut len = spaces.trailing_zeros() as usize;
+                if spaces == 0 {
+                    cold();
+                    // SAFETY: the padding covers it.
+                    len +=
+                        unsafe { equal_bytes(load(text, at + 64), gap) }.trailing_zeros() as usize;
+                }
                 // Whatever the line holds, the closing space, `close`, is at most 172 bytes after
-                // `line`, so the next two loads end at most 13 bytes later, inside the padding.
+                // `line`, so the loads of its status and latency end at most 13 bytes later, inside
+                // the padding.
                 let close = at + len;
-                // Statuses are 100 to 599.
-                // SAFETY: as above.
-                let err = u32::from(unsafe { load::<u8>(text, close + 1) } == b'5');
                 // Three status digits sit between two spaces, so the latency starts 5 bytes on.
                 // SAFETY: as above.
-                let (latency, digits) = unsafe { parse_latency(text, close + 5) };
+                let (mut latency, digits) = unsafe { parse_latency(text, close + 5) };
                 // SAFETY: `at` is at least 29, so `close - 8` is inside the buffer, and both loads end
                 // inside the padding, as above.
                 let (first, last) = unsafe { (load(text, at), load(text, close - 8)) };
@@ -345,6 +353,7 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                 let hit = !equal_bytes(seen, key) & mask == 0 && spaces != 0;
                 let id = if hit { kept as u32 } else { miss() };
                 if latency >= BIG_LATENCY {
+                    cold();
                     // A fresh block of big latencies, from the back of the hour's array.
                     if bigs[hour] as usize % (BIG_BLOCK * 4) == 0 {
                         let Hour { words, back, .. } = &hours[hour];
@@ -355,13 +364,18 @@ fn parse(log: &File, table: &Table, hours: &[Hour], mut next: impl FnMut() -> Op
                     // words.
                     unsafe { (*bigs[hour]).store(u64::from(id) << 32 | latency as u64, Relaxed) };
                     bigs[hour] = bigs[hour].wrapping_add(1);
+                    latency = BIG_LATENCY;
                 }
                 // A fresh block of records, from the front.
                 if place as usize % (BLOCK * 4) == 0 {
+                    cold();
                     let Hour { words, front, .. } = &hours[hour];
                     place = words[front.fetch_add(BLOCK, Relaxed)..].as_ptr();
                 }
-                let record = id << ID_SHIFT | latency.min(BIG_LATENCY) << 1 | err;
+                // Statuses are 100 to 599.
+                // SAFETY: as above, for `close`.
+                let err = u32::from(unsafe { load::<u8>(text, close + 1) } == b'5');
+                let record = id << ID_SHIFT | latency << 1 | err;
                 // SAFETY: `place` is inside a block this thread reserved, until it's aligned again.
                 unsafe { (*place).store(record, Relaxed) };
                 place = place.wrapping_add(1);
@@ -420,25 +434,22 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
         // An endpoint with no line in this hour prints nothing.
         let Some(_) = group.first() else { continue };
         let n = group.len();
-        let (count, errors): (u64, u64) = (n as u64, group.iter().map(|r| u64::from(r & 1)).sum());
-        // A group's big latencies are its last records, as they sort highest.
-        let is_big = |&&r: &&u32| r >> 1 & BIG_LATENCY == BIG_LATENCY;
-        let big_count = group.iter().rev().take_while(is_big).count();
-        // Nearest rank, as the spec defines it. A rank among the group's big latencies reads the real
-        // value from `big`, where a binary search finds the group's first.
+        let errors = group.iter().map(|r| r & 1).sum::<u32>() as u64;
+        // Nearest rank, as the spec defines it. A group's big latencies are its last records, as they
+        // sort highest, so a rank among them reads the real value from `big`, by two binary searches.
         let pct = |p: usize| {
             let index = (p * n + 99) / 100 - 1;
-            match index.checked_sub(n - big_count) {
-                Some(i) => big[big.partition_point(|e| e >> 32 < id as u64) + i] & 0xFFFF_FFFF,
-                None => u64::from(group[index] >> 1 & BIG_LATENCY),
+            let small = |r: &u32| r >> 1 & BIG_LATENCY < BIG_LATENCY;
+            if small(&group[index]) {
+                return u64::from(group[index] >> 1 & BIG_LATENCY);
             }
+            let first = big.partition_point(|e| e >> 32 < id as u64);
+            big[first + index - group.partition_point(small)] & 0xFFFF_FFFF
         };
-        let (p50, p99) = (pct(50), pct(99));
-        // Below 20 records, p95 and p99 are the same record.
-        let p95 = if n <= 19 { p99 } else { pct(95) };
-        let rate = errors * 1_000_000 / count;
+        let (p50, p95, p99) = (pct(50), pct(95), pct(99));
+        let rate = errors * 1_000_000 / n as u64;
         // The digits of the six numbers, in the order they print.
-        let [a, b, c, d] = eight_digits([count, p50, p95, p99]);
+        let [a, b, c, d] = eight_digits([n as u64, p50, p95, p99]);
         let [e, f, ..] = eight_digits([errors, rate, 0, 0]);
         // SAFETY: the hour's array has room for 256 bytes past any line. A key is in the table's lines,
         // followed by its closing space, and a copy of fixed size has no branch on its length. The stamp
@@ -463,7 +474,7 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
             to.set_len(end.offset_from(to.as_ptr()) as usize);
         }
         if p99 >= 100_000_000 {
-            writeln!(to, "{count} {p50} {p95} {p99} {errors} {rate}").expect("writing to a Vec");
+            writeln!(to, "{n} {p50} {p95} {p99} {errors} {rate}").expect("writing to a Vec");
         }
     }
 }

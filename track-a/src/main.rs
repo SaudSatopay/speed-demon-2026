@@ -542,6 +542,13 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // Tying a segment's size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
     // smaller than a line on tiny inputs.
     let segment = (end / (threads * 64)).max(1);
+    // Threads faulting in the same large folio of the page cache sleep on its lock, so on a big log
+    // they stay out of each other's folios.
+    let segment = if segment < 1 << 16 {
+        segment
+    } else {
+        segment.next_multiple_of(1 << 20)
+    };
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
     let worker = &|me: usize| {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each

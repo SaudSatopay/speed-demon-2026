@@ -83,6 +83,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 61 | Rows unpacked to 8 words, one line each; min and max as branches; repeats added from BTS's carry; the locked write last in a record | The third loop had 103 instructions, with 5 register spills, 5 instructions turning the carry into a count and 8 for min and max, which hardly ever change | pending | — | — | — |
 | 62 | Position bytes from one GFNI matrix multiply instead of six PDEPs, with +gfni in the build's target features | Six PDEPs a block take the one port that runs them, and the box's Raptor Lake cores have GFNI | pending | — | — | — |
 | 63 | Row columns reordered so sums aren't adjacent; tuning for old CPUs lifted (false dependencies of bit counts, slow three-part LEA) | The compiler paired adjacent additions into vector instructions that took more than the two would, and added zeroing instructions and split LEAs meant for old CPUs | pending | — | — | — |
+| 64 | exp: 52-byte name slots on the current base, with the join table first in the mapping | Local M 9.85 to 8.53, wall +3%, S +17; its one earlier sample came in a run where A and D also ran slow | pending | — | — | — |
 
 ## Decision log
 
@@ -212,6 +213,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D62.** Cycles per record -3.3%, instructions the same, wall -3 to -5% locally, S +4
 
 **D63.** Instructions per record 271 to 261, cycles -1.5 to -2%, S the same
+
+**D64.** Keep or revert after several samples
 
 ## What didn't work
 

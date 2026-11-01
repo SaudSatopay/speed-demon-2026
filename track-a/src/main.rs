@@ -25,8 +25,7 @@ use std::io::{self, Write};
 use std::mem::{replace, transmute};
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Arc, Mutex};
-use std::{fs::File, os::fd::AsRawFd, path::Path, thread};
+use std::{fs::File, os::fd::AsRawFd, path::Path, sync::Arc, sync::Mutex, thread};
 
 /// Every seed's log spans exactly 2026-10-30T18:00Z to 2026-11-02T17:59Z (spec section 2).
 const HOURS: usize = 72;
@@ -43,9 +42,6 @@ const ID_SHIFT: u32 = 20;
 /// from the front, a page at a time, and big latencies, two words each, from the back.
 const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
-
-/// Bytes of the log ahead of a line to prefetch: past the page's end, where the L2 streamer stops.
-const AHEAD: usize = 1536;
 
 /// Bytes of the log that a thread takes out of the address space at a time, at the end.
 const RELEASE: usize = 1 << 23;
@@ -67,9 +63,6 @@ const IDS: usize = 1 << 12;
 /// DELETE has E (5), and OPTIONS has I (9).
 const METHOD_LENGTHS: u64 = 0x70_0064_5003;
 
-/// 64 bytes of the table's keys.
-type Line = [AtomicU8; 64];
-
 /// The lock-free endpoint table, and what the threads share about the hours, here to spare `parse` a
 /// fifth argument. `repr(C)`, here and on the next two, keeps the fields in the order they were timed
 /// in, as that decides which of them share a cache line.
@@ -78,7 +71,7 @@ struct Table {
     /// The keys. A key has whole lines, through its closing space, so a block load of a published key
     /// meets no other thread's stores, and a compare touches one cache line. A key's first line is its
     /// id.
-    lines: &'static [Line],
+    lines: &'static [[AtomicU8; 64]],
     /// Each holds its key's first line, so 0 means empty, as line 0 is never used, and a published slot
     /// never changes.
     slots: [AtomicU16; SLOTS],
@@ -134,13 +127,8 @@ unsafe extern "C" {
 }
 
 // Their arguments, as Linux on x86-64 defines them.
-const PR_SET_THP_DISABLE: i32 = 41;
-/// `PROT_READ | PROT_WRITE`.
-const PROT_READ_WRITE: i32 = 1 | 2;
 /// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`.
-const MAP_PRIVATE_ANON_NORESERVE: i32 = 0x02 | 0x20 | 0x4000;
-/// `MAP_PRIVATE | MAP_FIXED`.
-const MAP_PRIVATE_FIXED: i32 = 0x02 | 0x10;
+const MAP_SPARSE: i32 = 0x02 | 0x20 | 0x4000;
 const MADV_DONTNEED: i32 = 4;
 
 /// Loads a `T` at `pos`, little-endian and with no alignment. It's a `u8`, a `u64` for 8 bytes, or two
@@ -195,8 +183,7 @@ fn id_of(table: &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
     let read = |at: usize| unsafe { table.lines.as_ptr().add(at).cast::<[__m256i; 2]>().read() };
     let differ = |at: usize, b, m: u64| !equal_bytes(read(at), b) & m;
     loop {
-        index &= SLOTS - 1;
-        let slot = &table.slots[index];
+        let slot = &table.slots[index & (SLOTS - 1)];
         let mut line = slot.load(Acquire) as usize;
         if line == 0 {
             // A key takes at most 2 lines.
@@ -284,17 +271,13 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
         // A line belongs to the segment holding its first byte, so a segment after the first starts a
         // byte early, and skips the line already started. The log ends in LF, so there's an LF to find.
         let mut last_stamp = 0;
-        let first = text[start.saturating_sub(1)..]
-            .iter()
-            .position(|&b| b == b'\n');
-        let mut line = if start > 0 {
-            start + first.expect("no LF")
-        } else {
-            0
-        };
+        let mut rest = text[start.saturating_sub(1)..].iter();
+        let skip = (start > 0).then(|| rest.position(|&b| b == b'\n').expect("no LF"));
+        let mut line = start + skip.unwrap_or(0);
         while line < end {
+            // Prefetch past the page's end, where the L2 streamer stops.
             // SAFETY: a prefetch needs no valid address, and never faults.
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(text.as_ptr().wrapping_add(line + AHEAD).cast()) };
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(text.as_ptr().wrapping_add(line + 1536).cast()) };
             // Reads at a fixed distance from `line` need no check, since `line` is inside the log
             // and the padding is longer than any such distance, and whatever they read is safe.
             // The hour's bytes of the timestamp, and the method's 4th byte, whose low nibble picks
@@ -378,9 +361,8 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
             // Statuses are 100 to 599.
             // SAFETY: as above, for `close`.
             let err = u32::from(unsafe { load::<u8>(text, close + 1) } == b'5');
-            let record = id << ID_SHIFT | latency << 1 | err;
             // SAFETY: `place` is inside a block this thread reserved, until it's aligned again.
-            unsafe { (*place).store(record, Relaxed) };
+            unsafe { (*place).store(id << ID_SHIFT | latency << 1 | err, Relaxed) };
             place = place.wrapping_add(1);
             line = close + 6 + digits;
         }
@@ -426,8 +408,7 @@ fn pass(from: &[u32], to: &mut [u32], at: &mut [u32], order: &[usize], d: impl F
 /// each id's group ends, its big latencies sorted by id and then latency, and the endpoints and ids in
 /// order.
 fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order, to: &mut Vec<u8>) {
-    let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24).into_bytes();
-    let stamp: [u8; 21] = stamp.try_into().expect("a stamp is 21 bytes");
+    let stamp = format!("{}T{:02}:00:00Z ", DATES[(h + 18) / 24], (h + 18) % 24);
     // Each group starts where the one before it ends, and id 0's holds the unused ends of blocks.
     let mut start = ends[0] as usize;
     for (key, &id) in order.keys.iter().zip(&order.ids).skip(1) {
@@ -457,15 +438,13 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
         // is 21 bytes with its space, and the 22 is that and the key's closing space.
         unsafe {
             let mut at = to.as_mut_ptr().add(to.len());
-            at.cast::<[u8; 21]>().write_unaligned(stamp);
-            let whole = key.as_ptr().cast::<[u8; 128]>().read_unaligned();
-            at.add(21).cast::<[u8; 128]>().write_unaligned(whole);
+            at.copy_from_nonoverlapping(stamp.as_ptr(), 21);
+            at.add(21).copy_from_nonoverlapping(key.as_ptr(), 128);
             at = at.add(22 + key.len());
             let numbers = at;
-            for digits in [a, b, c, d, e, f] {
-                let zeros = (digits.trailing_zeros() as usize / 8).min(7);
-                at.cast::<u64>()
-                    .write_unaligned((digits | 0x3030_3030_3030_3030) >> (8 * zeros));
+            for word in [a, b, c, d, e, f] {
+                let zeros = (word.trailing_zeros() as usize / 8).min(7);
+                std::ptr::write_unaligned(at.cast(), (word | 0x3030_3030_3030_3030) >> (8 * zeros));
                 at.add(8 - zeros).write(b' ');
                 at = at.add(9 - zeros);
             }
@@ -526,15 +505,14 @@ fn write_hour(h: usize, hour: &Hour, table: &Table, digits: &[usize], tmp: &mut 
 /// to `round` itself.
 fn append(hours: &[Hour], next: &Mutex<usize>, mut file: &File) {
     let Ok(mut n) = next.try_lock() else { return };
-    while let Some(hour) = hours.get(*n).filter(|h| h.ready.load(Acquire) > 0) {
-        let Hour { words, ready, .. } = hour;
+    while let Some(h) = hours.get(*n).filter(|h| h.ready.load(Acquire) > 0) {
         // SAFETY: the text is whole, as its length is out, and nothing else refers to it.
-        let text = unsafe { from_raw_parts(words.as_ptr().cast(), ready.load(Relaxed) - 1) };
+        let text = unsafe { from_raw_parts(h.words.as_ptr().cast(), h.ready.load(Relaxed) - 1) };
         // `panic = "abort"`: a failed write ends the process.
         file.write_all(text).expect("writing the summary");
         // SAFETY: nothing else refers to these whole pages, and nothing reads them again. A failure
         // would only keep them in memory.
-        unsafe { madvise(text.as_ptr().cast_mut(), words.len() * 4, MADV_DONTNEED) };
+        unsafe { madvise(text.as_ptr().cast_mut(), h.words.len() * 4, MADV_DONTNEED) };
         *n += 1;
     }
 }
@@ -550,21 +528,19 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // and 1 MiB for text, as an hour has one line per endpoint, of about 200 bytes at most.
     let room = (end / 15 + (BLOCK + BIG_BLOCK) * (threads + 1) + (1 << 18)).next_multiple_of(BLOCK);
     // The hours' words, then the table's lines. Nearly all stay untouched, hence MAP_NORESERVE.
-    let bytes = HOURS * room * 4 + IDS * size_of::<Line>();
-    // SAFETY: this maps fresh zero pages, for the life of the process.
-    let base = unsafe { mmap(0, bytes, PROT_READ_WRITE, MAP_PRIVATE_ANON_NORESERVE, -1, 0) };
+    // SAFETY: this maps fresh zero pages, readable and writable (1 | 2), for the life of the process.
+    let base = unsafe { mmap(0, HOURS * room * 4 + IDS * 64, 1 | 2, MAP_SPARSE, -1, 0) };
     assert_ne!(base as isize, -1, "mmap: {}", io::Error::last_os_error());
     // SAFETY: the mapping holds `HOURS * room` zero words, reached only through `hours`.
     let arena = unsafe { from_raw_parts(base.cast::<AtomicU32>(), HOURS * room) };
-    // SAFETY: and after them the lines of zeros, page-aligned, reached only through `table`.
-    let lines = unsafe { from_raw_parts(base.add(HOURS * room * 4).cast::<Line>(), IDS) };
     let hour = |words| Hour {
         words,
         ..Default::default()
     };
     let hours: Vec<Hour> = arena.chunks(room).map(hour).collect();
     let table = Table {
-        lines,
+        // SAFETY: after the hours' words come the lines of zeros, page-aligned, reached only from here.
+        lines: unsafe { from_raw_parts(base.add(HOURS * room * 4).cast(), IDS) },
         slots: [const { AtomicU16::new(0) }; SLOTS],
         used: AtomicUsize::new(1),
         progress: Mutex::new(Progress {
@@ -644,8 +620,8 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
 extern "C" fn main() -> i32 {
     // Transparent huge pages would round each hour's sparse array up to 2 MB, so turn them off. Failing
     // is harmless.
-    // SAFETY: it only sets a flag on our own process.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    // SAFETY: 41 is `PR_SET_THP_DISABLE`, which only sets a flag on our own process.
+    unsafe { prctl(41, 1, 0, 0, 0) };
     let arg = |i, default: &str| std::env::args().nth(i).unwrap_or(default.into());
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
@@ -656,10 +632,11 @@ extern "C" fn main() -> i32 {
     // SAFETY: fresh zero pages for the padding and past it, then the log over their start. Nothing writes
     // to the log while this runs, as it's on a read-only mount, and only `text` reaches the mapping.
     let text = unsafe {
-        let room = end + PADDING + (1 << 12);
-        let base = mmap(0, room, 1, MAP_PRIVATE_ANON_NORESERVE, -1, 0);
+        // Protection 1 is `PROT_READ`.
+        let base = mmap(0, end + PADDING + (1 << 12), 1, MAP_SPARSE, -1, 0);
         assert_ne!(base as isize, -1, "mmap");
-        let mapped = mmap(base as usize, end, 1, MAP_PRIVATE_FIXED, log.as_raw_fd(), 0);
+        // Flags: `MAP_PRIVATE | MAP_FIXED`.
+        let mapped = mmap(base as usize, end, 1, 0x02 | 0x10, log.as_raw_fd(), 0);
         assert!(end == 0 || mapped == base, "mmap");
         from_raw_parts(base, end + PADDING)
     };

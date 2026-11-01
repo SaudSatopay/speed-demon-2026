@@ -88,6 +88,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 66 | The padding table on one cache line; 8 lines saved outside the hot path | PADS straddled a line, so most key loads split across two. mark's signature fits one line now, and find always gives a slot, since a full table throws the pass away anyway | pending | — | — | — |
 | 67 | exp: a second locked operation per record, on the thread's own row | To time one uncontended locked operation on the box: Golden Cove's are about twice Zen 4's in cycles, and locally dropping the lock saves only 2% | pending | — | — | — |
 | 68 | Back on the build without the extra locked operation | The experiment has run | pending | — | — | — |
+| 69 | Per-record path: 27 fewer instructions (home and tag kept from the first loop, byte offsets for slots, branch for the BOM, CMP/SBB sign, shuffle classifier, PEXT directly on the mask, ADC-style empty-field fix, locked write's table pointers held in registers) | The box is a 2.5 GHz Golden Cove near its rename limit, so instructions set T: last time -7% instructions gave -5% T | pending | — | — | — |
 
 ## Decision log
 
@@ -227,6 +228,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D67.** An experiment, reverted right after its run
 
 **D68.** See PROGRESS for the cost of a locked operation on the box
+
+**D69.** Instructions 258 -> 229 per record, cycles -8% locally, S 492. Keep if the board's T falls
 
 ## What didn't work
 

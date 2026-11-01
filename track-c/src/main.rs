@@ -96,19 +96,15 @@ unsafe fn load_u64(text: &[u8], pos: usize) -> u64 {
     unsafe { text.as_ptr().add(pos).cast::<u64>().read_unaligned() }
 }
 
-/// One bit per byte of the 64 at `at`, set where the byte is `first` or `second`.
+/// One bit per byte of the 64 at `at`, set where `is` marks the byte in its vector.
 ///
 /// # Safety
 /// The 64 bytes at `at` must be inside a buffer.
-unsafe fn byte_mask(at: *const u8, first: u8, second: u8) -> u64 {
+unsafe fn byte_mask(at: *const u8, is: impl Fn(__m256i) -> __m256i) -> u64 {
     // SAFETY: the caller keeps both loads inside the buffer, they need no alignment, and the build
     // targets x86-64-v3, which has AVX2.
     unsafe {
-        let is = |block, byte| _mm256_cmpeq_epi8(block, _mm256_set1_epi8(byte as i8));
-        let mask = |at| {
-            let block = _mm256_loadu_si256(at);
-            _mm256_movemask_epi8(_mm256_or_si256(is(block, first), is(block, second))) as u32
-        };
+        let mask = |at| _mm256_movemask_epi8(is(_mm256_loadu_si256(at))) as u32;
         let at = at.cast::<__m256i>();
         u64::from(mask(at)) | u64::from(mask(at.add(1))) << 32
     }
@@ -119,7 +115,8 @@ unsafe fn byte_mask(at: *const u8, first: u8, second: u8) -> u64 {
 /// step doubles the digits per lane: to 2, to 4, then to 8. The third is an amount, in the form `d.dd`,
 /// so its weights are for cents: its point's byte has none, and the digit before the point gets the
 /// weight of the point.
-fn parse_three(words: [u64; 3]) -> [u64; 3] {
+/// The first two come back as one word, low half first, since most callers keep them side by side.
+fn parse_three(words: [u64; 3]) -> (u64, u32) {
     // SAFETY: x86-64-v3 has AVX2.
     unsafe {
         let [a, b, c] = words.map(|word| word as i64);
@@ -135,9 +132,8 @@ fn parse_three(words: [u64; 3]) -> [u64; 3] {
         // The second one is a region id, and `add_records` needs it inside the join table.
         let cap = _mm256_set_epi32(-1, -1, -1, -1, -1, -1, REGION_IDS as i32 - 1, -1);
         let eights = _mm256_min_epu32(eights, cap);
-        let low = _mm256_extract_epi64::<0>(eights) as u64;
-        let high = _mm256_extract_epi32::<4>(eights);
-        [low & 0xFFFF_FFFF, low >> 32, high as u32 as u64]
+        let first_two = _mm256_extract_epi64::<0>(eights) as u64;
+        (first_two, _mm256_extract_epi32::<4>(eights) as u32)
     }
 }
 
@@ -226,7 +222,7 @@ impl<'a> NameTable<'a> {
             // SAFETY: `pos` is inside the text, and the padding covers the load.
             let word = unsafe { load_u64(text, pos) };
             let bits = (!word & 0x1010_1010_1010_1010).trailing_zeros() & !7;
-            let [id, ..] = parse_three([word << (64 - bits), 0, 0]);
+            let (id, _) = parse_three([word << (64 - bits), 0, 0]);
             pos += bits as usize / 8 + 1;
             let code = (0..3).fold(0, |code, i| code * 26 + usize::from(text[pos + i] - b'A'));
             let index = &self.index_of[code];
@@ -237,7 +233,7 @@ impl<'a> NameTable<'a> {
                     index.store(keys.len() as u8, Relaxed); // At most 240 (spec section 2.3).
                 }
             }
-            self.regions[id as usize].store(index.load(Relaxed), Relaxed);
+            self.regions[id as u32 as usize].store(index.load(Relaxed), Relaxed);
             pos += 4; // The three letters and the LF.
         }
     }
@@ -250,7 +246,7 @@ impl<'a> NameTable<'a> {
     fn hash(text: &[u8], start: usize, len: usize) -> u32 {
         // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
         // CRC32 in SSE4.2, and x86-64-v3 includes both.
-        let head = unsafe { _bzhi_u64(load_u64(text, start), 8 * len as u32) };
+        let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
         let crc = unsafe { _mm_crc32_u64(len as u64, head) as u32 };
         if cfg!(sd_const_hash) { 0 } else { crc }
     }
@@ -275,15 +271,16 @@ impl<'a> NameTable<'a> {
     }
 
     /// Guesses the name's slot from the tags, and asks to own its line, for a write: a locked update
-    /// then needs no second trip to take it from the core that wrote it last. A wrong guess costs
-    /// `mark` a search. A name's tag is the low byte of its hash, or 1 for zero, which means free.
-    fn guess_slot(&self, hash: u32) -> usize {
-        let home = self.home(hash);
-        let hits = Self::slots_with(self.window(home), (hash as u8).max(1));
-        let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
+    /// then needs no second trip to take it from the core that wrote it last. A wrong guess costs a
+    /// search. A name's tag is the low byte of its hash, or 1 for zero, which means free; here a zero
+    /// finds a free slot, which is a wrong guess too, and costs one name in 256 less than a check.
+    /// It returns the slot's offset in bytes.
+    fn guess_slot(&self, home: usize, tag: u8) -> u32 {
+        let hits = Self::slots_with(self.window(home), tag);
+        let at = (home + hits.trailing_zeros() as usize) * SLOT_WORDS * 8;
         // SAFETY: the slot is inside the table, and prefetching has no effect on memory anyway.
-        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().add(base).cast()) };
-        base
+        unsafe { _mm_prefetch::<_MM_HINT_ET0>(self.words.as_ptr().byte_add(at).cast()) };
+        at as u32
     }
 
     /// The key of a name of at most `INLINE_BYTES`.
@@ -300,12 +297,11 @@ impl<'a> NameTable<'a> {
     /// Whether this slot holds the name. A slot whose writer hasn't finished with it doesn't.
     ///
     /// # Safety
-    /// `base` must be where a slot's words start.
-    unsafe fn holds(&self, base: usize, text: &[u8], start: usize, len: usize) -> bool {
+    /// `stored` must be where a slot's words start.
+    unsafe fn holds(stored: *const AtomicU64, text: &[u8], start: usize, len: usize) -> bool {
         // SAFETY: the slot is inside the table. A long name's pointer and length are published before
         // `LONG`, and are good for the life of the process. x86-64-v3 has AVX2.
         unsafe {
-            let stored = self.words.as_ptr().add(base);
             if len > INLINE_BYTES {
                 // The pointer and length may only be read once `LONG` shows they are in place.
                 if (*stored.add(3)).load(Acquire) != LONG {
@@ -323,6 +319,7 @@ impl<'a> NameTable<'a> {
 
     /// Finds the name's slot, or takes a free one for it. Only a wrong guess or a new name comes here.
     /// When every slot is taken it gives up, and `aggregate` throws the whole pass away, so any slot does.
+    /// It returns the slot's offset in bytes.
     #[cold]
     fn find(&self, text: &[u8], start: usize, len: usize) -> usize {
         let hash = Self::hash(text, start, len);
@@ -338,8 +335,8 @@ impl<'a> NameTable<'a> {
                 let base = (home + hits.trailing_zeros() as usize) * SLOT_WORDS;
                 while self.words[base + 3].load(Acquire) == 0 {}
                 // SAFETY: `base` is where a slot's words start.
-                if unsafe { self.holds(base, text, start, len) } {
-                    return base;
+                if unsafe { Self::holds(self.words[base..].as_ptr(), text, start, len) } {
+                    return base * 8;
                 }
                 hits &= hits - 1;
             }
@@ -365,34 +362,11 @@ impl<'a> NameTable<'a> {
                 }
                 (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
                 stored[3].store(key[3], Release);
-                return base;
+                return base * 8;
             }
         }
         self.full.store(true, Relaxed);
         0
-    }
-
-    /// Marks this name as seen in country `bit`, and adds one to `same` if it had been already.
-    ///
-    /// # Safety
-    /// `at` must be where a slot's words start.
-    unsafe fn mark(&self, at: usize, text: &[u8], name: (usize, usize), bit: u8, same: &mut i64) {
-        // SAFETY: the caller's promise, and `find` returns where a slot's words start. Its 256 bits
-        // start 4 words in, and a byte can't index past them.
-        unsafe {
-            let (start, len) = name;
-            let base = if self.holds(at, text, start, len) {
-                at
-            } else {
-                self.find(text, start, len)
-            };
-            // Nine records in ten set a new bit, so a plain load first would rarely save the locked
-            // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
-            // leaves the old bit in the carry.
-            let (words, bit) = (self.words.as_ptr(), usize::from(bit));
-            asm!("lock bts [{} + {} * 8 + 32], {}", "adc qword ptr [{}], 0",
-                in(reg) words, in(reg) base, in(reg) bit, in(reg) same);
-        }
     }
 }
 
@@ -405,8 +379,8 @@ const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
 /// Enough rows for every country index a byte can hold, so that indexing needs no check.
 type Rows = [Row; 256];
-/// A record's guessed slot, region, id and cents.
-type Found = [[u32; 4]; LISTED / 5];
+/// A record's home and hash, then its guessed slot, cents, and id and region together.
+type Found = [(u32, u32, u64); LISTED / 5];
 
 /// Segments per thread: when the segments run out, each thread still has its last to finish, and the
 /// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
@@ -439,33 +413,41 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         let mut odd_so_far = *odd;
         let mut at = text.as_ptr().add(scan);
         let end = at.add(blocks * 64);
+        // A byte's low half picks what the byte would have to be, to be a separator: an LF, a comma,
+        // or all ones, which only a byte with the top bit set could be, and those shuffle to zero.
+        let lf_comma = 0xFFFF_FF2C_FF0A_FFFFu64 as i64;
+        let separator = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
+        let quote = _mm256_set1_epi8(b'"' as i8);
         while at < end {
-            let quotes = byte_mask(at, b'"', b'"');
+            let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let ones = _mm_set1_epi8(-1);
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
             let inside = _mm_cvtsi128_si64(parity) as u64 ^ odd_so_far;
             odd_so_far = (inside as i64 >> 63) as u64;
-            let left = byte_mask(at, b',', b'\n') & !inside;
+            let shuffled = |block| _mm256_shuffle_epi8(separator, block);
+            let left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, shuffled(block))) & !inside;
             // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
-            // writes 8 whatever the number, and moves on by the right amount. The positions of the
-            // lowest 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every
-            // position at that position, and PEXT gathers it for those bits, into a byte. Those
-            // bytes are a bit matrix with a row per bit of a position, and GFNI's multiply, given
-            // the columns one at a time, turns it around into a byte per position.
-            let first = _pdep_u64(0xFF, left);
+            // writes 8 whatever the number, and moves on by the right amount. The positions of up to
+            // 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every position at
+            // that position, and PEXT gathers it for those bits, into a byte. Those bytes are a bit
+            // matrix with a row per bit of a position, and GFNI's multiply, given the columns one at
+            // a time, turns it around into a byte per position.
             let matrix = planes
                 .iter()
-                .fold(0, |matrix, &plane| matrix << 8 | _pext_u64(plane, first));
+                .fold(0, |matrix, &plane| matrix << 8 | _pext_u64(plane, left));
             let columns = _mm_cvtsi64_si128(0x8040_2010_0804_0201u64 as i64);
             let packed =
                 _mm_gf2p8affine_epi64_epi8::<0>(columns, _mm_cvtsi64_si128((matrix << 16) as i64));
             let bytes = _mm256_cvtepu8_epi32(packed);
             _mm256_storeu_si256(cursor.cast(), _mm256_add_epi32(bytes, base));
             let total = left.count_ones() as usize;
-            let mut rest = _pdep_u64(!0 << 8, left);
-            for i in 8..total {
-                *cursor.add(i) = at.offset_from(text.as_ptr()) as u32 + rest.trailing_zeros() + 1;
-                rest &= rest.wrapping_sub(1);
+            if total > 8 {
+                let mut rest = left;
+                for i in 0..total {
+                    *cursor.add(i) =
+                        at.offset_from(text.as_ptr()) as u32 + rest.trailing_zeros() + 1;
+                    rest &= rest.wrapping_sub(1);
+                }
             }
             cursor = cursor.add(total);
             at = at.add(64);
@@ -480,7 +462,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
 fn parse_records(mut pos: usize, end: usize, names: &NameTable, rows: &mut Rows, room: &mut [u8]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at. Positions fit 32 bits: a piece is small.
-    let (mut listed, mut found) = ([0u32; LISTED], [[0u32; 4]; LISTED / 5]);
+    let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
     let mut piece = PIECE;
     while pos < end {
         let len = piece.min(end - pos);
@@ -524,78 +506,105 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut Found, names: &NameTable
     // The tags are the one load in a record's chain that the caches don't answer at once, and a
     // thread's share of the core can't run far enough ahead to cover it, so each record's window is
     // asked for a loop before its use, and the hash kept for that. The window may straddle two lines.
+    // A name is two bytes shorter than its field. An empty one without quotes wraps around here, and
+    // that only makes it a wrong guess, in one record out of 200.
     for record in 0..records {
         let [_, name_at, note_at, ..] = positions(record);
-        let name = note_at - name_at - 1;
-        let hash = NameTable::hash(text, name_at + 1, name.saturating_sub(2));
+        let hash = NameTable::hash(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
         // SAFETY: `found` has room for every record, the window is inside the tags, and prefetching
         // has no effect on memory anyway.
         unsafe {
-            let window = names.tags.as_ptr().add(names.home(hash));
+            let home = names.home(hash);
+            let window = names.tags.as_ptr().add(home);
             _mm_prefetch::<_MM_HINT_T0>(window.cast());
             _mm_prefetch::<_MM_HINT_T0>(window.add(31).cast());
-            found.get_unchecked_mut(record)[0] = hash;
+            let slot = found.get_unchecked_mut(record);
+            (slot.0, slot.1) = (home as u32, hash);
         }
     }
+    let (words, regions) = (names.words.as_ptr(), names.regions.as_ptr());
     for record in 0..records {
         let [mut start, name_at, _, region_at, amount_at, _] = positions(record);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
         // loads. `region` stays inside the join table. Prefetching has no effect on memory.
         unsafe {
-            // Moves the digits at `start` to the top of a word, with zeros below them.
-            let digits = |start, end| load_u64(text, start) << (64 - 8 * (end - start) as u32);
             // A byte order mark can only start a record here, and no record otherwise starts with it.
-            if *text.get_unchecked(start) == 0xEF {
-                start += 3;
-            }
-            let id = digits(start, name_at - 1);
-            let region = digits(region_at, amount_at - 1);
+            (*text.get_unchecked(start) == 0xEF).then(|| start += 3);
+            // Moves the digits of the field at `start` to the top of a word, with zeros below them.
+            let id = load_u64(text, start) << (8 * (start + 1 - name_at) as u32 & 63);
+            // At most 7 digits (spec section 2.2), and the comma below them counts as a zero.
+            let region = load_u64(text, region_at - 1) << (8 * (region_at - amount_at) as u32 & 63);
             // Amounts are at most 8 bytes, and negative ones at most 7 (spec section 2.2), so one load
             // holds one with what follows it. Its digits, point and sign have bit 5 set, and the CR,
             // LF or padding after it doesn't, which finds its end with no branch to mispredict.
             let word = load_u64(text, amount_at);
             let field = (!word & 0x2020_2020_2020_2020).trailing_zeros() & !7; // 8 bits per byte
-            let negative = u32::from(word as u8 == b'-');
-            let [id, region, cents] = parse_three([id, region, word << (64 - field)]);
-            let cents = (cents as i64 ^ -(negative as i64)) + negative as i64;
-            _mm_prefetch::<_MM_HINT_T0>(names.regions.as_ptr().add(region as usize).cast());
-            let guess = names.guess_slot(found.get_unchecked(record)[0]);
-            *found.get_unchecked_mut(record) =
-                [guess, region as usize, id as usize, cents as usize].map(|v| v as u32);
+            let (id_region, cents) = parse_three([id, region, word << (64 - field)]);
+            // A minus sign is the one thing that sorts below a digit.
+            let negative = -i32::from((word as u8) < b'0');
+            _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
+            let (home, hash, _) = *found.get_unchecked(record);
+            let guess = names.guess_slot(home as usize, hash as u8);
+            let cents = (cents as i32 ^ negative) - negative;
+            *found.get_unchecked_mut(record) = (guess, cents as u32, id_region);
         }
     }
     for record in 0..records {
         let [_, name_at, note_at, region_at, ..] = positions(record);
-        let [guess, region, id, cents] = found[record];
-        let (name, note) = (note_at - name_at - 1, region_at - note_at - 1);
-        let both = region_at - name_at - 1;
-        // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
-        // for a count of 64.
-        let (name_quotes, quotes) = if both <= 64 {
-            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), b'"', b'"') };
-            let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
-            (below(name), below(both))
-        } else {
-            let count = |at: usize, len| text[at..at + len].iter().filter(|&&c| c == b'"').count();
-            (count(name_at, name), count(name_at, both))
-        };
-        // SAFETY: the first pass kept `region` inside the table, and `guess` came from `guess_slot`.
-        let country = unsafe { names.regions.get_unchecked(region as usize) }.load(Relaxed);
-        let cents = i64::from(cents as i32);
+        let (guess, cents, id_region) = found[record];
+        // SAFETY: the first pass kept the region inside the table, and its writes all came before.
+        let country = unsafe { regions.add((id_region >> 32) as usize).cast::<u8>().read() };
         let row = &mut rows[usize::from(country)].0;
+        let cents = i64::from(cents as i32);
         row[0] += 1;
-        row[2] += i64::from(id);
+        row[2] += i64::from(id_region as u32);
         row[4] += cents;
         // These hardly ever change, so branches beat conditional moves and two stores.
         (cents < row[1]).then(|| row[1] = cents);
         (cents > row[3]).then(|| row[3] = cents);
+        let (name, both) = (note_at - name_at - 1, region_at - name_at - 1);
+        // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
+        // for a count of 64.
+        let (name_quotes, quotes) = if both <= 64 {
+            let quote = unsafe { _mm256_set1_epi8(b'"' as i8) };
+            let is_quote = |block| unsafe { _mm256_cmpeq_epi8(block, quote) };
+            let mask = unsafe { byte_mask(text.as_ptr().add(name_at), is_quote) };
+            let below = |bits| unsafe { _bzhi_u64(mask, bits as u32) }.count_ones() as usize;
+            (below(name), below(both))
+        } else {
+            let tail = &text[name_at..name_at + both];
+            (count_quotes(&tail[..name]), count_quotes(tail))
+        };
         // A value is its field, less its delimiting quotes, less one for each `""`, with empty
         // fields of no quotes or two both coming to nothing.
-        row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
-        row[7] += (note - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
-        let key = (name_at + 1, name.saturating_sub(2));
-        unsafe { names.mark(guess as usize, text, key, country, &mut row[6]) };
+        let less_delimiter = |field: usize| (field - usize::from(field != 0)) as i64;
+        let name_field = name - name_quotes / 2;
+        row[5] += less_delimiter(name_field);
+        row[7] += less_delimiter(both - 1 - quotes / 2 - name_field);
+        let (start, len) = (name_at + 1, name.wrapping_sub(2));
+        // SAFETY: `guess` came from `guess_slot`, and `find` returns a slot too. The name starts
+        // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.
+        unsafe {
+            let at = if len <= INLINE_BYTES
+                && NameTable::holds(words.byte_add(guess as usize), text, start, len)
+            {
+                guess as usize
+            } else {
+                names.find(text, start, name.saturating_sub(2))
+            };
+            // Nine records in ten set a new bit, so a plain load first would rarely save the locked
+            // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
+            // leaves the old bit in the carry, which adds one to the row's repeats if it had been set.
+            asm!("lock bts [{} + {} + 32], {}", "adc qword ptr [{} + 48], 0",
+                in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
+        }
     }
+}
+
+/// Counts the quotes in a field too long for one block's mask, which is one record in 60.
+#[cold]
+fn count_quotes(field: &[u8]) -> usize {
+    field.iter().filter(|&&c| c == b'"').count()
 }
 
 /// Runs the numbered jobs below `count` that `next` hasn't handed out yet, sharing them with however

@@ -134,7 +134,7 @@ fn parse_three(words: [u64; 3]) -> [u64; 3] {
 
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
-const REGION_IDS: usize = 1 << 20;
+const REGION_IDS: usize = 1_000_001;
 /// Slots to start with: enough for the generator's pool of 100,000 names (spec section 2.2), at about
 /// 91% full. Only more names than slots cost a restart. A test build starts tiny, to exercise that.
 const INITIAL_SLOTS: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 110_000 };
@@ -399,8 +399,9 @@ type Rows = [Row; 256];
 /// A record's guessed slot, region, id and cents.
 type Found = [[u32; 4]; LISTED / 5];
 
-/// Segments per thread.
-const SEGMENTS: usize = 8;
+/// Segments per thread: when the segments run out, each thread still has its last to finish, and the
+/// threads done first sit idle. Each one costs two small reads and a short piece, so not too many.
+const SEGMENTS: usize = 24;
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
@@ -628,23 +629,23 @@ fn run_threads<F: Fn() + Sync>(work: &F, threads: usize, stacks: usize) {
 type Totals = (Vec<[u8; 3]>, Rows);
 
 /// Parses the whole file on `threads` threads and merges their rows, returning them with the codes.
-/// The threads share the regions too, and all of those are done before any record is parsed. Eight
-/// segments per thread balances the load. Tying the sizes to the thread count also makes the
-/// SD_THREADS test sweep move every cut. The spec's pool of names is a distribution, not a promise: if
+/// The threads share the regions too, and all of those are done before any record is parsed. Tying
+/// the part sizes to the thread count also makes the SD_THREADS test sweep move every cut. The spec's
+/// pool of names is a distribution, not a promise: if
 /// a file holds more names than the table, the pass is thrown away and redone with a bigger table.
 fn aggregate(records: &Input, lookup: &Input, threads: usize, slots: usize) -> Totals {
     let names = NameTable::new(records, slots, threads);
-    let (lines, segments) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
     let work = || {
         let mut room = [0u8; PIECE + PADDING + 64];
-        run_jobs(&lines, threads * SEGMENTS, |at| {
-            let (pos, end) = lookup.part(threads * SEGMENTS, at, b"\n");
+        run_jobs(&lines, line_parts, |at| {
+            let (pos, end) = lookup.part(line_parts, at, b"\n");
             names.parse_regions(lookup.read(pos, end - pos, &mut room), end - pos);
             parsed.fetch_add(1, Release);
         });
         // Not a barrier: nobody should wait for a thread that hasn't started, or be woken up.
-        while parsed.load(Acquire) < threads * SEGMENTS {
+        while parsed.load(Acquire) < line_parts {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];

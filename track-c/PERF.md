@@ -74,6 +74,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 52 | exp: one pass per record, with no list: one mask from the name's start, table work a record behind | A Fable agent's test of a leaner parser. Local: cycles level, instructions 295 -> 264, S 493 -> 512, and its stall analysis says the box's larger reorder buffer should favour it | pending | — | — | — |
 | 53 | Back to the two-stage parser | One pass per record gave T 0.0251 on the box against a steady 0.0228, though it matched locally with 10% fewer instructions | pending | — | — | — |
 | 54 | A piece's bytes line up with the file's within a cache line | The kernel's copy runs fastest when source and destination agree modulo 64; a finding from Track A | pending | — | — | — |
+| 55 | 24 segments per thread instead of 8, regions stay at 8 parts; the join table loses its unused 48 KB | With 8 per thread, threads that ran out of segments sat idle while the last ones finished: first to last finish was 1.05 ms of 13.9 locally | pending | — | — | — |
 
 ## Decision log
 
@@ -185,6 +186,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D53.** Two-stage stays: without a list, one record's latencies serialize.
 
 **D54.** Take it: kernel cycles about -2% locally, S +2. Too small to see in one board run.
+
+**D55.** Paired local wall -2 to -4% over five runs at 16 to 48 segments, identical binaries -0.4%. 24 balances the idle time against two small reads and a short piece per segment
 
 ## What didn't work
 

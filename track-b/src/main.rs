@@ -592,7 +592,7 @@ struct Query(bool, u32, u32);
 /// are in the order of the short checks, the long checks, then the terms'. A term's checks end where the
 /// next term's start.
 #[derive(Clone, Copy)]
-struct AnchorList(u32, u32, u32); // Where its short checks start, where its long ones do, and its own tally.
+struct AnchorList(u32, u32); // Where its short checks start, and where its long ones do.
 
 /// A tally's place in the plan: the answer it goes into, and the last of that answer's ten smallest
 /// documents when this last saw them, which only falls, so that the documents past it need no lock. Those
@@ -742,6 +742,9 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
             *tally = (*tally).min(term_tallies);
             term_tallies += u32::from(*tally == term_tallies);
             plan.shared_answer[query as usize] = query_count + *tally;
+            if first && !common_sure {
+                checks.push((term, (query_count + *tally, make_check(&[term], term, &[]))));
+            }
             if first && common_sure {
                 block_terms.push(term);
                 block_term_answers.push(query_count + *tally);
@@ -807,7 +810,7 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     plan.phrases.extend([0; 8]);
 
     // Then a term's checks, the short ones of all terms first. A short check holds up to 3 other terms.
-    let (term_count, answers) = (plan.terms.count, query_count + term_tallies + 1);
+    let (term_count, answers) = (plan.terms.count, query_count + term_tallies);
     for (term, (_, check)) in &mut checks {
         check.terms = check.terms.map(|term| new_number[term as usize]);
         let long = check.terms[3] != 0 || check.terms[..3].iter().any(|&t| t > PACKED_MAX);
@@ -845,7 +848,7 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
     // stays empty.
     let checked = checks.iter().map(|&(query, _)| query);
     let blocks = block_term_answers.into_iter().chain(block_queries);
-    let tally_answers = checked.chain(query_count..answers).chain(blocks);
+    let tally_answers = checked.chain(blocks);
     let tally = |answer| Tally(answer, AtomicU32::new(NONE));
     plan.tallies = tally_answers.map(tally).collect();
     let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
@@ -854,12 +857,8 @@ fn make_plan(plan: &mut Plan, docs: &[u8], threads: usize) {
 
     // Last, where each term's checks are, and its own tally, or the spare for a term without one, which
     // nothing reads.
-    let list = |t| AnchorList(starts[t], starts[term_count + t], 0);
+    let list = |t| AnchorList(starts[t], starts[term_count + t]);
     plan.anchor_lists = (0..=term_count).map(list).collect();
-    for (term, &new) in new_number.iter().enumerate() {
-        plan.anchor_lists[new as usize].2 =
-            checks.len() as u32 + term_tally[term].min(term_tallies);
-    }
 }
 
 // ---- The scan: what each thread keeps, and the stages of a document ----
@@ -1176,8 +1175,8 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
         // SAFETY: `anchor_lists` has one entry more than there are terms, `short` has room for all the checks
         // and four more, and an anchor's checks are all in `long_checks`.
         unsafe {
-            let AnchorList(from, long_from, own_tally) = *anchor_lists.get_unchecked(term as usize);
-            let AnchorList(to, long_to, _) = *anchor_lists.get_unchecked(term as usize + 1);
+            let AnchorList(from, long_from) = *anchor_lists.get_unchecked(term as usize);
+            let AnchorList(to, long_to) = *anchor_lists.get_unchecked(term as usize + 1);
             prefetch(checks.wrapping_add(from as usize).cast());
             // One store lists four of the term's short checks, which is enough for most, whatever
             // `listed` then keeps of them, and the loop lists any more.
@@ -1187,7 +1186,6 @@ fn check_bools(lists: &DocLists, bools: usize, plan: &Plan, doc: u32, scan: &mut
                 short[listed + (at - from) as usize] = at;
             }
             listed += (to - from) as usize;
-            add(1, own_tally as usize);
             for at in long_from as usize..long_to as usize {
                 let check = plan.long_checks.get_unchecked(at - short_count);
                 add(counts(check, present, stamp), at);

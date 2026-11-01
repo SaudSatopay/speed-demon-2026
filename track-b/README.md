@@ -17,7 +17,7 @@ Boolean and phrase queries over a 254 MB corpus. Rust, standard library only.
 - Sums of ids are kept in 40 bits per tally, so they hold while N(N-1)/2 is below 2^40, which is up to 1,482,910 documents. Past that a sum spills into the count, and nothing checks for it. The spec's full scale has 250,000 documents, whose sums stay under 2^35.
 - It relies on the spec's document ids, which are consecutive from 0 in the file's order, and on its bounds of 6 terms in a BOOL query and 8 in a phrase. A phrase of 9 terms could never match.
 - A wrong guess from the 1% sample can cost time, never a wrong answer.
-- S is 1,039 code lines against the reference's 91. Each feature has been measured again since it went in, and each still pays for its lines, but it's the most code of any of our tracks.
+- S is 1,046 code lines against the reference's 91. Each feature has been measured again since it went in, and each still pays for its lines, but it's the most code of any of our tracks.
 
 ## Approach
 

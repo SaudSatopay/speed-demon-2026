@@ -8,7 +8,7 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 |---|---|
 | Headline numbers and their board run IDs | [PERF.md](PERF.md), first lines |
 | Why each decision was made, reverted ones included | [PERF.md](PERF.md#decision-log) |
-| The hot loop | `src/main.rs`, functions `parse_records` and `add_records` |
+| The hot loop | `src/main.rs`, functions `separators`, `parse_records` and `add_records` |
 | How correctness was checked | [Correctness](#correctness), below |
 
 ## Limits
@@ -19,7 +19,7 @@ Aggregates per country, from a hostile 200 MB CSV joined against a region table.
 
 ## Approach
 
-Threads claim segments of the file from a shared counter, and cut them just after a CRLF, which is always a record boundary because the spec promises a CR appears nowhere else. A thread reads its segment in 32 KiB pieces into its own buffer. Inside a piece there are two stages. The first walks fixed 64-byte blocks: a carry-less multiply of the quote mask gives the parity of quotes at every byte, which tells inside from outside, and every comma and line end outside quotes goes on a list. The second reads each record from its five listed positions, in two passes over a chunk of about 16 records: the first parses the numbers, prefetches the join table entry, and guesses and prefetches the name's slot; the second counts quotes, adds to the country's row and marks the name.
+Threads claim segments of the file from a shared counter, and cut them just after a CRLF, which is always a record boundary because the spec promises a CR appears nowhere else. A thread reads its segment in 32 KiB pieces into its own buffer. Inside a piece there are two stages. The first walks fixed 64-byte blocks: a carry-less multiply of the quote mask gives the parity of quotes at every byte, which tells inside from outside, and every comma and line end outside quotes goes on a list. The list is written with PEXT and PDEP: six bit planes turn a block's separators into 8 position bytes at once. The second stage reads each record from its five listed positions, in three passes over a chunk of about 16 records: the first hashes each name and prefetches its tags; the second parses the numbers, prefetches the join table entry, and guesses and prefetches the name's slot; the third counts quotes, adds to the country's row and marks the name.
 
 The region table becomes an array from region id to country index, with indices given out as codes first appear; the threads fill it together, and the output is sorted when it's written. Nothing is unescaped: a quoted field's raw bytes, with its `""` pairs intact, encode its value one to one, and the value's length follows from counting its quotes. One lock-free table, shared by all threads, counts distinct names. A slot is one cache line, holding the name padded with ones and one bit per country. A vector of byte tags covers each name's home group and the next.
 
@@ -33,8 +33,9 @@ See [PERF.md](PERF.md) for run IDs.
 2. **No branch for most of the hostile parts.** Quote parity comes from arithmetic, so `""` pairs, commas in quotes and LFs in quotes cost no mispredicts: 0.41 per record.
 3. **Three numbers in one vector,** and an amount's point squeezed out by a shift.
 4. **Reads instead of a mapping.** The buffer stays in the first-level cache, and there are no page faults or TLB misses on small file pages. 32 KiB is the measured best: 16 KiB costs too many reads and 64 KiB leaves L1.
-5. **One cache line per name lookup,** prefetched for ownership before the locked write. A single `LOCK BTS` finds the country's bit.
+5. **One cache line per name lookup,** prefetched for ownership before the locked write. A single `LOCK BTS` finds the country's bit. Tags are prefetched a pass earlier, since under hyper-threading a thread's half of the reorder buffer can't hide even an L2 hit on them.
 6. **No page charged from a worker's CPU.** `memory.peak` counts each CPU's unused charge batch, up to 252 KB per CPU that charges anything, so this alone took M from about 12 to 10.3 MB.
+7. **No std runtime before `main`,** which saves about 15 system calls that the timer counts.
 
 ## Ideas and where they came from
 

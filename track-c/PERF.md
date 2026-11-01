@@ -6,8 +6,8 @@
 
 ## Where it loses
 
-- S is about 500 code lines against the reference's 108, which costs about 5 speed points. The two-stage parser, parallel setup and raw threads pay for their lines in T and M.
-- The first stage writes 8 list entries per block whatever the number, which is about 20 instructions per record, because a variable loop's exit mispredicts more than that costs.
+- S is about 490 code lines against the reference's 108, which costs about 5 speed points. Each block of it was measured against what it buys: the two-stage parser, bit-plane lists, parallel setup and raw threads pay in T and M. A pass by a separate agent, checking counters after each group of cuts, took out 56 cold lines; going further cost hot-path cycles.
+- T on one source swings between 0.0227 and 0.0276 from run to run on the box, so gains under about 3% need several samples.
 
 ## Where the reference spends its time
 
@@ -65,12 +65,12 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 43 | Count with repeats in one word, name bytes with note bytes in another | The compiler vectorised pairs of adjacent adds into four instructions each, and turning a set bit into a new-name flag took four more | run-03dd6f13e5ea | 0.0240 | 10.3 | 80.1 |
 | 44 | MADV_POPULATE_WRITE on the mapping, in one call | Touching a page at a time took 150 page faults more, and the piece-size runs suggest small-page faults cost a lot on the box: each larger piece needed more stack pages | run-c4842a2cf4c2 | 0.0238 | 10.7 | 80.0 |
 | 45 | exp: 64 KiB pieces again, now that stack pages take no faults | 64 KiB pieces halve the reads but gained nothing before; if faults on the extra stack pages were the reason, this should show it | run-9969baf99d50 | 0.0249 | 11.1 | 79.3 |
-| 46 | 32 KiB pieces, to stay | 64 KiB gave T 0.0249 and M 11.1 even with no faults on the stack pages, so faults weren't why it gained nothing. Also tried and dropped, by hardware counters: listing only commas (cycles flat, S +9), counting long notes' quotes with masks (cycles +1%), prefetching rows (+1%) | superseded before it ran | — | — | — |
-| 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | pending | — | — | — |
-| 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | pending | — | — | — |
-| 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | pending | — | — | — |
-| 50 | Read a long name's pointer only after its slot says it's complete | A Fable review found it: the pointer and length were loaded before the Acquire, so a reader could compare against a null pointer while a writer was part way through. 2 crashes in 1,900 runs on a spec-legal stress input; the generator almost never writes such a name (over 32 bytes: about 1 seed in 100,000) | pending | — | — | — |
-| 51 | C's entry point instead of std's | Std reads /proc/self/maps, installs handlers and allocates a signal stack before main: about 15 system calls the timer counts, and system calls cost far more on the box than locally. Finding from Track A | pending | — | — | — |
+| 46 | 32 KiB pieces, to stay | 64 KiB gave T 0.0249 and M 11.1 even with no faults on the stack pages, so faults weren't why it gained nothing. Also tried and dropped, by hardware counters: listing only commas (cycles flat, S +9), counting long notes' quotes with masks (cycles +1%), prefetching rows (+1%) | run-861d7f77375d (on ad4fd74, same code) | 0.0252 | 10.4 | 79.5 |
+| 47 | List writes by bit-plane transpose: PEXT and PDEP turn a block's separators into 8 position bytes at once; the amount's end from one bit test; a fixed copy for the list's tail | The first stage's list writes were the largest block of instructions, and a sibling stall is not the whole story: fewer ops still buy cycles | run-66ae7ca08130 | 0.0232 | 10.4 | 80.2 |
+| 48 | exp: a first short loop per chunk hashes each name and prefetches its tag window | The load-stall profile puts 36% of load stalls on the tag-window chain: a thread's half of the reorder buffer can't run far enough ahead to cover even an L2 hit | run-79723ba010ba | 0.0227 | 10.7 | 80.2 |
+| 49 | Fifty-six fewer lines, the same hot code: no job struct, keys built in main, one-line helper signatures, simpler cold paths | S 541 cost about 8% of K against the leader. A Fable agent cut only cold code, checking counters after each group | run-9c9b12a38866 | 0.0235 | 10.4 | 80.3 |
+| 50 | Read a long name's pointer only after its slot says it's complete | A Fable review found it: the pointer and length were loaded before the Acquire, so a reader could compare against a null pointer while a writer was part way through. 2 crashes in 1,900 runs on a spec-legal stress input; the generator almost never writes such a name (over 32 bytes: about 1 seed in 100,000) | run-40b0e94343ad | 0.0227 | 10.3 | 80.7 |
+| 51 | C's entry point instead of std's | Std reads /proc/self/maps, installs handlers and allocates a signal stack before main: about 15 system calls the timer counts, and system calls cost far more on the box than locally. Finding from Track A | run-55bdb13c33fe | 0.0228 | 10.4 | 80.6 |
 
 ## Decision log
 
@@ -190,7 +190,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 ## The final design
 
-Two-stage parsing of 32 KiB pieces, one shared lock-free name table with vector tags, and memory that workers never fault on. See the [README](README.md#approach). What the hardware counters say about it (local, 12 threads, per record): 293 instructions, 0.41 mispredicts, 160 thread cycles, of which about 57 are retiring, 45 wait on loads (2.2 first-level misses from L2, 0.3 from L3), 23 lose to the sibling thread, and 21 wait on other long operations, mostly the locked write.
+Two-stage parsing of 32 KiB pieces, one shared lock-free name table with vector tags, and memory that workers never fault on. See the [README](README.md#approach). What the hardware counters say about it (local, 12 threads, per record): about 295 instructions, 0.38 mispredicts, 150 thread cycles, of which about 34 wait on loads (1.2 first-level misses from L2, 0.14 from L3).
+
+A separate review tried to break this code: fresh seeds and hostile inputs against the reference (records straddling every position of a piece boundary, names over the table's capacity, records over 1 MiB, thread counts from 1 to 64) gave about 940 comparisons and 7,300 repeat runs with no wrong output, and found one crash on a spec-legal input with names over 32 bytes, since fixed (see the journey).
 
 ## How we know it's correct
 

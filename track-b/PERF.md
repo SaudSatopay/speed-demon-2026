@@ -72,6 +72,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 36 | Marks as stamps with no clearing per document, a one-multiply hash, ids from a counter, per-thread sample counts, a fourth way for short terms, phrases compared in one vector, the second pass 8 words at a time, and the corpus prefetched 16 blocks ahead | On the box T is thread cycles over 12 threads at 2.5 GHz, and about 35 mispredicts per document came mostly from each stage's loop exit, so whole stages could go | run-502eb22efedc (with `cfa0c46`) | 0.0838 | 27.1 | 79.7 |
 | 37 | Parked threads map the corpus ahead with MADV_POPULATE_READ, a common sure term's tally runs by blocks, columns numbered by first use and aligned, short checks packed in 8 bytes, a phrase anchor's neighbour stored for a first test, answers on their own cache lines, no barrier in the answer round, and 78 fewer lines | The board showed B more sensitive to L2 than local cycles say, so this round goes after bytes a thread drags through L2 per document and per block: block queries 2767 to 1913, columns 5067 to 3013, columns read per block 158 to 94 KB | run-840d618b3bd5 | 0.0786 | 28.4 | 80.4 |
 | 38 | exp: block queries at anchors holding N/32 documents, not N/48 | A common sure term's tally now runs by blocks, which changes what a block query costs, so the line may have moved | run-e2271da97952 | 0.0786 | 26.5 | 80.4 |
+| 39 | exp: all threads share the release of the corpus's pages before exit | The clock runs to exit, and exit takes 59,000 mapped pages out one by one on one thread. The same change helped A on the box. Local paired wall is flat, -0.8% inside 28% noise | pending | — | — | — |
 
 ## Decision log
 
@@ -152,6 +153,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D38.** Local, seed 1, 12 threads: cycles 1.84G to 1.69G, instructions 2.917G to 2.869G, cache misses 44.5M to 35.8M, wall -2.4 to -5%, S 1056 to 1032, M about 27 MB. Grid 43/43, threads 228/228, const-hash 38/38, stress 0 wrong in 300. The "too many ids" assert goes; the README's limits give the corpus size that the 40-bit sums hold. Tried and dropped: one thread round (+1 ms), the plan on threads, heap prefault, mapped output, skipping empty sets (12% are empty, +1.5%), selective clears.
 
 **D39.** Measurement against T 0.0787 at N/48. S flat.
+
+**D40.** Experiment: judged by median K over at least 3 board runs against the current source
 
 ## What didn't work
 

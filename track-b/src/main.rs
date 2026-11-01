@@ -1333,7 +1333,11 @@ struct Progress {
     totalled: AtomicUsize,      // How many threads have no more to add up.
     next_batch: AtomicUsize,    // In queries, as is...
     written: AtomicUsize,       // ...how many of them have reached the file.
+    next_release: AtomicUsize,  // In bytes of the corpus.
 }
+
+/// How much of the corpus a thread takes out of the address space at a time.
+const RELEASE: usize = 1 << 24;
 
 /// Counts this thread as here, and waits for the others. All these waits are short, as threads finish
 /// about together, and a thread that sleeps through one takes far longer to wake.
@@ -1452,6 +1456,13 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
         // threads waiting for their turn.
         file.write_all(&text).expect("writing the results");
         progress.written.store(batch.end, Release);
+    }
+    // The clock runs to exit, where one thread would take the corpus's pages out of the address space, one
+    // by one. All the threads share that here.
+    while let Some(part) = claim(&progress.next_release, RELEASE, docs.len()) {
+        // SAFETY: nothing reads the corpus again, and its pages would come back from the file if it did.
+        // A part starts at a page, and a failure only leaves the pages for exit.
+        unsafe { madvise(docs[part.start..].as_ptr(), part.len(), 4) };
     }
 }
 

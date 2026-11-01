@@ -156,8 +156,9 @@ const SLOT_WORDS: usize = 8;
 /// generated name has been seen beyond 25 bytes.
 const INLINE_BYTES: usize = 32;
 const LONG: u64 = 1;
-/// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones.
-static PADS: [u64; 8] = [0, 0, 0, 0, !0, !0, !0, !0];
+/// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones. A `Row`
+/// is the size of a cache line and aligned to one, so that the loads never split across two.
+static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 
 /// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
 /// name's bytes, padded with ones, and one bit per country that has seen this name. The tags, one byte
@@ -261,8 +262,9 @@ impl<'a> NameTable<'a> {
     /// One bit per slot of a window of tags, set where the tag is `tag`.
     fn slots_with(window: __m256i, tag: u8) -> u32 {
         // SAFETY: x86-64-v3 has AVX2.
-        let same = unsafe { _mm256_cmpeq_epi8(window, _mm256_set1_epi8(tag as i8)) };
-        unsafe { _mm256_movemask_epi8(same) as u32 }
+        unsafe {
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(window, _mm256_set1_epi8(tag as i8))) as u32
+        }
     }
 
     /// The tags of the 32 slots from `home`.
@@ -290,7 +292,7 @@ impl<'a> NameTable<'a> {
         // the other load inside the table. x86-64-v3 has AVX2.
         unsafe {
             let at = |bytes: *const u8| _mm256_loadu_si256(bytes.cast());
-            let pad = at(PADS.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
+            let pad = at(PADS.0.as_ptr().cast::<u8>().add(INLINE_BYTES - len));
             _mm256_or_si256(at(text.as_ptr().add(start)), pad)
         }
     }
@@ -320,9 +322,9 @@ impl<'a> NameTable<'a> {
     }
 
     /// Finds the name's slot, or takes a free one for it. Only a wrong guess or a new name comes here.
-    /// When every slot is taken it gives up, and `aggregate` throws the whole pass away.
+    /// When every slot is taken it gives up, and `aggregate` throws the whole pass away, so any slot does.
     #[cold]
-    fn find(&self, text: &[u8], start: usize, len: usize) -> Option<usize> {
+    fn find(&self, text: &[u8], start: usize, len: usize) -> usize {
         let hash = Self::hash(text, start, len);
         let (mut home, tag) = (self.home(hash), (hash as u8).max(1));
         for _ in 0..self.homes / 16 + 2 {
@@ -337,7 +339,7 @@ impl<'a> NameTable<'a> {
                 while self.words[base + 3].load(Acquire) == 0 {}
                 // SAFETY: `base` is where a slot's words start.
                 if unsafe { self.holds(base, text, start, len) } {
-                    return Some(base);
+                    return base;
                 }
                 hits &= hits - 1;
             }
@@ -363,35 +365,27 @@ impl<'a> NameTable<'a> {
                 }
                 (0..3).for_each(|i| stored[i].store(key[i], Relaxed));
                 stored[3].store(key[3], Release);
-                return Some(base);
+                return base;
             }
         }
         self.full.store(true, Relaxed);
-        None
+        0
     }
 
     /// Marks this name as seen in country `bit`, and adds one to `same` if it had been already.
     ///
     /// # Safety
-    /// `guess` must be where a slot's words start.
-    unsafe fn mark(
-        &self,
-        guess: usize,
-        text: &[u8],
-        name: (usize, usize),
-        bit: u8,
-        same: &mut i64,
-    ) {
+    /// `at` must be where a slot's words start.
+    unsafe fn mark(&self, at: usize, text: &[u8], name: (usize, usize), bit: u8, same: &mut i64) {
         // SAFETY: the caller's promise, and `find` returns where a slot's words start. Its 256 bits
         // start 4 words in, and a byte can't index past them.
         unsafe {
             let (start, len) = name;
-            let found = if self.holds(guess, text, start, len) {
-                Some(guess)
+            let base = if self.holds(at, text, start, len) {
+                at
             } else {
                 self.find(text, start, len)
             };
-            let Some(base) = found else { return };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
             // leaves the old bit in the carry.

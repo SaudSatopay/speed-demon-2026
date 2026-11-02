@@ -178,6 +178,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 133 | Measure only: workers stop after the regions, main does the rest (c-e1) | Finds the floor of M on the box: c-w1 did not move M there, so what is left may be outside the program | pending | — | — | — |
 | 134 | Page tables for most of the file touched after the threads start, totals merged before the release, 32 KiB stacks for 106,188 homes (c-x1) | Local phase stamps: 620 us of 9.7 ms pass before a worker starts, 250 us of it touches that needn't wait; simulated spills 5.0 to 4.15 percent | pending | — | — | — |
 | 135 | CLDEMOTE after the locked write (c-d1) | The workers-only-regions run took 49 ns a record alone against about 58 per thread with 12: memory waits set T, and a slot written by another core costs a snoop | pending | — | — | — |
+| 136 | PREFETCHNTA for the text instead of T0 (c-n1) | Text at about the rate of slot lines passes through the caches on its way: NTA should leave more room in them for slots | pending | — | — | — |
 
 ## Decision log
 
@@ -457,6 +458,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D137.** pending: board, 3 samples
 
 **D138.** pending: board, 3 samples
+
+**D139.** pending: board, 3 samples
 
 ## What didn't work
 

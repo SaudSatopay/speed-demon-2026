@@ -336,7 +336,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         for block in 0..blocks {
             let at = text.as_ptr().add(scan + block * 64);
             // Far enough ahead to pass where the chunk's own loads and a page's end stop the core.
-            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(1024).cast());
+            _mm_prefetch::<_MM_HINT_NTA>(at.wrapping_add(1024).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
             let inside = _mm_cvtsi128_si64(parity) as u64 ^ *odd;
@@ -480,9 +480,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
             // leaves the old bit in the carry, which adds one to the row's repeats if it had been set.
-            // CLDEMOTE sends the line on to the shared cache, a hint that does nothing on a CPU without
-            // it: the next thread to want the line finds it there, rather than in this core's.
-            asm!("lock bts [{0} + {1} + 32], {2}", "adc qword ptr [{3} + 48], 0", "cldemote [{0} + {1}]",
+            asm!("lock bts [{} + {} + 32], {}", "adc qword ptr [{} + 48], 0",
                 in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
         }
     }

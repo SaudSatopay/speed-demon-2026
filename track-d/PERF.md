@@ -110,7 +110,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D27. Mapping stays.** T 0.1501 against about 0.151 is no gain for 18 lines: D's parse is too small a part of its run. Outcome: reverted in `06b555e`.
 
-**D28. Trim, keep the design.** Measuring each block showed every large one pays for itself, so only small cuts are left: offsets close up in the region pass, no shrink between queries, shorter helpers. Evidence: S 648 -> 620, instructions -1%, mispredicts +0.16 per edge, M the same; grid, sweep and constant-hash all pass. Over 78 board runs up to Nov 1: T 0.144 to 0.166, median K 27.29, best K 27.65 (`run-6f599535a090`). Outcome: the final source.
+**D28. Trim, keep the design.** Measuring each block showed every large one pays for itself, so only small cuts are left: offsets close up in the region pass, no shrink between queries, shorter helpers. Evidence: S 648 -> 620, instructions -1%, mispredicts +0.16 per edge, M the same; grid, sweep and constant-hash all pass. Over 78 board runs up to Nov 1: T 0.144 to 0.166, median K 27.29, best K 27.65 (`run-6f599535a090`). Outcome: kept; D29 to D32 test what comes after it.
 
 **D29.** Board test only: keep if median K beats the current source over 3 runs, else restore.
 

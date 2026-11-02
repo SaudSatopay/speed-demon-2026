@@ -1,14 +1,14 @@
 # Track D: performance log
 
-**Result:** the reference takes **72.69 s / 893 MB** on the board. Our best run is `run-6f599535a090`: **0.144 s / 42.6 MB**, K **27.65** and **72.1** speed points. Over 78 runs of the final source, up to Nov 1, T was 0.144 to 0.166 s, M 41.8 to 45.0 MB, and the median K 27.29.
+**Result:** the reference takes **72.69 s / 893 MB** on the board. Our best run is `run-ba733dba1abf`: **0.144 s / 42.2 MB**, K **27.68** and **72.1** speed points. Over 210 runs of the final source, up to Nov 2, T was 0.143 to 0.187 s, M 41.6 to 45.3 MB, and the median K 27.09.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks d`. Output SHA-256 on seed 1: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
 
 ## Where it loses
 
-- T is where we lose. On Sunday Nov 1, SweetDreams leads with K 29.56 at T 0.109, M 65.3 and S 574, and we're #7. D is outside our best three tracks, so we spent the last day on A, B and C, and its code hasn't changed since Oct 31 (`f9e45d2`).
+- T is where we lose. On Monday Nov 2, SweetDreams leads with K 34.17 at T 0.085, M 57.6 and S 578, and we're #16. D is outside our best three tracks, so we spent the last day on A, B and C, and its code hasn't changed since Oct 31 (`f9e45d2`).
 - S is 620 code lines on the board, against the reference's 43, which costs about 8.7 speed points. `simplify` is about a third of them (S 428 -> 690 at step 18), and removing it costs 9% of K (step 27).
-- T moves a lot on one source: 0.144 to 0.166 s over 78 runs, so one sample can't judge a change under about 5%.
+- T moves a lot on one source: 0.143 to 0.187 s over 210 runs, so one sample can't judge a change under about 5%.
 - Two threads writing one count record at the same instant can lose a numbering link (D23). That costs locality and nothing else, but the numbering, and so T, differs a little between runs.
 
 ## Where the reference spends its time
@@ -149,10 +149,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 - Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 4 answer-preserving rewrites of the input and 6 limit cases.
 - `quick.sh --threads "1 2 3 7 12 64"` on every build moves every cut, because range sizes follow the thread count.
-- **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`, then again with `yes` running: 40/40 cells, each run five times.
+- **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`, then 12 threads on those same two CPUs with two `yes` competing for them: 40/40 cells, each run five times.
 - D has no key hash, since labels are found by page and index (D10), so a constant-hash build has nothing to test here.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks d` (Docker, git and Python only). Its report on commit `077d9b5`, run with `--full` on 2026-11-01 09:40 UTC against the organisers' harness at `7a9057b`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks d` (Docker, git and Python only). Its report on commit `5b85889`, run with `--full` on 2026-11-02 at 10:06 UTC against the organisers' harness at `9f059f7`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|

@@ -572,7 +572,7 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 - **What none of these can see:** the code relies on the file's last record ending in its CRLF terminator (spec 2.2). A file whose last record had none would lose that record. No file in the bank lacks the terminator, so a change that broke the reliance would pass `quick.sh`. See [README](README.md#limits).
 - **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `234687d`, whose source is the final one, run with `--full` on 2026-11-02 at 07:57 UTC against the organisers' harness at `adb9316`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `5b85889`, run with `--full` on 2026-11-02 at 10:06 UTC against the organisers' harness at `9f059f7`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|

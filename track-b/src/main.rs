@@ -6,8 +6,8 @@
 //! 1. **Parse** (`parse_queries`). The queries are read first, into one table of their terms, so that
 //!    only those terms are ever looked up.
 //! 2. **Plan** (`make_plan`). A sample of about 1% of the corpus says which terms are common. Every
-//!    document matching a BOOL query contains one of a few anchor terms (the rarest AND of its last
-//!    run, or its OR terms). For nine queries in ten the anchors are rare: at each anchor's first
+//!    document matching a BOOL query contains one of a few anchor terms, chosen to hold as few
+//!    documents as they can. For nine queries in ten the anchors are rare: at each anchor's first
 //!    occurrence in a document, the marks of what the document holds index a truth table. A query whose
 //!    anchors are common goes by blocks instead: each thread keeps a bit per document of a block for each
 //!    term of such queries, and runs them in vectors when the block is full. A common term that alone makes
@@ -483,19 +483,23 @@ fn is_or(step: &u32) -> bool {
     step & !TERM_BITS == 0
 }
 
-/// Terms of which every document matching a BOOL query contains at least one, chosen rare. The
-/// query's last run, from its last OR (the first term counts as an OR from the empty set), is
-/// intersected with each AND in it, so any of those ANDs is in every match, and so is the first
-/// term when the query is a single run. A run without an AND adds its OR term to the anchors of
-/// the query before it. A term repeated among them is listed again, and `make_check` blocks its later
-/// check.
+/// Terms of which every document matching a BOOL query contains at least one, chosen rare. Step by step,
+/// an OR's term joins those of the set so far, an AND's term replaces them if it's rarer than they are in
+/// all, as each match holds it too, and a NOT changes nothing. A term repeated among them is listed again,
+/// and `make_check` blocks its later check.
 fn anchors(steps: &[u32], df: &[u32], out: &mut Vec<u32>) {
-    let last_or = steps.iter().rposition(is_or).unwrap_or(0);
-    let ands = steps[last_or + 1..].iter().filter(|step| *step & AND != 0);
-    let candidates = ands.chain(steps.first().filter(|_| last_or == 0));
-    let best = candidates.min_by_key(|&step| df[(step & TERM_BITS) as usize]);
-    out.push(best.unwrap_or(&steps[last_or]) & TERM_BITS);
-    best.is_none().then(|| anchors(&steps[..last_or], df, out));
+    let mut held = 0;
+    for step in steps {
+        let (term, count) = (step & TERM_BITS, df[(step & TERM_BITS) as usize]);
+        if step & AND != 0 && count <= held {
+            out.clear();
+            held = 0;
+        }
+        if is_or(step) || out.is_empty() {
+            out.push(term);
+            held += count;
+        }
+    }
 }
 
 /// A BOOL query's check at one of its anchors. The anchor is present, so the marks of a document's
@@ -691,7 +695,7 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
     // About a block's documents, a little under, as a block that a range cuts short costs a whole pass.
     let sampled = (1 << 21).min(docs.len());
     plan.range_size = sampled / df[0].max(1) as usize * (BLOCK_DOCS as usize - 8) + 1;
-    // A query goes by blocks if its anchors hold about N/32 documents in all, where running it on every
+    // A query goes by blocks if its anchors hold about N/48 documents in all, where running it on every
     // block starts to cost less than its checks at all those documents. A term in such a query has a row
     // above about N/48, where a byte per occurrence and a bit per document, for every document, start to
     // cost less than listing its first occurrence in each document that holds it. Any choice gives
@@ -733,8 +737,8 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
         let trailing = steps.iter().rev().take_while(|step| is_or(step));
         let sure = trailing.max_by_key(|&&term| df[term as usize]);
         let (sum, sure_count) = (sum_of(&query_anchors), sure.map_or(0, |&t| df[t as usize]));
-        let common_sure = sure_count * 32 >= df[0] && (sum - sure_count) * 32 < df[0];
-        if sum * 32 >= df[0] && !common_sure {
+        let common_sure = sure_count * 48 >= df[0] && (sum - sure_count) * 48 < df[0];
+        if sum * 48 >= df[0] && !common_sure {
             block_queries.push(query);
             for term in steps.iter().map(|step| step & TERM_BITS) {
                 used.extend((store_of[term as usize] == NEITHER).then_some(term));
@@ -1506,7 +1510,7 @@ pub extern "C" fn main() -> i32 {
     // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
     // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
-    // faults. They start now but wait for the sample, whose new threads need the lock that this holds. An
+    // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
     // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
     // One more thread starts them and creates the output, so that this one needn't wait for either.
     let helper = thread::spawn(move || {

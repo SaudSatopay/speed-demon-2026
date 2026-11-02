@@ -103,7 +103,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 67 | exp: a sorted insert of the ten smallest ids that compares each with its old neighbour (`c-i`) | The scan agent's best local change: cycles -1.0 to -2.2% in eight batches | run-184fb58a535b | 0.0684 | 27.4 | 82.0 |
 | 68 | exp: blocks at N/64 and no check that can't count (`c-z`) | The b-bool agent's simulation: check evaluations 7.71M -> 6.81M, instructions -5.6% and cycles -4.8% locally | run-4464d70ac109 | 0.0682 | 28.6 | 82.0 |
 | 69 | A shorter serial plan (`c-sr`), S 1050 | Serial work counts about double on the box. Plan end 0.74 ms earlier locally | run-5fc3b985fd1d | 0.0662 | 29.6 | 82.3 |
-| 70 | Term table in a `OnceLock` cleared by the first parse thread, `make_plan`'s phrases on one more thread, scan threads started before the plan, `reserve` in the parse merge (`s2-y`) | `c-sr`'s scan threads started 1 to 5 ms late on busy runs, waiting for the lock the mappers hold | run-06a4871e5ef2 | 0.0645 | 33.7 | 82.0 |
+| 70 | Term table in a `OnceLock` cleared by the first parse thread, `make_plan`'s phrases on one more thread, scan threads started before the plan, `reserve` in the parse merge (`s2-y`) | `c-sr`'s scan threads started 1 to 5 ms late on busy runs, waiting for the lock the mappers hold | run-06a4871e5ef2 | 0.0645 | 33.7 | 82.5 |
 
 ## Decision log
 

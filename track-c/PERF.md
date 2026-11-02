@@ -1,14 +1,14 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-s7`: `c-map` with a one-stage Dockerfile (D143) and seven lines cut off the hot path (D156), S 342 in place of 352. Its median K is **46.73** over 8 runs, T 0.0195, M 10.13 to 10.54 MB. Our best run of nearly the same code is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-s7`: `c-map` with a one-stage Dockerfile (D143) and seven lines cut off the hot path (D156), S 342 in place of 352. Its median K is **46.67** over 16 runs, T 0.0196, M 10.01 to 10.59 MB. Our best run of nearly the same code is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
 - S is 342 code lines on the board's last run (`c-s7`), against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124), nor did the 5 for `c-e0` (step 148). The last 3 lines cut came from the Dockerfile, which the line counter includes: one stage in place of two took it from 7 lines to 4 with the same binary (step 140).
-- The binary's T ran 0.0193 to 0.0197 over the 5 runs of step 126, and 0.0193 to 0.0204 over the 8 of `c-s7`. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
-- At Mon Nov 2 10:40 IST the board's top three on this track were NickTrapp (K 50.29: T 0.019, M 8.4, S 314), another ello (K 49.97: T 0.019, M 7.9, S 371) and SALAAR (K 48.54: T 0.017, M 9.3, S 451). Our final source, `c-s7`, has a median K of 46.73 over 8 runs; our best run on the board is K 47.28, sixth at Mon 13:35 IST. The board shows only their numbers, so we don't know how they do it.
+- The binary's T ran 0.0193 to 0.0197 over the 5 runs of step 126, and 0.0193 to 0.0222 over the 16 of `c-s7`. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
+- At Mon Nov 2 10:40 IST the board's top three on this track were NickTrapp (K 50.29: T 0.019, M 8.4, S 314), another ello (K 49.97: T 0.019, M 7.9, S 371) and SALAAR (K 48.54: T 0.017, M 9.3, S 451). Our final source, `c-s7`, has a median K of 46.67 over 16 runs; our best run on the board is K 47.28, sixth at Mon 13:35 IST. The board shows only their numbers, so we don't know how they do it.
 
 ## What the box taught us
 
@@ -205,8 +205,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 160 | Back to c-s7, the final source | Name classes reached M 8.15 to 8.45 but T 0.0223 to 0.0239, K 43.06 to 44.53, against c-s7 K 46.73; see the HANDOVER in PROGRESS. This run was slow for the source: K 45.93, T 0.0204. Restored | run-0ec1b8e6356f | 0.0204 | 10.13 | 83.10 |
 | 161 | c-l7: name classes, longer classes own their line in the first pass | Bisects why the c-l builds lost 12 percent of T; the suspect is asking for the line late. 1 run: K 43.58, T 0.0234, M 8.13, S 411. No better than c-l3, so asking late for the line is not the cost. Rejected on this run, with no time for 3 samples before feature freeze: it would have needed T down 15%, beyond the noise of about 10% of T | run-67f0c40ec025 | 0.0234 | 8.13 | 81.96 |
 | 162 | Back to c-s7, the final source | c-l7 asked to own the line in the first pass: T 0.0234, M 8.13, S 411, K 43.58, no better than c-l3, so the late request is not what costs the c-l builds their T. K 46.82, T 0.0194, M 10.44. Same source as step 153, now median K 46.73 over 8, T 0.0195, M 10.13 to 10.54. The final source | run-fd234bc3c56f | 0.0194 | 10.44 | 83.52 |
-| 163 | c-v7: 32-byte slots, a compact exact-key arena, table on 4 KiB pages | Two slots share a line and keys move to an arena, which lowers M by a huge page or more | pending | — | — | — |
-| 164 | Back to c-s7, the final source | c-v7 lost on the box: T 0.0281 and 0.0297, M 10.10 and 10.15, S 438, K 37.74 and 36.62 against a median of about 46.7 | pending | — | — | — |
+| 163 | c-v7: 32-byte slots, a compact exact-key arena, table on 4 KiB pages | Two slots share a line and keys move to an arena, which lowers M by a huge page or more. 3 runs: K 37.74, 36.62, 37.81, median 37.74, T 0.0281, M 10.10 to 10.17, S 438. Local M was 8.95, and the box did not show it. Rejected | run-58ff6707a38c | 0.0281 | 10.10 | 78.84 |
+| 164 | Back to c-s7, the final source | c-v7 lost on the box: T 0.0281 and 0.0297, M 10.10 and 10.15, S 438, K 37.74 and 36.62 against a median of about 46.7. K 46.34, T 0.0198. Restored, the final source | run-ed504a8737ab | 0.0198 | 10.42 | 83.30 |
 
 ## Decision log
 
@@ -541,9 +541,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D165.** c-s7 stays final at feature freeze: c-l7 K 43.58, T 0.0234 on one run, so the early request for the line did not recover the T. We stopped without the planned 3 samples, as the gap was beyond the noise and the freeze was 25 minutes away.
 
-**D166.** Decide on 3 samples against c-s7, which stays final
+**D166.** c-v7 went on the board against c-s7, which stayed final throughout.
 
-**D167.** c-s7 stays final; c-v7 rejected
+**D167.** c-s7 stays final: c-v7 median K 37.74 over 3 against 46.7, with M no lower on the box and 96 more lines.
 
 ## What didn't work
 
@@ -562,6 +562,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Empty names get no slot, each thread counts them in its row (`c-e0`) | One record in a hundred has an empty name, and all of them went to `find` and fought over one cache line: about 2.6% of T by estimate | Median K 46.70 over 3 against 46.82 for c-map; T 0.0194, S 354. T moved by under 1% for 5 more lines, so the estimate was too high | run-af7cfd91c950, run-980a974d8a52, run-7fc479cde02d | reverted |
 | The first pass prefetches the free slot a new name will take (`c-f0`, and with `c-e0` as `c-ef`) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | `c-f0`: median K 46.55 over 4 (one a sample from another track's push), T 0.0197, S 356. `c-ef`: K 46.68 and 45.66, S 361. The extra compares cost what the prefetch saves | run-d4bd2ea3e1ca, run-1f9ef227a22f, run-12c225b0a04e, run-8eacbe22eef9, run-a1da73edffe3, run-0fd0f9fecaf4 | reverted |
 | Name classes: short names keep a one-word key apart, with their bits in the holes of other names' lines, on three huge pages (`c-l1`, `c-l3`, `c-l5`, `c-l6`, `c-l7`) | Rivals hold M near 8 at our T, and only a smaller table lowers ours: T 0.0200, M 8.2, S 365 would be K 47.8 | M 8.13 to 8.45 in 6 of 8 runs, but T 0.0223 to 0.0239, S 394 to 411, K 40.78 to 44.53 against 46.73. `c-l4`, the same code with no classes, had the same T, so the code shape costs it, not the layout. We did not find which part | run-159c8078d77d, run-c66d73391e02, run-67f0c40ec025 | reverted |
+| 32-byte slots with a compact exact-key arena, on 4 KiB pages (`c-v7`) | Two slots share a line and keys move out, for local M 8.95 against about 10.5 | T 0.0281, 0.0297, 0.0279, M 10.10 to 10.17, S 438, K 37.74, 36.62, 37.81 against 46.7. T rose about 43%, and M barely moved on the box | run-58ff6707a38c, run-dc8c76f9a4dc, run-de63f8131386 | reverted |
 | 1 MiB of the program's read-only data read at start (`c-big`) | If the program file's pages count in M, M should rise by about 1 MB; 1.5 MB above the table is unexplained and the binary maps 0.9 MB | M 10.03 against about 10.1: the program file's own pages don't count in M on the box, so a smaller binary wouldn't lower M | run-efc1d6d73e2b | not kept (measure only) |
 
 ## The final design

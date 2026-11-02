@@ -202,6 +202,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 157 | exp: c-s7 with 48 idle instructions per record, a measure (c-n48) | c-l4 lost 16 percent of T with 48 more instructions and no change of layout: is that the instructions | pending | — | — | — |
 | 158 | exp: name classes, two passes, second pass owns each bit's line six records ahead (c-l5) | c-n48 shows idle instructions cost 3.6 percent, so c-l4's 16 percent is from code shape: keep compare and write in the second pass | pending | — | — | — |
 | 159 | exp: name classes, a prefetch pass between the two passes, lines trimmed (c-l6) | Simpler than c-l5's lookahead | pending | — | — | — |
+| 160 | Back to c-s7, the final source | Name classes reached M 8.15 to 8.45 but T 0.0223 to 0.0239, K 43.06 to 44.53, against c-s7 K 46.73; see the HANDOVER in PROGRESS | pending | — | — | — |
 
 ## Decision log
 
@@ -529,6 +530,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D161.** On trial
 
 **D162.** On trial
+
+**D163.** Final source restored; c-l1 to c-l6 and c-n48 rejected or measures
 
 ## What didn't work
 

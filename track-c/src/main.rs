@@ -21,7 +21,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::asm, arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
+use std::{arch::asm, arch::x86_64::*, collections::*, fs::File, hint::black_box, thread};
 use std::{io::BufWriter, io::Write, mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
@@ -56,7 +56,6 @@ fn map(file: &File) -> &'static [u8] {
     // files.
     let text = unsafe {
         let room = mmap(null_mut(), len + PADDING + HUGE, 1, 0x22, -1, 0); // Private, anonymous.
-        assert_ne!(room as isize, -1);
         let base = room.map_addr(|at| at.next_multiple_of(HUGE));
         mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // Private, at this address.
         std::slice::from_raw_parts(base, len + PADDING)
@@ -127,8 +126,10 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
         // The second one is a region id, and `add_records` needs it inside the join table.
         let cap = _mm256_set_epi32(-1, -1, -1, -1, -1, -1, REGION_IDS as i32 - 1, -1);
         let eights = _mm256_min_epu32(eights, cap);
-        let first_two = _mm256_extract_epi64::<0>(eights) as u64;
-        (first_two, _mm256_extract_epi32::<4>(eights) as u32)
+        (
+            _mm256_extract_epi64::<0>(eights) as u64,
+            _mm256_extract_epi32::<4>(eights) as u32,
+        )
     }
 }
 
@@ -307,20 +308,15 @@ const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
-/// Bit `k` of each of the 64 positions in a block, at that position.
-const fn plane(k: u32) -> u64 {
-    !0 / ((1 << (1 << k)) + 1) << (1 << k)
-}
-static PLANES: [u64; 6] = [plane(0), plane(1), plane(2), plane(3), plane(4), plane(5)];
-
 /// Lists into `out` the positions just past the separators outside quotes in `blocks` blocks of `text`
 /// from `scan`, and returns how many. `odd` is all ones when the first block starts inside quotes,
 /// that is after an odd number of quotes, and comes back set for the block after. A function of its
 /// own, so that its constants get the registers that the loops around it would otherwise hold.
 #[inline(never)]
 fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mut u64) -> usize {
-    // Read once here, since the compiler would otherwise rebuild them in every block.
-    let planes = black_box(&PLANES);
+    // Bit `k` of each of the 64 positions in a block, at that position. Behind a black box, since the
+    // compiler would otherwise rebuild them in every block.
+    let planes = black_box([0, 1, 2, 3, 4, 5].map(|k| !0u64 / ((1 << (1 << k)) + 1) << (1 << k)));
     // SAFETY: the blocks are inside the text, or the padding covers them. PCLMULQDQ is in the
     // build's target features. The carry-less multiply by all ones gives each bit the parity of the
     // quotes up to it, and that's odd exactly inside quotes, since a `""` pair cancels out. The
@@ -345,7 +341,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
             let mut left = byte_mask(at, |block| _mm256_cmpeq_epi8(block, class(block))) & !inside;
             // Blocks hold 5 of them on average, and a loop's exit would be a coin toss, so this
             // writes 8 whatever the number, and moves on by the right amount. The positions of up to
-            // 8 set bits come out as 8 bytes at once: `PLANES[k]` has bit `k` of every position at
+            // 8 set bits come out as 8 bytes at once: `planes[k]` has bit `k` of every position at
             // that position, and PEXT gathers it for those bits, into a byte. Those bytes are a bit
             // matrix with a row per bit of a position, and GFNI's multiply, given the columns one at
             // a time, turns it around into a byte per position.
@@ -428,8 +424,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
             // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
-            let hits = slots_with(window, tag);
-            let guess = (home + hits.trailing_zeros() as usize) * 64;
+            let guess = (home + slots_with(window, tag).trailing_zeros() as usize) * 64;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
             *slot = (guess as u32, cents as u32, id_region);
@@ -537,12 +532,16 @@ extern "C" fn main() -> i32 {
         // one. Any pages still in use just map again. Whole 2 MiB, so that none has to split a huge
         // mapping.
         let chunk = records.len().div_ceil(threads * 3).next_multiple_of(HUGE);
-        let mut from = released.fetch_add(chunk, Relaxed);
-        while from < records.len() {
-            let len = chunk.min(records.len() - from);
+        let claims = std::iter::repeat_with(|| released.fetch_add(chunk, Relaxed));
+        for from in claims.take_while(|&from| from < records.len()) {
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
-            unsafe { madvise(records.as_ptr().add(from), len, 4) };
-            from = released.fetch_add(chunk, Relaxed);
+            unsafe {
+                madvise(
+                    records.as_ptr().add(from),
+                    chunk.min(records.len() - from),
+                    4,
+                )
+            };
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);
@@ -566,8 +565,12 @@ extern "C" fn main() -> i32 {
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
-    let keys = ["_UNMATCHED"].iter().chain(codes).copied();
-    let lines: std::collections::BTreeMap<_, _> = keys.zip(&totals).collect();
+    let lines: BTreeMap<_, _> = ["_UNMATCHED"]
+        .iter()
+        .chain(codes)
+        .copied()
+        .zip(&totals)
+        .collect();
     let mut out = BufWriter::new(File::create(arg(2, "/out") + "/aggregates.txt").unwrap());
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
         write!(out, "{key} {} {}", row[0], row[2]).unwrap();

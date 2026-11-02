@@ -194,6 +194,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 149 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate. Sample 3: K 46.56, T 0.0196, M 10.09, S 356. Another track's push gave a fourth sample, `run-8eacbe22eef9` (K 46.45, T 0.0198, M 10.01). Median K 46.55 over 4, T 0.0197, against c-map's 46.82: the extra compares cost what the prefetch saves. Rejected | run-12c225b0a04e | 0.0196 | 10.09 | 83.40 |
 | 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | Third sample: K 46.25. Median 46.25 over 3, S 361. Rejected | run-b0f16fcd0721 | 0.0197 | 10.28 | 83.25 |
 | 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.25 over 3: none beats c-map at 46.82 over 17. First run here K 46.26, then c-m3 has K 46.88, 46.79, 46.26. Kept | run-bb5f373588a0 | 0.0200 | 10.04 | 83.26 |
+| 152 | exp: 10 real lines cut off the hot path (c-s10) | Bit planes computed where they are used, the page release as an iterator, three lets folded, one unneeded assert gone: S counts, and none of these pays for its lines | pending | — | — | — |
 
 ## Decision log
 
@@ -505,6 +506,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D153.** Rejected: both together (c-ef). Three samples, K 46.68, 45.66 and 46.25, S 361.
 
 **D154.** Back to `c-m3`, the final source. c-e0, c-f0 and c-ef didn't beat c-map's median K 46.82 over 17. Outcome: final unless something beats its median over 3 samples.
+
+**D155.** Keep if the median T over 3 samples holds against c-m3
 
 ## What didn't work
 

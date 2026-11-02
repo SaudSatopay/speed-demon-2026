@@ -218,6 +218,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 182 | c-map sample 3 | third sample | pending | — | — | — |
 | 183 | c-scout cold scout guesses spilled and new names, sample 1 | local find calls 282k to 125k, T -2.3 percent | pending | — | — | — |
 | 184 | c-scout sample 2 | second sample | pending | — | — | — |
+| 185 | c-scout sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -589,6 +590,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D183.** exp: judged over 3 samples against c-kp2 46.84
 
 **D184.** exp: judged over 3 samples against c-kp2 46.84
+
+**D185.** exp: judged over 3 samples against c-kp2 46.84
 
 ## What didn't work
 

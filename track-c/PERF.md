@@ -197,6 +197,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 152 | exp: bit planes computed where used, the page release as an iterator, three lets folded, one assert gone (c-s10) | Hoped for 10 lines fewer, but rustfmt broke up three of the folds, so S went up, to 353. 10 runs on the same code: median K 46.64, T 0.0195, M 10.2. Not kept, and the folds went | run-43d27ad255c0 | 0.0195 | 10.18 | 83.37 |
 | 153 | Seven lines cut off the hot path (c-s7): bit planes computed where used, the page release as an iterator, one let folded, one assert gone | S 349 to 342. 3 runs: K 46.68, 46.81, 46.87, median 46.81, T 0.0194, against c-map's median 46.79 over 19. M 10.26 to 10.54 against about 10.1, though `c-s10` with the same code had 9.95 to 10.41, so that may be the box. Kept, the final source | run-8b505a462403 | 0.0194 | 10.50 | 83.40 |
 | 154 | exp: name classes, short names keys apart and bits in holes, three huge pages (c-l1) | Rivals hold M 8 at our T; only a smaller table lowers M | pending | — | — | — |
+| 155 | exp: c-l2 tightened, three passes: region read and bit prefetch in the second (c-l3) | c-l1 T 0.0239: the demand read of the region in pass 1 stalls the box | pending | — | — | — |
 
 ## Decision log
 
@@ -514,6 +515,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D156.** Kept: `c-s7`, seven real lines cut, S 342. Median K 46.81 over 3 against c-map's 46.79 over 19: a tie in K, so the lines are worth having and T didn't pay for them. The final source. M is watched: 10.26 to 10.54 here.
 
 **D157.** On trial against c-s7
+
+**D158.** On trial
 
 ## What didn't work
 

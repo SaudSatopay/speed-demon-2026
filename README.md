@@ -17,17 +17,17 @@ T is wall time, M peak memory and S the code lines the board counts, all as the 
 
 ## Board numbers
 
-This is the only place in this README where numbers change. They come from the live board's feed at **2026-11-02 04:08:16 UTC (Mon 09:38 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
+This is the only place in this README where numbers change. They come from the live board's feed at **2026-11-02 11:49:02 UTC (Mon 17:19 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
 
 | Track | Best run | Commit | T (s) | M (MB) | S | K | Speed points | Rank by K | Latest run: K |
 |---|---|---|---|---|---|---|---|---|---|
-| A | `run-4e5bbad388d3` | `ae916cd` | 0.0155 | 16.4 | 352 | 58.41 | 88.3 | 2 of 132 | 52.41 (`run-e20201cf1920`) |
-| B | `run-fca516e7f3d8` | `3fa5caa` | 0.0675 | 27.8 | 1075 | 43.62 | 82.0 | 2 of 107 | 43.41 (`run-30e3929cea98`) |
-| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 4 of 114 | 45.91 (`run-8c544b80774d`) |
-| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 16 of 115 | 27.32 (`run-771b05c21c95`) |
-| Overall | | | | | | | 84.64 | 2 of 114 | |
+| A | `run-a3d80d9d43be` | `c438b24` | 0.0156 | 16.1 | 343 | 58.58 | 88.4 | 3 of 136 | 56.94 (`run-e9f3b90435fa`) |
+| B | `run-4d59d4dfba18` | `4d9e164` | 0.0643 | 29.2 | 1076 | 44.70 | 82.5 | 2 of 109 | 43.81 (`run-deac1404c01f`) |
+| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 7 of 116 | 44.20 (`run-db358eb1bf1f`) |
+| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 16 of 116 | 24.02 (`run-ce33b2f0836c`) |
+| Overall | | | | | | | 84.84 | 3 of 115 | |
 
-The overall row is the board's: speed points only, over the 114 teams with three scored tracks. The judges' share of the score comes after the freeze.
+The overall row is the board's: speed points only, over the 115 teams with three scored tracks. The judges' share of the score comes after the freeze.
 
 A best run can come from an earlier commit than the head of this branch; the commit column says which. The headline at the top of a PERF.md can lag this table until the freeze. Where they differ, this table is newer. Every step in a PERF.md names the board run that measured it, and the failed experiments are kept too.
 
@@ -69,7 +69,7 @@ One line per track. The full list is in each track's README, under Limits.
 
 ## Shared design choices
 
-- **Rust, standard library only.** The image builds on `rust:1-slim-trixie` and runs on `debian:13-slim`, both pinned by digest, in two stages with `cargo build --release --offline`. `mmap`, `madvise` and a few other calls are declared by hand against glibc, which `std` already links, so there is no `libc` crate.
+- **Rust, standard library only.** Each image builds on `rust:1-slim-trixie`, pinned by digest, with `cargo build --release --offline`. A, B and D run on `debian:13-slim` in a second stage; C has one stage and runs where it was built. `mmap`, `madvise` and a few other calls are declared by hand against glibc, which `std` already links, so there is no `libc` crate.
 - **Threads.** The count is `SD_THREADS` if set, otherwise `available_parallelism()`, which respects the container's CPU set, capped at 12. A, B and D use `std::thread::scope`; C creates its threads with `pthread` calls it declares itself. Work is handed out from atomic counters.
 - **Build flags** are in each track's `.cargo/config.toml`: `target-cpu=x86-64-v3` on all four. A, B and C also link glibc statically, as T counts from exec, and switch off three tuning features meant for much older CPUs. C adds `pclmulqdq`, `prfchw` and `gfni`.
 - **One output file.** Each program writes exactly one file into `/out` (`summary.txt`, `results.txt`, `aggregates.txt` or `distances.txt`), in pieces.

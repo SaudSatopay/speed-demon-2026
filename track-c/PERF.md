@@ -213,6 +213,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 177 | c-kp2 sample 5 | alternate | pending | — | — | — |
 | 178 | c-kp3 sample 3 | third sample | pending | — | — | — |
 | 179 | c-kp2 restored, sample 6 | chosen source at HEAD | pending | — | — | — |
+| 180 | c-map files mapped on a 2 MiB boundary, sample 1 | local faults 3094 to 651 and T -8 percent, if the box caches huge folios | pending | — | — | — |
 
 ## Decision log
 
@@ -574,6 +575,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D178.** exp: judged over 3 samples against c-kp2 46.85
 
 **D179.** exp: judged over 3 samples against c-kp2 46.85
+
+**D180.** exp: judged over 3 samples against c-kp2 46.84
 
 ## What didn't work
 

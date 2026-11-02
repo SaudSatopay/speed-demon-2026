@@ -173,6 +173,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 128 | exp: bits two to a line, keys apart, 133,000 homes (c-sp1) | Measures the second fill: bits lines are half the size, so the same four huge pages hold far more homes | pending | — | — | — |
 | 129 | exp: keys apart, 104,724 homes, three huge pages and small ones (c-sp2) | The split leaves the table small enough to give back a huge page | pending | — | — | — |
 | 130 | exp: small pages hold only tails and stacks (c-sp3) | c-sp2 had the end of the join table on small pages, read by every record | pending | — | — | — |
+| 131 | Back to c-map, the final source | Keys apart from bits, two slots to a line: c-sp1 133,000 homes T 0.0201 M 9.99 S 385 K 45.50; c-sp2 three huge pages T 0.0210 and 0.0214 M 8.70 and 8.90 S 389 K 45.80 and 45.09; c-sp3 tails on small pages T 0.0212 M 10.18 K 44.10. The memory is real, and T and lines cost more than it pays | pending | — | — | — |
 
 ## Decision log
 
@@ -442,6 +443,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D132.** Keep only if median beats 46.94 over 3
 
 **D133.** Keep only if median beats 46.94 over 3
+
+**D134.** Rejected: no run of the three reaches the median 46.94 of c-map
 
 ## What didn't work
 

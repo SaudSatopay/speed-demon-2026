@@ -1,14 +1,14 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-m3`, which is `c-map` with a one-stage Dockerfile: the same binary, with S 349 in place of 352 (D143). Its median K is **46.82** over 17 runs of the same binary plus 2 at S 349. Our best run is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-s7`: `c-map` with a one-stage Dockerfile (D143) and seven lines cut off the hot path (D156), S 342 in place of 352. Its median K is **46.81** over 3 runs, T 0.0194, M 10.26 to 10.54 MB. Our best run of nearly the same code is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
-- S is 349 code lines on the board's last run (`c-m3`), against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124), nor did the 5 for `c-e0` (step 148). The last 3 lines cut came from the Dockerfile, which the line counter includes: one stage in place of two took it from 7 lines to 4 with the same binary (step 140).
-- The binary's T ran 0.0193 to 0.0197 over the 5 runs of step 126, and 0.0195 and 0.0196 over the 2 of `c-m3`. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
-- At Mon Nov 2 10:40 IST the board's top three on this track were NickTrapp (K 50.29: T 0.019, M 8.4, S 314), another ello (K 49.97: T 0.019, M 7.9, S 371) and SALAAR (K 48.54: T 0.017, M 9.3, S 451). Our final source, `c-m3`, has a median K of 46.82 over 17 runs of the same binary plus 2 at S 349, and is fourth. The board shows only their numbers, so we don't know how they do it.
+- S is 342 code lines on the board's last run (`c-s7`), against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124), nor did the 5 for `c-e0` (step 148). The last 3 lines cut came from the Dockerfile, which the line counter includes: one stage in place of two took it from 7 lines to 4 with the same binary (step 140).
+- The binary's T ran 0.0193 to 0.0197 over the 5 runs of step 126, and 0.0193 to 0.0195 over the 3 of `c-s7`. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
+- At Mon Nov 2 10:40 IST the board's top three on this track were NickTrapp (K 50.29: T 0.019, M 8.4, S 314), another ello (K 49.97: T 0.019, M 7.9, S 371) and SALAAR (K 48.54: T 0.017, M 9.3, S 451). Our final source, `c-s7`, has a median K of 46.81 over 3 runs; our best run on the board is K 47.28, sixth at Mon 13:35 IST. The board shows only their numbers, so we don't know how they do it.
 
 ## What the box taught us
 
@@ -194,8 +194,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 149 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate. Sample 3: K 46.56, T 0.0196, M 10.09, S 356. Another track's push gave a fourth sample, `run-8eacbe22eef9` (K 46.45, T 0.0198, M 10.01). Median K 46.55 over 4, T 0.0197, against c-map's 46.82: the extra compares cost what the prefetch saves. Rejected | run-12c225b0a04e | 0.0196 | 10.09 | 83.40 |
 | 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | Third sample: K 46.25. Median 46.25 over 3, S 361. Rejected | run-b0f16fcd0721 | 0.0197 | 10.28 | 83.25 |
 | 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.25 over 3: none beats c-map at 46.82 over 17. First run here K 46.26, then c-m3 has K 46.88, 46.79, 46.26. Kept | run-bb5f373588a0 | 0.0200 | 10.04 | 83.26 |
-| 152 | exp: 10 real lines cut off the hot path (c-s10) | Bit planes computed where they are used, the page release as an iterator, three lets folded, one unneeded assert gone: S counts, and none of these pays for its lines | pending | — | — | — |
-| 153 | C: 7 real lines cut off the hot path (c-s7) | c-s10 came to S 353 as rustfmt broke up three of its folds; those are put back. The bit planes computed where used, the release as an iterator, one let folded, an unneeded assert gone. c-s10 had the same code at median T 0.0195 over 9 | pending | — | — | — |
+| 152 | exp: bit planes computed where used, the page release as an iterator, three lets folded, one assert gone (c-s10) | Hoped for 10 lines fewer, but rustfmt broke up three of the folds, so S went up, to 353. 10 runs on the same code: median K 46.64, T 0.0195, M 10.2. Not kept, and the folds went | run-43d27ad255c0 | 0.0195 | 10.18 | 83.37 |
+| 153 | Seven lines cut off the hot path (c-s7): bit planes computed where used, the page release as an iterator, one let folded, one assert gone | S 349 to 342. 3 runs: K 46.68, 46.81, 46.87, median 46.81, T 0.0194, against c-map's median 46.79 over 19. M 10.26 to 10.54 against about 10.1, though `c-s10` with the same code had 9.95 to 10.41, so that may be the box. Kept, the final source | run-8b505a462403 | 0.0194 | 10.50 | 83.40 |
 
 ## Decision log
 
@@ -484,7 +484,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D142.** Not kept: a second run of c-x1. K 44.43, T 0.0215, a slow-mode run. With D137's first run (K 46.71) it doesn't beat c-map's median, though a slow-mode run doesn't prove it worse.
 
-**D143.** Kept: the one-stage Dockerfile. The line counter includes the Dockerfile, and one stage takes it from 7 lines to 4, so S goes from 352 to 349 with the same binary. Two runs, K 46.88 and 46.79, T 0.0196 and 0.0195, M 9.97 and 10.22 (the second a sample from another track's push). Outcome: c-m3, which is c-map with this Dockerfile, is the final source. c-map's median K is 46.82 over 17 runs.
+**D143.** Kept: the one-stage Dockerfile. The line counter includes the Dockerfile, and one stage takes it from 7 lines to 4, so S goes from 352 to 349 with the same binary. Two runs, K 46.88 and 46.79, T 0.0196 and 0.0195, M 9.97 and 10.22 (the second a sample from another track's push). Outcome: c-m3, which is c-map with this Dockerfile, was final until D156. c-map's median K is 46.82 over 17 runs.
 
 **D144.** Not kept, measurement only: 1 MiB of the program's read-only data read at start (c-big). One run: M 10.03 against about 10.1 without it. The program file's own pages don't count in M on the box, so a smaller binary wouldn't lower M. T 0.0217 was a slow-mode T.
 
@@ -508,9 +508,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D154.** Back to `c-m3`, the final source. c-e0, c-f0 and c-ef didn't beat c-map's median K 46.82 over 17. Outcome: final unless something beats its median over 3 samples.
 
-**D155.** Keep if the median T over 3 samples holds against c-m3
+**D155.** Not kept: `c-s10`. Rustfmt expanded three of its folds, so S rose to 353. The code itself held, at T 0.0195 over 10 runs, so D156 keeps the cuts that are real.
 
-**D156.** Keep if its K over 3 samples holds against c-m3
+**D156.** Kept: `c-s7`, seven real lines cut, S 342. Median K 46.81 over 3 against c-map's 46.79 over 19: a tie in K, so the lines are worth having and T didn't pay for them. The final source. M is watched: 10.26 to 10.54 here.
 
 ## What didn't work
 
@@ -544,7 +544,7 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 - **What none of these can see:** the code relies on the file's last record ending in its CRLF terminator (spec 2.2). A file whose last record had none would lose that record. No file in the bank lacks the terminator, so a change that broke the reliance would pass `quick.sh`. See [README](README.md#limits).
 - **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `1a2665e`, whose source is the final one, run with `--full` on 2026-11-02 at 06:38 UTC against the organisers' harness at `adb9316`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `234687d`, whose source is the final one, run with `--full` on 2026-11-02 at 07:57 UTC against the organisers' harness at `adb9316`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|

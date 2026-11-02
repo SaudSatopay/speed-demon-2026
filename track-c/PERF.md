@@ -174,6 +174,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 129 | exp: keys apart, 104,724 homes, three huge pages and small ones (c-sp2) | The split leaves the table small enough to give back a huge page | run-2bbe3e79c435 | 0.0210 | 8.70 | 83.04 |
 | 130 | exp: small pages hold only tails and stacks (c-sp3) | c-sp2 had the end of the join table on small pages, read by every record | run-546cd6aecc4d | 0.0212 | 10.18 | 82.22 |
 | 131 | Back to c-map, the final source | Keys apart from bits, two slots to a line: c-sp1 133,000 homes T 0.0201 M 9.99 S 385 K 45.50; c-sp2 three huge pages T 0.0210 and 0.0214 M 8.70 and 8.90 S 389 K 45.80 and 45.09; c-sp3 tails on small pages T 0.0212 M 10.18 K 44.10. The memory is real, and T and lines cost more than it pays | run-86b020e5c814 | 0.0195 | 10.19 | 83.45 |
+| 132 | No release until every thread has finished parsing (c-w1) | Local cgroup test: a release during the last segments frees page tables and the threads still reading allocate new ones, charging a batch per CPU: peak 10.6 to 9.16 MB | pending | — | — | — |
 
 ## Decision log
 
@@ -445,6 +446,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D133.** Keep only if median beats 46.94 over 3
 
 **D134.** Rejected: no run of the three reaches the median 46.94 of c-map
+
+**D135.** pending: board M and T
 
 ## What didn't work
 

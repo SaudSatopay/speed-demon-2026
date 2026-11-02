@@ -516,7 +516,7 @@ extern "C" fn main() -> i32 {
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
-    let released = AtomicUsize::new(0);
+    let (released, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = || {
         while let Some((pos, end)) = part(lookup, &lines, line_parts, b"\n") {
             parse_regions(&lookup[pos..], end - pos);
@@ -532,10 +532,14 @@ extern "C" fn main() -> i32 {
         while let Some((pos, end)) = part(records, &segments, threads * 12, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
         }
-        // Parsing is over, so each release can only stop threads still on their last segment, which a
-        // release per segment would do all run. Threads share the releases: the exit would do them on
-        // one. Any pages still in use just map again. Whole 2 MiB, so that none has to split a huge
-        // mapping.
+        // No release before every thread is done: it frees page tables it empties, and a thread still
+        // reading those pages would allocate new ones, which charges a batch to its CPU (see above).
+        finished.fetch_add(1, Release);
+        while finished.load(Acquire) < threads {
+            thread::yield_now();
+        }
+        // Threads share the releases: the exit would do them on one. Whole 2 MiB, so that none has to
+        // split a huge mapping.
         let chunk = records.len().div_ceil(threads * 3).next_multiple_of(HUGE);
         let mut from = released.fetch_add(chunk, Relaxed);
         while from < records.len() {

@@ -938,9 +938,9 @@ fn insert_smallest(smallest: &mut [u32; SMALLEST], mut doc: u32) {
     }
 }
 
-/// Looks the tokens up: first finding each one's key and set, then comparing the keys, in a loop so short
-/// that the cache misses of many sets overlap, with no branch on what that finds and nothing in the loop
-/// waiting for it. A word with no flags then marks its term. The others are listed by position: those marked `UNSURE` need a full look, and few
+/// Looks the tokens up: first finding each one's key and prefetching its set, so that cache misses
+/// overlap, then comparing the keys without a branch on what that finds. A word with no flags marks its
+/// term there and then. The others are listed by position: those marked `UNSURE` need a full look, and few
 /// do, and those that are a term's with flags go to `mark`. Returns how many it listed for that. This stage
 /// stays out of line, like `mark` and `check_bools`, because measurements say so: inlining this one costs
 /// 1.7% of all cycles, and those two 1.9% together.
@@ -957,11 +957,12 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
     // A set is 64 bytes, so these take a hash to a set's distance from the first.
     let shift = 32 - 6 - terms.sets.len().trailing_zeros() as i32;
     let distances = (terms.sets.len() as i64 - 1) << 6;
-    // First pass: each token's key, and its set's address, as far as the next pass reads.
+    // First pass: each token's key, and its set's address, prefetched, as far as the next pass reads.
     for at in (0..count.next_multiple_of(2 * LANES)).step_by(LANES) {
         // SAFETY: `edges` has eight pairs more than there are tokens, each at or before a token's start,
         // whose load stays in the mapping as in `keys_of`. Keys and places have room for seven more.
-        // The build targets x86-64-v3, which has AVX2.
+        // The set is in the table, and a prefetch has no other effect. The build targets x86-64-v3,
+        // which has AVX2.
         unsafe {
             let pairs = edges.as_ptr().add(2 * at);
             let start = |i: usize| text.as_ptr().add(*pairs.add(2 * i) as usize);
@@ -984,12 +985,20 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             let place = _mm256_add_epi64(distance, _mm256_set1_epi64x(sets));
             _mm256_storeu_si256(keys.as_mut_ptr().add(at).cast(), key);
             _mm256_storeu_si256(places.as_mut_ptr().add(at).cast(), place);
+            for i in 0..LANES {
+                _mm_prefetch(*places.get_unchecked(at + i) as *const i8, _MM_HINT_T0);
+            }
         }
     }
-    // Second pass: compare the keys.
+    // Second pass: compare the keys, mark the terms of the words with no flags, and list the others. Any
+    // other word is above `last`, so marks the mark past the last term's.
+    let (mut unsure_count, mut flagged_count) = (0, 0);
+    // SAFETY: the build targets x86-64-v3, which has AVX2.
+    let mut here = unsafe { _mm256_setzero_si256() };
     for at in (0..count).step_by(2 * LANES) {
-        // SAFETY: the places are in the table, and `tokens` has room for every token and seven more. The build
-        // targets x86-64-v3, which has AVX2.
+        // SAFETY: the places are in the table, `present` has a mark past the last term's, and the lists have
+        // room for every token and seven more. `POSITIONS` has a row for each of the masks. The build targets
+        // x86-64-v3, which has AVX2.
         unsafe {
             let word = |i: usize| {
                 let set = &*(*places.get_unchecked(at + i) as *const TermSet);
@@ -998,19 +1007,6 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             let half = |i| _mm_setr_epi32(word(i), word(i + 1), word(i + 2), word(i + 3));
             let words = _mm256_set_m128i(half(4), half(0));
             _mm256_storeu_si256(tokens.as_mut_ptr().add(at).cast(), words);
-        }
-    }
-    // Third pass: mark the terms of the words with no flags, and list the others. Any other word is above
-    // `last`, so marks the mark past the last term's.
-    let (mut unsure_count, mut flagged_count) = (0, 0);
-    // SAFETY: the build targets x86-64-v3, which has AVX2.
-    let mut here = unsafe { _mm256_setzero_si256() };
-    for at in (0..count).step_by(2 * LANES) {
-        // SAFETY: `tokens` has words up to here, `present` has a mark past the last term's, and the lists have
-        // room for every token and seven more. `POSITIONS` has a row for each of the masks. The build targets
-        // x86-64-v3, which has AVX2.
-        unsafe {
-            let words = _mm256_loadu_si256(tokens.as_ptr().add(at).cast());
             let marked = _mm256_min_epu32(words, _mm256_set1_epi32(last as i32));
             for index in std::mem::transmute::<__m256i, [u32; 8]>(marked) {
                 *present.get_unchecked_mut(index as usize) = stamp;
@@ -1031,7 +1027,7 @@ fn look_up(terms: &TermTable, text: &[u8], edges: &[u32], lists: &mut DocLists) 
             here = _mm256_add_epi32(here, _mm256_set1_epi32(2 * LANES as i32));
         }
     }
-    // Fourth pass: the words that may not be the token's.
+    // Third pass: the words that may not be the token's.
     for at in unsure[..unsure_count].iter().map(|&at| at as usize) {
         // SAFETY: this is a token's position or at most seven past the last, for which `tokens` has room,
         // and `flagged` has room for every token and those seven.

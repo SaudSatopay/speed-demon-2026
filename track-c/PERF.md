@@ -1,14 +1,14 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run of the final source (`c-map`) is `run-540bab063106`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of 5 runs of the final source, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-m3`, which is `c-map` with a one-stage Dockerfile: the same binary, with S 349 in place of 352 (D143). Its median K is **46.82** over 17 runs of the same binary plus 2 at S 349. Our best run is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
-- S is 352 code lines on the board's last run, against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124).
-- The final source's T ran 0.0193 to 0.0197 over its 5 runs. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
-- On Monday Nov 2, 08:00 IST, the board's top three on this track were another ello (K 49.97: T 0.019, M 7.9, S 371), SALAAR (K 48.54: T 0.017, M 9.3, S 451) and NickTrapp (K 48.09: T 0.018, M 12.8, S 303). Our final source has a median K of 47.01 at T 0.0194, M 10.06 and S 352, fourth. The board shows only their numbers, so we don't know how they do it.
+- S is 349 code lines on the board's last run (`c-m3`), against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124), nor did the 5 for `c-e0` (step 148). The last 3 lines cut came from the Dockerfile, which the line counter includes: one stage in place of two took it from 7 lines to 4 with the same binary (step 140).
+- The binary's T ran 0.0193 to 0.0197 over the 5 runs of step 126, and 0.0195 and 0.0196 over the 2 of `c-m3`. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
+- At Mon Nov 2 10:40 IST the board's top three on this track were NickTrapp (K 50.29: T 0.019, M 8.4, S 314), another ello (K 49.97: T 0.019, M 7.9, S 371) and SALAAR (K 48.54: T 0.017, M 9.3, S 451). Our final source, `c-m3`, has a median K of 46.82 over 17 runs of the same binary plus 2 at S 349, and is fourth. The board shows only their numbers, so we don't know how they do it.
 
 ## What the box taught us
 
@@ -174,26 +174,26 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 129 | exp: keys apart, 104,724 homes, three huge pages and small ones (c-sp2) | The split leaves the table small enough to give back a huge page | run-2bbe3e79c435 | 0.0210 | 8.70 | 83.04 |
 | 130 | exp: small pages hold only tails and stacks (c-sp3) | c-sp2 had the end of the join table on small pages, read by every record | run-546cd6aecc4d | 0.0212 | 10.18 | 82.22 |
 | 131 | Back to c-map, the final source | Keys apart from bits, two slots to a line: c-sp1 133,000 homes T 0.0201 M 9.99 S 385 K 45.50; c-sp2 three huge pages T 0.0210 and 0.0214 M 8.70 and 8.90 S 389 K 45.80 and 45.09; c-sp3 tails on small pages T 0.0212 M 10.18 K 44.10. The memory is real, and T and lines cost more than it pays | run-86b020e5c814 | 0.0195 | 10.19 | 83.45 |
-| 132 | No release until every thread has finished parsing (c-w1) | Local cgroup test: a release during the last segments frees page tables and the threads still reading allocate new ones, charging a batch per CPU: peak 10.6 to 9.16 MB | pending | — | — | — |
-| 133 | Measure only: workers stop after the regions, main does the rest (c-e1) | Finds the floor of M on the box: c-w1 did not move M there, so what is left may be outside the program | pending | — | — | — |
-| 134 | Page tables for most of the file touched after the threads start, totals merged before the release, 32 KiB stacks for 106,188 homes (c-x1) | Local phase stamps: 620 us of 9.7 ms pass before a worker starts, 250 us of it touches that needn't wait; simulated spills 5.0 to 4.15 percent | pending | — | — | — |
-| 135 | CLDEMOTE after the locked write (c-d1) | The workers-only-regions run took 49 ns a record alone against about 58 per thread with 12: memory waits set T, and a slot written by another core costs a snoop | pending | — | — | — |
-| 136 | PREFETCHNTA for the text instead of T0 (c-n1) | Text at about the rate of slot lines passes through the caches on its way: NTA should leave more room in them for slots | pending | — | — | — |
-| 137 | Measure only: one thread (c-e2) | M at one thread shows what the 11 spawns add on the box | pending | — | — | — |
-| 138 | Text and region prefetches into L2, not L1 (c-q1) | A core has 16 fill buffers for two threads, and a chunk asks for about 50 lines at once; a prefetch to L2 should give its buffer back early, so slot prefetches stop queueing | pending | — | — | — |
-| 139 | Back to c-x1 for more samples | One run so far, T 0.0195; c-q1 T 0.0199 and c-n1 0.0197 show no gain | pending | — | — | — |
-| 140 | C: back to c-map, with a one-stage Dockerfile | The line counter includes the Dockerfile; one stage takes it from 7 lines to 4, S 352 to 349, with the same binary | pending | — | — | — |
-| 141 | exp: 1 MiB of file-backed rodata read at start (c-big) | Test whether the program file pages count in M on the box: 1.5 MB above the table is unexplained, and the binary maps 0.9 MB | pending | — | — | — |
-| 142 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all of them went to find and fought over one cache line | pending | — | — | — |
-| 143 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
-| 144 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real | pending | — | — | — |
-| 145 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all went to find and fought over one line | pending | — | — | — |
-| 146 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
-| 147 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real | pending | — | — | — |
-| 148 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all went to find and fought over one line | pending | — | — | — |
-| 149 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
-| 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real | pending | — | — | — |
-| 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.17 over 2: none beats c-map at 46.82 over 17 | pending | — | — | — |
+| 132 | No release until every thread has finished parsing (c-w1) | Local cgroup test: a release during the last segments frees page tables and the threads still reading allocate new ones, charging a batch per CPU: peak 10.6 to 9.16 MB. 1 run: K 45.40, T 0.0206, M 10.19, S 356. M did not move on the box (c-map 10.06), and T was 0.0206 against 0.0194. Rejected | run-66c52ea6c2f0 | 0.0206 | 10.19 | 82.85 |
+| 133 | Measure only: workers stop after the regions, main does the rest (c-e1) | Finds the floor of M on the box: c-w1 did not move M there, so what is left may be outside the program. 1 run: T 0.1627, M 10.18, S 357. M is level with c-map's 10.06, so parsing and releasing add nothing to M on the box. Measure only. Not kept | run-8a2910111617 | 0.1627 | 10.18 | 60.39 |
+| 134 | Page tables for most of the file touched after the threads start, totals merged before the release, 32 KiB stacks for 106,188 homes (c-x1) | Local phase stamps: 620 us of 9.7 ms pass before a worker starts, 250 us of it touches that needn't wait; simulated spills 5.0 to 4.15 percent. 1 run: K 46.71, T 0.0195, M 10.14, S 354. Step 139 ran it a second time and judged both. Not kept | run-ff3487739ae9 | 0.0195 | 10.14 | 83.47 |
+| 135 | CLDEMOTE after the locked write (c-d1) | The workers-only-regions run took 49 ns a record alone against about 58 per thread with 12: memory waits set T, and a slot written by another core costs a snoop. 1 run: K 46.65, T 0.0195, M 10.24, S 352, against c-map's median K 46.82 over 17 runs. One run, so not proven worse. Not kept | run-888955904777 | 0.0195 | 10.24 | 83.44 |
+| 136 | PREFETCHNTA for the text instead of T0 (c-n1) | Text at about the rate of slot lines passes through the caches on its way: NTA should leave more room in them for slots. 1 run: K 46.51, T 0.0197, M 10.13, S 352, against c-map's median K 46.82 over 17 runs. One run, so not proven worse. Not kept | run-74548fffcb89 | 0.0197 | 10.13 | 83.38 |
+| 137 | Measure only: one thread (c-e2) | M at one thread shows what the 11 spawns add on the box. 1 run, one thread: T 0.1218, M 9.89, S 352. The 11 spawns add about 0.25 MB to M, and alone the work takes 37 ns a record. Measure only. Not kept | run-94c70698c41e | 0.1218 | 9.89 | 63.70 |
+| 138 | Text and region prefetches into L2, not L1 (c-q1) | A core has 16 fill buffers for two threads, and a chunk asks for about 50 lines at once; a prefetch to L2 should give its buffer back early, so slot prefetches stop queueing. 1 run: K 46.40, T 0.0199, M 10.00, S 352, against c-map's median K 46.82 over 17 runs. One run, so not proven worse. Not kept | run-6943039e722a | 0.0199 | 10.00 | 83.32 |
+| 139 | Back to c-x1 for more samples | One run so far, T 0.0195; c-q1 T 0.0199 and c-n1 0.0197 show no gain. A second run of c-x1: K 44.43, T 0.0215, M 10.13, S 354, a slow-mode run. With step 134, c-x1 has K 46.71 and 44.43. Neither it nor c-d1 (46.65), c-n1 (46.51) or c-q1 (46.40) beats c-map's median K 46.82 over 17 runs. Few runs each, so none is proven worse. Not kept | run-57941b6573bb | 0.0215 | 10.13 | 82.38 |
+| 140 | C: back to c-map, with a one-stage Dockerfile | The line counter includes the Dockerfile; one stage takes it from 7 lines to 4, S 352 to 349, with the same binary. 2 runs: K 46.88 here and 46.79 on `run-f75d24121fb9`, a sample from another track's push (T 0.0195, M 10.22, S 349). This run: T 0.0196, M 9.97, S 349. Same binary. Kept, the final source | run-f11cfb61d357 | 0.0196 | 9.97 | 83.55 |
+| 141 | exp: 1 MiB of file-backed rodata read at start (c-big) | Test whether the program file pages count in M on the box: 1.5 MB above the table is unexplained, and the binary maps 0.9 MB. 1 run: M 10.03 against about 10.1 without it, so the program file's own pages don't count in M on the box, and a smaller binary wouldn't lower M. T 0.0217 was a slow-mode T. Measure only. Not kept | run-efc1d6d73e2b | 0.0217 | 10.03 | 82.37 |
+| 142 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all of them went to find and fought over one cache line. Sample 1 of 3: K 46.91, T 0.0193, M 10.19, S 354. Judged on all 3 at step 148. Rejected | run-af7cfd91c950 | 0.0193 | 10.19 | 83.56 |
+| 143 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate. Sample 1: K 46.55, T 0.0197, M 10.01, S 356. Judged on all samples at step 149. Rejected | run-d4bd2ea3e1ca | 0.0197 | 10.01 | 83.39 |
+| 144 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real. Sample 1: K 46.68, T 0.0194, M 10.15, S 361. Judged with sample 2 at step 147. Rejected | run-a1da73edffe3 | 0.0194 | 10.15 | 83.46 |
+| 145 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all went to find and fought over one line. Sample 2 of 3: K 46.70, T 0.0194, M 10.21, S 354. Judged on all 3 at step 148. Rejected | run-980a974d8a52 | 0.0194 | 10.21 | 83.47 |
+| 146 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate. Sample 2: K 46.55, T 0.0196, M 10.19, S 356. Judged on all samples at step 149. Rejected | run-1f9ef227a22f | 0.0196 | 10.19 | 83.40 |
+| 147 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real. Sample 2: K 45.66, T 0.0203, M 10.07, S 361. With sample 1, c-ef has K 46.68 and 45.66 against c-map's median 46.82, at S 361. Rejected | run-0fd0f9fecaf4 | 0.0203 | 10.07 | 82.98 |
+| 148 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all went to find and fought over one line. Sample 3 of 3: K 46.61, T 0.0194, M 10.38, S 354. Median K 46.70 over 3 (46.91, 46.70, 46.61) against c-map's 46.82, T 0.0194. T moved by under 1% for 5 more lines, so the estimate of about 2.6% of T from the shared line was too high. Rejected | run-7fc479cde02d | 0.0194 | 10.38 | 83.42 |
+| 149 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate. Sample 3: K 46.56, T 0.0196, M 10.09, S 356. Another track's push gave a fourth sample, `run-8eacbe22eef9` (K 46.45, T 0.0198, M 10.01). Median K 46.55 over 4, T 0.0197, against c-map's 46.82: the extra compares cost what the prefetch saves. Rejected | run-12c225b0a04e | 0.0196 | 10.09 | 83.40 |
+| 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | Third sample: K 46.25. Median 46.25 over 3, S 361. Rejected | run-b0f16fcd0721 | 0.0197 | 10.28 | 83.25 |
+| 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.25 over 3: none beats c-map at 46.82 over 17. First run here K 46.26, then c-m3 has K 46.88, 46.79, 46.26. Kept | run-bb5f373588a0 | 0.0200 | 10.04 | 83.26 |
 
 ## Decision log
 
@@ -466,45 +466,45 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D134.** Rejected: no run of the three reaches the median 46.94 of c-map
 
-**D135.** pending: board M and T
+**D135.** Rejected: no release until every thread has finished parsing (c-w1). Locally the peak fell from 10.6 to 9.16 MB. On the box one run gave M 10.19, so M did not move, and T was 0.0206 against 0.0194 for c-map (K 45.40, S 356).
 
-**D136.** pending: one run, then back
+**D136.** Not kept, measurement only: the workers stop after the regions and main does the rest (c-e1). One run: M 10.18, T 0.1627. Parsing and releasing add nothing to M on the box.
 
-**D137.** pending: board, 3 samples
+**D137.** Not kept: page tables for most of the file touched after the threads start, totals merged before the release, 32 KiB stacks (c-x1). Two runs, K 46.71 and 44.43 (T 0.0195 and 0.0215, the second a slow-mode run), against c-map's median 46.82 over 17 runs. c-d1, c-n1 and c-q1 (D138, D139, D141) did no better. Few runs each, so none is proven worse.
 
-**D138.** pending: board, 3 samples
+**D138.** Not kept: CLDEMOTE after the locked write (c-d1). One run: K 46.65, T 0.0195, M 10.24, S 352, against c-map's median 46.82 over 17 runs. One run doesn't prove it worse.
 
-**D139.** pending: board, 3 samples
+**D139.** Not kept: PREFETCHNTA for the text instead of T0 (c-n1). One run: K 46.51, T 0.0197, M 10.13, S 352, against c-map's median 46.82 over 17 runs. One run doesn't prove it worse.
 
-**D140.** pending: one run, then back
+**D140.** Not kept, measurement only: one thread (c-e2). M 9.89, so the 11 spawns add about 0.25 MB. T 0.1218 alone is 37 ns a record.
 
-**D141.** pending: board, 3 samples
+**D141.** Not kept: text and region prefetches into L2, not L1 (c-q1). One run: K 46.40, T 0.0199, M 10.00, S 352, against c-map's median 46.82 over 17 runs. One run doesn't prove it worse.
 
-**D142.** pending: board, 3 samples
+**D142.** Not kept: a second run of c-x1. K 44.43, T 0.0215, a slow-mode run. With D137's first run (K 46.71) it doesn't beat c-map's median, though a slow-mode run doesn't prove it worse.
 
-**D143.** pending: board shows T and M unchanged
+**D143.** Kept: the one-stage Dockerfile. The line counter includes the Dockerfile, and one stage takes it from 7 lines to 4, so S goes from 352 to 349 with the same binary. Two runs, K 46.88 and 46.79, T 0.0196 and 0.0195, M 9.97 and 10.22 (the second a sample from another track's push). Outcome: c-m3, which is c-map with this Dockerfile, is the final source. c-map's median K is 46.82 over 17 runs.
 
-**D144.** Measurement only, restore c-m3 after
+**D144.** Not kept, measurement only: 1 MiB of the program's read-only data read at start (c-big). One run: M 10.03 against about 10.1 without it. The program file's own pages don't count in M on the box, so a smaller binary wouldn't lower M. T 0.0217 was a slow-mode T.
 
-**D145.** Keep if the median K beats c-map over 3 samples
+**D145.** c-e0, sample 1: K 46.91, T 0.0193, M 10.19, S 354. Judged at D151.
 
-**D146.** Keep if the median K beats c-map over 3 samples
+**D146.** c-f0, sample 1: K 46.55, T 0.0197, M 10.01, S 356. Judged at D152.
 
-**D147.** Keep if the median K beats c-map over 3 samples
+**D147.** c-ef, sample 1: K 46.68, T 0.0194, M 10.15, S 361. Judged at D153.
 
-**D148.** Keep if the median K beats c-map over 3 samples
+**D148.** c-e0, sample 2: K 46.70, T 0.0194, M 10.21, S 354. Judged at D151.
 
-**D149.** Keep if the median K beats c-map over 3 samples
+**D149.** c-f0, sample 2: K 46.55, T 0.0196, M 10.19, S 356. Judged at D152.
 
-**D150.** Keep if the median K beats c-map over 3 samples
+**D150.** c-ef, sample 2: K 45.66, T 0.0203, M 10.07, S 361. Judged at D153.
 
-**D151.** Keep if the median K beats c-map over 3 samples
+**D151.** Rejected: empty names get no slot, one flag per thread in the row's repeats (c-e0). Three samples, K 46.91, 46.70 and 46.61, median 46.70 against c-map's 46.82; T 0.0194, S 354. T moved by under 1% for 5 more lines. The estimate of about 2.6% of T from the shared line was too high.
 
-**D152.** Keep if the median K beats c-map over 3 samples
+**D152.** Rejected: the first pass prefetches the free slot a new name will take (c-f0). Four samples, K 46.55, 46.55, 46.56 and 46.45 (the last, `run-8eacbe22eef9`, from another track's push), median 46.55 against c-map's 46.82; T 0.0197, S 356. The extra compares cost what the prefetch saves.
 
-**D153.** Keep if the median K beats c-map over 3 samples
+**D153.** Rejected: both together (c-ef). Three samples, K 46.68, 45.66 and 46.25, S 361.
 
-**D154.** Final unless something beats its median over 3 samples
+**D154.** Back to `c-m3`, the final source. c-e0, c-f0 and c-ef didn't beat c-map's median K 46.82 over 17. Outcome: final unless something beats its median over 3 samples.
 
 ## What didn't work
 
@@ -520,6 +520,9 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 48-byte name slots packed across cache lines (`c-pack2`, `c-p4`) | M falls by about a megabyte | M 9.38 and 8.77 against 10.16, but T 0.0211 and 0.0216 against 0.0196, and K 45.13 and 45.28 against 46.55 | run-97a7fd55f700, run-b8a2382fa642 | reverted |
 | No release of the file's pages (`c-ph2`) | 8 lines fewer; the exit's cost unknown | T 0.0228 against 0.0192: the exit costs about 3.6 ms | run-dd2fa2833129, run-d82eb3c3bb54 | reverted |
 | `MADV_POPULATE_READ` on each segment before parsing (`c-p1`) | Fewer faults, and the text prefetch no longer stops at unmapped pages | K 45.92 in one run, T 0.0196 against 0.0191: no gain, not proven worse | run-9860184a210a | not kept |
+| Empty names get no slot, each thread counts them in its row (`c-e0`) | One record in a hundred has an empty name, and all of them went to `find` and fought over one cache line: about 2.6% of T by estimate | Median K 46.70 over 3 against 46.82 for c-map; T 0.0194, S 354. T moved by under 1% for 5 more lines, so the estimate was too high | run-af7cfd91c950, run-980a974d8a52, run-7fc479cde02d | reverted |
+| The first pass prefetches the free slot a new name will take (`c-f0`, and with `c-e0` as `c-ef`) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | `c-f0`: median K 46.55 over 4 (one a sample from another track's push), T 0.0197, S 356. `c-ef`: K 46.68 and 45.66, S 361. The extra compares cost what the prefetch saves | run-d4bd2ea3e1ca, run-1f9ef227a22f, run-12c225b0a04e, run-8eacbe22eef9, run-a1da73edffe3, run-0fd0f9fecaf4 | reverted |
+| 1 MiB of the program's read-only data read at start (`c-big`) | If the program file's pages count in M, M should rise by about 1 MB; 1.5 MB above the table is unexplained and the binary maps 0.9 MB | M 10.03 against about 10.1: the program file's own pages don't count in M on the box, so a smaller binary wouldn't lower M | run-efc1d6d73e2b | not kept (measure only) |
 
 ## The final design
 
@@ -535,7 +538,7 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 - **What none of these can see:** the code relies on the file's last record ending in its CRLF terminator (spec 2.2). A file whose last record had none would lose that record. No file in the bank lacks the terminator, so a change that broke the reliance would pass `quick.sh`. See [README](README.md#limits).
 - **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `0f33ae9`, whose source is the final one, run with `--full` on 2026-11-02 at 02:35 UTC against the organisers' harness at `adb9316`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `1a2665e`, whose source is the final one, run with `--full` on 2026-11-02 at 06:38 UTC against the organisers' harness at `adb9316`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|

@@ -49,10 +49,10 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 25 | exp: read the graph file in 32 KiB pieces instead of mapping it | On C and A this beat the mapping on the box by 10% or more: page faults on a mapped file cost far more there than here. D reads the file twice, so it gets twice the copies but also no faults | run-5750d7815232 | 0.1501 | 42.2 | 71.5 |
 | 26 | Map the graph file again | Reading it in pieces gave T 0.1501 against about 0.151, for 18 more lines: D's parse is too small a part of its run | run-cd677a8bdf1c | 0.1622 | 42.6 | 70.7 |
 | 27 | 28 fewer lines: offsets close up in the region pass, no shrink between queries, shorter helpers | S 648 costs K, and measuring each block showed every large one pays for itself, so only small cuts are left: removing simplify costs 9% K, tier 3 alone also 9% | superseded before it ran | — | — | — |
-| 28 | REGION 2^13 -> 2^14 (board test) | Fewer boundary nodes kept by simplify; +6 MB of per-thread Local arrays. Local timing too noisy to judge. | pending | — | — | — |
-| 29 | REGION back to 2^13 (2^14 lost: board T 0.1507, M 48.7 MB, K 26.34 against about 27.2); BATCH 32 -> 64 (board test) | Wider batches overlap more cache misses in parse and build, at 1.5 KB more stack. | pending | — | — | — |
-| 30 | Default thread cap 12 -> 6 (board test); BATCH 64 kept (3 board samples K 27.45, 27.24, 27.32 against a 27.16 median before) | The box has 6 cores with hyper-threading; parse and numbering may contend at 12. | pending | — | — | — |
-| 31 | Thread cap back to 12 (6 lost badly: board T 0.196 to 0.205, K 23.8 to 24.2, four samples); BATCH 64 kept | Hyper-threads hide the memory latency of parse, numbering and search; six threads leave it exposed. | pending | — | — | — |
+| 28 | REGION 2^13 -> 2^14 (board test) | Fewer boundary nodes kept by simplify; +6 MB of per-thread Local arrays. Local timing too noisy to judge. | run-188ed93338b0 | 0.1507 | 48.7 | 71.0 |
+| 29 | REGION back to 2^13 (2^14 lost: board T 0.1507, M 48.7 MB, K 26.34 against about 27.2); BATCH 32 -> 64 (board test) | Wider batches overlap more cache misses in parse and build, at 1.5 KB more stack. | run-d9220323162a | 0.1442 | 44.1 | 71.9 |
+| 30 | Default thread cap 12 -> 6 (board test); BATCH 64 kept (3 board samples K 27.45, 27.24, 27.32 against a 27.16 median before) | The box has 6 cores with hyper-threading; parse and numbering may contend at 12. | run-fb17921d3cb0 | 0.1960 | 38.1 | 69.2 |
+| 31 | Thread cap back to 12 (6 lost badly: board T 0.196 to 0.205, K 23.8 to 24.2, four samples); BATCH 64 kept | Hyper-threads hide the memory latency of parse, numbering and search; six threads leave it exposed. | run-dec04fae4304 | 0.1511 | 43.7 | 71.5 |
 
 ## Decision log
 

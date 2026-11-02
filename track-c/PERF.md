@@ -200,6 +200,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 155 | exp: c-l2 tightened, three passes: region read and bit prefetch in the second (c-l3) | c-l1 T 0.0239: the demand read of the region in pass 1 stalls the box | pending | — | — | — |
 | 156 | exp: c-l3 code on four huge pages with no short class (c-l4), a measure | Separates the code cost of the classes from the cost of keys and bits apart | pending | — | — | — |
 | 157 | exp: c-s7 with 48 idle instructions per record, a measure (c-n48) | c-l4 lost 16 percent of T with 48 more instructions and no change of layout: is that the instructions | pending | — | — | — |
+| 158 | exp: name classes, two passes, second pass owns each bit's line six records ahead (c-l5) | c-n48 shows idle instructions cost 3.6 percent, so c-l4's 16 percent is from code shape: keep compare and write in the second pass | pending | — | — | — |
 
 ## Decision log
 
@@ -523,6 +524,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D159.** Measure only
 
 **D160.** Measure only
+
+**D161.** On trial
 
 ## What didn't work
 

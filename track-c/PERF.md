@@ -185,6 +185,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 140 | C: back to c-map, with a one-stage Dockerfile | The line counter includes the Dockerfile; one stage takes it from 7 lines to 4, S 352 to 349, with the same binary | pending | — | — | — |
 | 141 | exp: 1 MiB of file-backed rodata read at start (c-big) | Test whether the program file pages count in M on the box: 1.5 MB above the table is unexplained, and the binary maps 0.9 MB | pending | — | — | — |
 | 142 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all of them went to find and fought over one cache line | pending | — | — | — |
+| 143 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
 
 ## Decision log
 
@@ -478,6 +479,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D144.** Measurement only, restore c-m3 after
 
 **D145.** Keep if the median K beats c-map over 3 samples
+
+**D146.** Keep if the median K beats c-map over 3 samples
 
 ## What didn't work
 

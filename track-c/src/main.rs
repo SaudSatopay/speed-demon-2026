@@ -21,7 +21,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::asm, arch::x86_64::*, collections::*, fs::File, hint::black_box, thread};
+use std::{arch::asm, arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
 use std::{io::BufWriter, io::Write, mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
@@ -126,10 +126,8 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
         // The second one is a region id, and `add_records` needs it inside the join table.
         let cap = _mm256_set_epi32(-1, -1, -1, -1, -1, -1, REGION_IDS as i32 - 1, -1);
         let eights = _mm256_min_epu32(eights, cap);
-        (
-            _mm256_extract_epi64::<0>(eights) as u64,
-            _mm256_extract_epi32::<4>(eights) as u32,
-        )
+        let first_two = _mm256_extract_epi64::<0>(eights) as u64;
+        (first_two, _mm256_extract_epi32::<4>(eights) as u32)
     }
 }
 
@@ -534,14 +532,9 @@ extern "C" fn main() -> i32 {
         let chunk = records.len().div_ceil(threads * 3).next_multiple_of(HUGE);
         let claims = std::iter::repeat_with(|| released.fetch_add(chunk, Relaxed));
         for from in claims.take_while(|&from| from < records.len()) {
+            let len = chunk.min(records.len() - from);
             // SAFETY: only read pages go, and a later read maps them again. 4 is `MADV_DONTNEED`.
-            unsafe {
-                madvise(
-                    records.as_ptr().add(from),
-                    chunk.min(records.len() - from),
-                    4,
-                )
-            };
+            unsafe { madvise(records.as_ptr().add(from), len, 4) };
         }
         for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
             [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);
@@ -565,12 +558,8 @@ extern "C" fn main() -> i32 {
 
     // Sorted by key, bytewise: the codes in order, then `_UNMATCHED`, because `_` is above `Z`. A
     // row's columns are already in output order, and a group without records gets no line.
-    let lines: BTreeMap<_, _> = ["_UNMATCHED"]
-        .iter()
-        .chain(codes)
-        .copied()
-        .zip(&totals)
-        .collect();
+    let keys = ["_UNMATCHED"].iter().chain(codes).copied();
+    let lines: std::collections::BTreeMap<_, _> = keys.zip(&totals).collect();
     let mut out = BufWriter::new(File::create(arg(2, "/out") + "/aggregates.txt").unwrap());
     for (key, Row(row)) in lines.into_iter().filter(|(_, row)| row.0[0] != 0) {
         write!(out, "{key} {} {}", row[0], row[2]).unwrap();

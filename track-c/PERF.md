@@ -195,6 +195,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | Third sample: K 46.25. Median 46.25 over 3, S 361. Rejected | run-b0f16fcd0721 | 0.0197 | 10.28 | 83.25 |
 | 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.25 over 3: none beats c-map at 46.82 over 17. First run here K 46.26, then c-m3 has K 46.88, 46.79, 46.26. Kept | run-bb5f373588a0 | 0.0200 | 10.04 | 83.26 |
 | 152 | exp: 10 real lines cut off the hot path (c-s10) | Bit planes computed where they are used, the page release as an iterator, three lets folded, one unneeded assert gone: S counts, and none of these pays for its lines | pending | — | — | — |
+| 153 | C: 7 real lines cut off the hot path (c-s7) | c-s10 came to S 353 as rustfmt broke up three of its folds; those are put back. The bit planes computed where used, the release as an iterator, one let folded, an unneeded assert gone. c-s10 had the same code at median T 0.0195 over 9 | pending | — | — | — |
 
 ## Decision log
 
@@ -508,6 +509,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D154.** Back to `c-m3`, the final source. c-e0, c-f0 and c-ef didn't beat c-map's median K 46.82 over 17. Outcome: final unless something beats its median over 3 samples.
 
 **D155.** Keep if the median T over 3 samples holds against c-m3
+
+**D156.** Keep if its K over 3 samples holds against c-m3
 
 ## What didn't work
 

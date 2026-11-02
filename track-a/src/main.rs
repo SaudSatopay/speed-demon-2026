@@ -533,6 +533,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
         // one's scratch stays as large as the largest hour it has seen. It has room for 1 MiB of
         // records from the start, in pages that stay untouched until a large hour needs them.
+        // A fifth finisher trades one reader for more overlap between reading and hour reduction.
         let finisher = me < 5;
         let mut scratch = Vec::with_capacity(usize::from(finisher) << 18);
         let next_segment = || loop {

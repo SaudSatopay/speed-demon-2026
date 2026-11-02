@@ -32,6 +32,8 @@ unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
     fn _exit(status: i32) -> !;
+    fn gettid() -> i32;
+    fn getpid() -> i32;
     fn pthread_attr_init(attr: *mut [u64; 8]) -> i32;
     fn pthread_attr_setstack(attr: *mut [u64; 8], stack: *mut u8, len: usize) -> i32;
     fn pthread_create(id: *mut u64, attr: *const [u64; 8], start: Start, arg: *mut u8) -> i32;
@@ -516,7 +518,7 @@ extern "C" fn main() -> i32 {
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));
-    let (released, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let released = AtomicUsize::new(0);
     let work = || {
         while let Some((pos, end)) = part(lookup, &lines, line_parts, b"\n") {
             parse_regions(&lookup[pos..], end - pos);
@@ -526,20 +528,20 @@ extern "C" fn main() -> i32 {
         while parsed.load(Acquire) < line_parts {
             thread::yield_now();
         }
+        // SAFETY: both only ask for an id.
+        if unsafe { gettid() != getpid() } {
+            return;
+        }
         let mut rows = [EMPTY_ROW; 256];
         // 12 segments per thread: when they run out, each thread still has its last to finish, and
         // the threads done first sit idle. Fine ones keep that short, and cost no shootdown.
         while let Some((pos, end)) = part(records, &segments, threads * 12, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
         }
-        // No release before every thread is done: it frees page tables it empties, and a thread still
-        // reading those pages would allocate new ones, which charges a batch to its CPU (see above).
-        finished.fetch_add(1, Release);
-        while finished.load(Acquire) < threads {
-            thread::yield_now();
-        }
-        // Threads share the releases: the exit would do them on one. Whole 2 MiB, so that none has to
-        // split a huge mapping.
+        // Parsing is over, so each release can only stop threads still on their last segment, which a
+        // release per segment would do all run. Threads share the releases: the exit would do them on
+        // one. Any pages still in use just map again. Whole 2 MiB, so that none has to split a huge
+        // mapping.
         let chunk = records.len().div_ceil(threads * 3).next_multiple_of(HUGE);
         let mut from = released.fetch_add(chunk, Relaxed);
         while from < records.len() {

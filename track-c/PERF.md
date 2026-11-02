@@ -186,6 +186,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 141 | exp: 1 MiB of file-backed rodata read at start (c-big) | Test whether the program file pages count in M on the box: 1.5 MB above the table is unexplained, and the binary maps 0.9 MB | pending | — | — | — |
 | 142 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all of them went to find and fought over one cache line | pending | — | — | — |
 | 143 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
+| 144 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real | pending | — | — | — |
 
 ## Decision log
 
@@ -481,6 +482,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D145.** Keep if the median K beats c-map over 3 samples
 
 **D146.** Keep if the median K beats c-map over 3 samples
+
+**D147.** Keep if the median K beats c-map over 3 samples
 
 ## What didn't work
 

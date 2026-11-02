@@ -37,9 +37,8 @@ const BIG_LATENCY: u32 = (1 << 19) - 1;
 const ID_SHIFT: u32 = 20;
 
 /// Words a thread reserves at a time from an hour's array, and writes without contention: records
-/// from the front, half a page at a time, as a block's unused end costs memory and is sorted too, and
-/// big latencies, two words each, from the back.
-const BLOCK: usize = 512;
+/// from the front, a page at a time, and big latencies, two words each, from the back.
+const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
 /// Bytes of the log that a thread takes out of the address space at a time, at the end.
@@ -506,7 +505,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     // Each hour's room, in words, as whole pages. Enough for every line: the shortest has 39 bytes, and
     // one with a big latency has at least 45 and takes 3 words. Plus each thread's unfinished blocks,
     // and 1 MiB for text, as an hour has one line per endpoint, of about 200 bytes at most.
-    let room = (end / 15 + (BLOCK + BIG_BLOCK) * (threads + 1) + (1 << 18)).next_multiple_of(1024);
+    let room = (end / 15 + (BLOCK + BIG_BLOCK) * (threads + 1) + (1 << 18)).next_multiple_of(BLOCK);
     // The hours' words, then the table's lines. Nearly all stay untouched, hence MAP_NORESERVE.
     // SAFETY: this maps fresh zero pages, readable and writable (1 | 2), for the life of the process.
     let base = unsafe { mmap(0, HOURS * room * 4 + IDS * 64, 1 | 2, MAP_SPARSE, -1, 0) };

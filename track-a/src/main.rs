@@ -41,10 +41,6 @@ const ID_SHIFT: u32 = 20;
 const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
-/// Bytes of the log in a segment. Threads faulting in the same large folio of the page cache sleep on
-/// its lock, so they stay out of each other's folios.
-const SEGMENT: usize = 1 << 20;
-
 /// Bytes of the log that a thread takes out of the address space at a time, at the end.
 const RELEASE: usize = 1 << 23;
 
@@ -123,13 +119,13 @@ unsafe extern "C" {
 const MAP_SPARSE: i32 = 0x02 | 0x20 | 0x4000;
 const MADV_DONTNEED: i32 = 4;
 
-/// Loads a `T` at element `pos`, little-endian and with no alignment. It's a `u8`, a `u64` for 8 bytes,
-/// or two AVX2 registers for a block of 64, from the text or from a line of the table.
+/// Loads a `T` at `pos`, little-endian and with no alignment. It's a `u8`, a `u64` for 8 bytes, or two
+/// AVX2 registers for a block of 64.
 ///
 /// # Safety
 /// The loaded bytes must be inside the buffer that `text` is part of. They may be past `text`'s own
 /// end: a key, a short slice of a piece, loads two whole blocks.
-unsafe fn load<T: Copy>(text: &[impl Sized], pos: usize) -> T {
+unsafe fn load<T: Copy>(text: &[u8], pos: usize) -> T {
     // SAFETY: the caller keeps the load inside the buffer, and the load needs no alignment.
     unsafe { text.as_ptr().add(pos).cast::<T>().read_unaligned() }
 }
@@ -167,12 +163,13 @@ fn id_of(table: &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
     let (block, second) = unsafe { (load(key, 0), load(key, 64)) };
     // The key's bytes in the second block: at most 62, as it has at most 126 with its space.
     let rest = (1u64 << key.len().saturating_sub(64)) - 1;
-    // SAFETY: a slot holds a line inside `lines`, and its bytes were stored
+    // SAFETY: a slot holds a line inside `lines`, aligned as they all are, and its bytes were stored
     // before it was published. The line after a key's last is inside `lines` too, as a key is given
     // room for 2. Another thread may be storing that line right now, which makes this read a race
     // that x86 tolerates, and nothing depends on what it reads: `rest` masks it off for a key of one
     // line, and a longer key's first compare fails unless the slot's key has a second line too.
-    let differ = |at: usize, b, m: u64| !equal_bytes(unsafe { load(table.lines, at) }, b) & m;
+    let read = |at: usize| unsafe { table.lines.as_ptr().add(at).cast::<[__m256i; 2]>().read() };
+    let differ = |at: usize, b, m: u64| !equal_bytes(read(at), b) & m;
     loop {
         let slot = &table.slots[index & (SLOTS - 1)];
         if slot.load(Acquire) == 0 {
@@ -191,6 +188,19 @@ fn id_of(table: &Table, key: &[u8], mask: u64, mut index: usize) -> u32 {
         }
         index += 1;
     }
+}
+
+/// The table's ids as they are now, in the order of their endpoints.
+fn order_ids(Table { slots, lines, .. }: &Table) -> Order {
+    // SAFETY: an atomic byte has the layout of a byte, and only published keys are read through this,
+    // whose lines never change.
+    let text = unsafe { from_raw_parts(lines.as_ptr().cast::<u8>(), lines.len() * 64) };
+    let key_of = |line: usize| text[line * 64..].split(|&b| b == b' ').next().unwrap();
+    let line = |slot: &AtomicU16| slot.load(Acquire) as usize;
+    let ids = slots.iter().map(line).filter(|&line| line > 0);
+    let mut ids: Vec<(&[u8], usize)> = ids.map(|l| (key_of(l), l)).chain([(&[][..], 0)]).collect();
+    ids.sort_unstable();
+    ids.into_iter().unzip()
 }
 
 /// Hours since the start of the span, from bytes 6 to 13 of a line, M-DDTHH:, without parsing a date.
@@ -302,9 +312,9 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
             // the log's lines, with no branch on the length of a key that fits. An empty slot
             // holds 0, and line 0 is all zeros, so it can't match.
             let kept = table.slots[index].load(Acquire) as usize;
-            // SAFETY: a slot holds a line inside the table's lines, and its
+            // SAFETY: a slot holds a line inside the table's lines, aligned as they all are, and its
             // bytes were stored before it was published.
-            let seen = unsafe { load(table.lines, kept) };
+            let seen = unsafe { table.lines.as_ptr().add(kept).cast::<[__m256i; 2]>().read() };
             // The bits up to and including the lowest one set: the key's bytes through its space, or
             // all 64 if it has no space in this block, which then leaves it to `id_of`.
             let mask = spaces ^ spaces.wrapping_sub(1);
@@ -387,15 +397,15 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
         let n @ 1.. = group.len() else { continue };
         let errors = group.iter().map(|r| r & 1).sum::<u32>() as u64;
         // Nearest rank, as the spec defines it. A group's big latencies are its last records, as they
-        // sort highest, so a rank among them reads the real value from `big`, as many places from the end
-        // of the id's as it is from the end of the group.
+        // sort highest, so a rank among them reads the real value from `big`, by two binary searches.
         let pct = |p: usize| {
-            let rank = (p * n + 99) / 100;
-            let latency = group[rank - 1] >> 1 & BIG_LATENCY;
-            if latency < BIG_LATENCY {
-                return u64::from(latency);
+            let index = (p * n + 99) / 100 - 1;
+            let small = |r: &u32| r >> 1 & BIG_LATENCY < BIG_LATENCY;
+            if small(&group[index]) {
+                return u64::from(group[index] >> 1 & BIG_LATENCY);
             }
-            big[big.partition_point(|e| e >> 32 <= id as u64) - (n + 1 - rank)] & 0xFFFF_FFFF
+            let first = big.partition_point(|e| e >> 32 < id as u64);
+            big[first + index - group.partition_point(small)] & 0xFFFF_FFFF
         };
         let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         let rate = errors * 1_000_000 / n as u64;
@@ -455,16 +465,7 @@ fn write_hour(h: usize, hour: &Hour, table: &Table, digits: &[usize], tmp: &mut 
     // the hours to come. It's made from the table as it is now, so it has this hour's endpoints.
     let mut order = table.order.lock().expect("poisoned").clone();
     if order.1.iter().map(|&id| ends[id] as usize).sum::<usize>() != recs.len() {
-        // The table's ids as they are now, in the order of their endpoints.
-        // SAFETY: an atomic byte has the layout of a byte, and only published keys are read through
-        // this, whose lines never change.
-        let text = unsafe { from_raw_parts(table.lines.as_ptr().cast::<u8>(), IDS * 64) };
-        let key_of = |line: usize| text[line * 64..].split(|&b| b == b' ').next().unwrap();
-        let line = |slot: &AtomicU16| slot.load(Acquire) as usize;
-        let ids = table.slots.iter().map(line).filter(|&line| line > 0);
-        let mut ids: Vec<_> = ids.map(|l| (key_of(l), l)).chain([(&[][..], 0)]).collect();
-        ids.sort_unstable();
-        order = Arc::new(ids.into_iter().unzip());
+        order = Arc::new(order_ids(table));
         *table.order.lock().expect("poisoned") = order.clone();
     }
     pass(recs, tmp, &mut low, digits, |r| (r >> 1 & 511) as usize);
@@ -510,11 +511,12 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     let base = unsafe { mmap(0, HOURS * room * 4 + IDS * 64, 1 | 2, MAP_SPARSE, -1, 0) };
     assert_ne!(base as isize, -1, "mmap: {}", io::Error::last_os_error());
     // SAFETY: the mapping holds `HOURS * room` zero words, reached only through `hours`.
-    let arena = unsafe { from_raw_parts(base.cast::<AtomicU32>(), HOURS * room) }.chunks(room);
-    let hours = Vec::from_iter(arena.map(|words| Hour {
+    let arena = unsafe { from_raw_parts(base.cast::<AtomicU32>(), HOURS * room) };
+    let hour = |words| Hour {
         words,
         ..Default::default()
-    }));
+    };
+    let hours: Vec<Hour> = arena.chunks(room).map(hour).collect();
     let table = Table {
         // SAFETY: after the hours' words come the lines of zeros, page-aligned, reached only from here.
         lines: unsafe { from_raw_parts(base.add(HOURS * room * 4).cast(), IDS) },
@@ -528,6 +530,12 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     let (cursor, next_out, released) = (AtomicUsize::new(0), Mutex::new(0), AtomicUsize::new(0));
     // A lower bound on the log position of any line each thread may yet read.
     let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
+    // Tying a segment's size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
+    // smaller than a line on tiny inputs.
+    // Threads faulting in the same large folio of the page cache sleep on its lock, so on a big log
+    // they stay out of each other's folios.
+    let unit = if end < 1 << 26 { 1 } else { 1 << 20 };
+    let segment = (end / threads / 64 + 1).next_multiple_of(unit);
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
     let worker = &|me: usize| {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
@@ -540,30 +548,31 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             reached[me].store(cursor.load(Relaxed), Release);
             // Only finishers take the lock here, as a thread put to sleep on it wakes up late and maybe on
             // another CPU, and its segment holds up the rest.
-            let mut h = HOURS;
+            let mut hour = HOURS;
             if finisher {
                 let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
-                let seen = table.last_seen.lock().expect("poisoned");
-                h = table.claimed.load(Relaxed);
+                let last_seen = table.last_seen.lock().expect("poisoned");
+                hour = table.claimed.load(Relaxed);
+                let seen = last_seen.get(hour).copied();
                 // An hour with no line yet has 0, and it's due only when all reading is done. Nothing
                 // waits for a thread that fell behind: on a shared machine, the others would then sit out
                 // its whole turn off the core, and that happens all the time, so a wait here turned a busy
                 // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
                 // while the box is busy.
-                if h < HOURS && (low >= end || seen[h] > 0 && seen[h] + end / share < low) {
-                    table.claimed.store(h + 1, Relaxed);
-                    drop(seen);
+                if seen.is_some_and(|s| low >= end || s > 0 && s + end / share < low) {
+                    table.claimed.store(hour + 1, Relaxed);
+                    drop(last_seen);
                     // While it writes, this thread holds no hour back.
                     reached[me].store(usize::MAX, Release);
-                    write_hour(h, &hours[h], &table, &digits, &mut scratch);
+                    write_hour(hour, &hours[hour], &table, &digits, &mut scratch);
                     append(&hours, &next_out, &file);
                     continue;
                 }
             }
-            let start = cursor.fetch_add(SEGMENT, Relaxed);
+            let start = cursor.fetch_add(segment, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
-            if start < end || reached[me].load(Relaxed) >= end && h >= HOURS {
-                return (start < end).then_some([start, (start + SEGMENT).min(end)]);
+            if start < end || reached[me].load(Relaxed) >= end && hour >= HOURS {
+                return (start < end).then_some([start, (start + segment).min(end)]);
             }
             // The wait gives up its core: a spinning thread would keep the one it waits for off a shared core.
             thread::yield_now();
@@ -572,7 +581,8 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // Exit would take the log's pages out of the address space one by one on the last thread, and
         // the clock counts that, so whichever threads are done share the work first. From the log's
         // start on, as threads still reading are near its end, and a page taken from them just comes back.
-        while let Some(at) = Some(released.fetch_add(RELEASE, Relaxed)).filter(|&at| at < end) {
+        let claims = (0..).map(|_| released.fetch_add(RELEASE, Relaxed));
+        for at in claims.take_while(|&at| at < end) {
             let page = log[at..].as_ptr().cast_mut();
             // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`
             // is a multiple of a page, and a failure would only leave them for exit.

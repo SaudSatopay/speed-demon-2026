@@ -86,6 +86,7 @@ unsafe extern "C" {
     fn mmap(at: *mut u8, len: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
     fn madvise(at: *const u8, len: usize, advice: i32) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 }
 
 /// Maps a file of this directory read-only for the life of the process, followed by `PADDING` readable
@@ -1327,7 +1328,8 @@ fn claim(next: &AtomicUsize, size: usize, len: usize) -> Option<std::ops::Range<
 /// How far each job that the threads share has got: the next of each to claim, and what's printed.
 #[derive(Default)]
 struct Progress {
-    next_range: AtomicUsize,                        // In bytes of the corpus.
+    next_cpu: AtomicUsize,      // The next CPU for a thread to stay on.
+    next_range: AtomicUsize,    // In bytes of the corpus.
     hits: Mutex<Vec<Vec<u64>>>, // Each thread's `Scan::hits`, once it has scanned...
     scanned: AtomicUsize,       // ...and how many have.
     next_total: AtomicUsize,    // The next tally to add up.
@@ -1353,6 +1355,11 @@ fn wait_for_all(here: &AtomicUsize, threads: usize) {
 /// all are done. Then the totals, before any printing. Then threads claim batches of queries, and the last
 /// to finish writes them to the file in order.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progress, threads: usize) {
+    // Each thread stays on a CPU of its own, so that two never share one until the kernel notices. A failure
+    // only leaves it to the kernel, and a test run with more threads than this just gets no such CPU.
+    let cpu = progress.next_cpu.fetch_add(1, Relaxed);
+    // SAFETY: the mask outlives the call, which only reads it.
+    unsafe { sched_setaffinity(0, 8, &(1u64 << (cpu % 64))) };
     // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();
     scan.hits.resize(plan.tallies.len(), 0);

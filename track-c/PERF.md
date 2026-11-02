@@ -226,6 +226,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 190 | c-ms sample 4 | the middle sample hit the slow mode, so two more | pending | — | — | — |
 | 191 | c-ms sample 5 | fifth sample | pending | — | — | — |
 | 192 | c-map sample 4 | c-ms median 46.70 over 7, no better than its parts | pending | — | — | — |
+| 193 | c-map sample 5 | fifth sample | pending | — | — | — |
 
 ## Decision log
 
@@ -613,6 +614,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D191.** exp: judged over 5 samples
 
 **D192.** c-map or c-kp2 is final, by more samples
+
+**D193.** c-map or c-kp2 is final, by more samples
 
 ## What didn't work
 

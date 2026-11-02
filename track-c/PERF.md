@@ -1,18 +1,18 @@
 # Track C: performance log
 
-**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run is `run-700275291d62`: **0.0195 s / 10.4 MB**, K **45.56** and **82.9** speed points. That's one of 3 runs of the final source, which gave T 0.0195 to 0.0198 s, M 10.4 to 10.4 MB and a median K of 45.42 (D94).
+**Result:** the reference takes **14.44 s / 367 MB** on the board. Our best run of the final source (`c-map`) is `run-540bab063106`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of 5 runs of the final source, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
 
 ## Where it loses
 
-- S is 399 code lines on the board's last run, against the reference's 108, which costs about 4 speed points. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: one pass took out 56 cold lines, and S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise below. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). The last pass took out 47 more with T inside the noise (D92 to D94).
-- T moved between 0.0200 and 0.0207 over today's board runs from `7d61093` on, except `e7232af`, `c036bab` and `a17ec2a`, which we rejected at 0.0212, 0.0211 and 0.0215. On one source, `7d61093` and its second sample `7ca3b51`, T was 0.0200 and 0.0204 and M 10.44 and 11.04 MB, so gains under about 3% in T need several samples.
-- On Sunday Nov 1, NickTrapp leads this track with K 47.50 at T 0.018, M 12.8 and S 303. Against us, their lines are worth about 4% of K and their time about 5%, and we get about 4% back on M. We don't know how they reach that T with that S: the board shows only the numbers.
+- S is 352 code lines on the board's last run, against the reference's 108. We weigh S at about 1% of K per 28 lines. Each block of it was measured against what it buys: the two-stage parser, the position lists built with PEXT and GFNI, parallel setup and raw threads pay in T and M. Line cuts have mostly been free: S fell from 483 to 446 since `7d61093` (the locked set, no pin, line trims) with T inside the noise, then to 399 (D92 to D94), and on Nov 1 and 2 by 19 cold lines (step 107), 28 (step 111) and 11 (step 118), each with K level. The exception is the record loop: two trims there saved 7 lines and looked like 3% of T (`e7232af`). Some lines paid for themselves: the 16-bit tags cost 9 (steps 107 and 108) and the release at the end cost 8 (steps 119 and 120). The scout's 15 didn't (step 124).
+- The final source's T ran 0.0193 to 0.0197 over its 5 runs. Before it, one source moved 2% in T and 6% in M on re-running (D79). Since Nov 1 16:00 UTC about 1 run in 10 has shown a slow mode, T about 0.0216 to 0.0245, across all sources including unchanged ones, and none showed in the 40 runs before it (for example `run-3644310568c7`, `run-8a5ca6600535` and `run-6cf63284be89`). It is probably box noise, but we haven't proven that, so a change under about 3% in T needs several runs and we judged by medians.
+- On Monday Nov 2, 08:00 IST, the board's top three on this track were another ello (K 49.97: T 0.019, M 7.9, S 371), SALAAR (K 48.54: T 0.017, M 9.3, S 451) and NickTrapp (K 48.09: T 0.018, M 12.8, S 303). Our final source has a median K of 47.01 at T 0.0194, M 10.06 and S 352, fourth. The board shows only their numbers, so we don't know how they do it.
 
 ## What the box taught us
 
-The box is an Intel i5-13500: Golden Cove P-cores, a 48 KB L1 that two threads share, 1.25 MB of L2 and 24 MB of L3. Our local PC is a Zen 4 7600X, so local cycles only rank instruction cuts; anything that turns on caches, locks or system calls needed a board run. Each finding names the commit and the run in the board's log. C over D is C's T divided by D's T from the same run.
+The box is an Intel i5-13500: Golden Cove P-cores, a 48 KB L1 that two threads share, 1.25 MB of L2 and 24 MB of L3. Our local PC is a Zen 4 7600X, so local cycles only rank instruction cuts; anything that turns on caches, locks or system calls needed a board run. Each finding names the commit and the run in the board's log. C over D is C's T divided by D's T from the same run. From Nov 1 afternoon the findings name sources as in the journey table (`c-ph1` and so on), with step numbers.
 
 - **A second cache-line fill per record costs about 22%, and the lock isn't the limit.** `4d52c96` wrote marks in batches under one lock, with keys and bits in separate tables (`run-fc66302c3d21`): T 0.0244, against 0.0199 before it (`15d35df`, `run-b2919f2e99ea`) and 0.0200 once it was reverted (`7d61093`, `run-ef9c22ce540f`). It had fewer locked operations, each record touched a second line, and it lost.
 - **A separate tag-prefetch loop bought nothing.** `7d61093` merged it into the loop after it: T 0.0200 against 0.0199, S 483 against 495 (`run-ef9c22ce540f`, `run-b2919f2e99ea`). The tag lines are L2 hits there, which the core's reorder window evidently covers.
@@ -22,6 +22,15 @@ The box is an Intel i5-13500: Golden Cove P-cores, a 48 KB L1 that two threads s
 - **One source moves about 2% in T and up to 6% in M.** `bfba195` (the locked set for names with no slot, no pin, line trims) gave T 0.0204, M 10.46, S 446 and K 43.88, the best K of any scored run of this track (`run-13115bed748f`). `7ca3b51` ran `7d61093`'s source again and gave T 0.0204, M 11.04 and K 42.89 (`run-6cee893dbf6c`), against T 0.0200, M 10.44 and K 43.74 the first time.
 - **The region prefetch pays, though the tag prefetch didn't.** `a17ec2a` dropped it (`run-34c6a4bf2815`): T 0.0215 and C over D 0.148, for one line less. The join table is nine times the size of the tags, which may be why, but we didn't measure that. Rejected.
 - **More segments don't pay.** `c036bab` used 48 segments per thread instead of 24 (`run-4b4240212d91`): T 0.0211 and C over D 0.1435. First to last finish is only about 600 us, so halving it could gain little, and each segment costs two small reads and a short piece. One sample, so it may be noise, but nothing says it helps. Rejected.
+- **Exit costs about 3.6 ms on the box, and sharing the release between the threads gets it back.** `c-ph2` released no pages at all: T 0.0228 and K 42.74 over 2 runs (`run-dd2fa2833129`, `run-d82eb3c3bb54`), against T 0.0192 and K 46.91 over 4 for `c-ph1`, which releases after parsing (`run-b3b4cd411429`; steps 119 and 120). Track A had found the same cost in a mapped log (step 95).
+- **A release per segment is what made fewer segments win, and releasing at the end made fine ones free.** While every segment released its own pages, median K by segments per thread was 45.40 at 24, 45.56 at 12, 45.83 at 6, 45.94 at 3 and 45.17 at 1, with one run of that last at T 0.0274 (steps 96 and 99 to 102). `c-ph1` released after parsing and went to 12 per thread, because the end idle was 8.6% of local T. It changed three things at once, so its K 46.91 (against 46.55 for `c64f`) isn't all the segments. 24 per thread on top of it lost: K 46.51 over 3 against 46.85 over 8 (`c-kp3` and `c-kp2`, step 123).
+- **A plain spin in the region wait was the loss.** `c-k1`, which has it, was level with its base (K 46.61 over 4, step 118). Added to `c-ph1`, K fell to 45.94 over 3 and T rose from 0.0192 to 0.0196 (`c-kp`, step 121); putting `yield_now` back gave K 46.85 over 8 at T 0.0194 (`c-kp2`, step 122).
+- **Wrong guesses and spilled names set T in the table.** With 8-bit tags about 4% of records went to the slow path on a collision. `c-t16` has 16-bit tags and gave median K 46.22 over 4 at T 0.0189 (step 108), against 44.85 for the same cuts on 8-bit tags, whose T swung from 0.0188 to 0.0216 (`c-cut`, step 107). Counted locally on `c-t16`, `find` ran 210,000 times, 33,000 of them for the empty name, which `c-c3` removed by hashing the length plus one (step 111). Spilled names hopping by their tag cut the windows walked from 780,000 to 251,000 locally (step 119).
+- **Homes trade T for M, and 16-bit tags moved the best point down.** On 8-bit tags at 3 segments, median K was 44.84 at 105,000 homes, 46.13 at 115,000, 43.37 at 125,000 (M 11.5) and 45.72 at 140,000 (T 0.0184, M 12.1). On 16-bit tags it was 45.81 at 105,000, 45.95 at 110,000 and 46.22 at 115,000 (steps 103 to 106 and 108 to 110). The final source takes the 104,724 homes that fill four huge pages, with M 10.16 and K level with 115,000 (`c64f`, step 115).
+- **Packing slots below a line saves real memory, and T costs more than it pays.** 48-byte slots packed across lines gave M 9.38 with T 0.0211 (`c-pack2`) and M 8.77 with T 0.0216 (`c-p4`), against M 10.16 and T 0.0196 for `c64f` (steps 114, 115 and 117). Freeing the table before the output changed nothing on the box (`c-f40`, step 116).
+- **Mapping on a 2 MiB boundary cut local page faults from 3,094 to 651, and T on the box didn't move.** `c-map` T 0.0194 over 5 runs, `c-kp2` T 0.0194 over 8. K's gain, 47.01 against 46.85, is inside the spread of `c-kp2` (46.53 to 47.04), so the box doesn't seem to gain huge-folio mappings (step 126).
+- **A cold guess for spilled names was level once lines were counted.** `c-scout` cut local `find` calls from 282,000 to 125,000 and gave T 0.0190 and K 47.02 over 3, but it costs 15 lines, and with the aligned mapping (`c-ms`) K was 46.70 over 7 (steps 124 and 125).
+- **About 1 run in 10 shows a slow mode.** T 0.0216 to 0.0245 on any source, including unchanged ones, since Nov 1 16:00 UTC, and none in the 40 runs before. Examples: `run-3644310568c7` (T 0.0243), `run-8a5ca6600535` (T 0.0234, `c-c4`), `run-6cf63284be89` (T 0.0245, `c-ms`). We judged on medians over 3 or more runs; the cause is unproven.
 
 ## Where the reference spends its time
 
@@ -29,7 +38,7 @@ About 28% is the number regular expressions, 27% the aggregation and 19% reading
 
 ## The journey
 
-Every step cites the live-board run that measured it. Numbers marked *local* come from our scorer on a Zen 4 7600X, not on the box's Golden Cove, and only explain decisions.
+Every step cites the live-board run that measured it. Numbers marked *local* come from our scorer on a Zen 4 7600X, not on the box's Golden Cove, and only explain decisions. From step 95 on, a row is one source (named as in our notes, like `c-m7`), with the medians over the board runs it had: T and M are medians, the Run ID is the run with the median K (the lower of the middle two when the count is even), and Points is that run's.
 
 | Step | Change | Why we expected it to help | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|---|
@@ -125,108 +134,41 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 89 | T0 for the slot prefetch, third sample | samples so far K 41.66 on a slow box and K 43.96 | run-2bf3009dbcc3 | 0.0207 | 10.2 | 82.0 |
 | 90 | Tag windows on multiples of 32, third sample | samples so far K 43.18 and K 43.28, the second on docs commit 1e21980 | run-ee0a2bfc62e2 | 0.0230 | 10.2 | 80.9 |
 | 91 | Chosen source restored | neither idea beat it over three samples | run-a80a4965a4fa | 0.0203 | 10.4 | 82.1 |
-| 92 | Twenty line cuts on cold paths: the input files as plain functions, main does its own work, one job claim call, one miss chain, one BOM line | S 446 to 426 is worth about 0.7 percent of K, and instructions fall 302.5 to 300.7 per record, so nothing hot pays for it | pending | — | — | — |
-| 93 | All memory is one zeroed 2 MiB aligned static in the image: no mmap, no NameTable struct, table functions are free functions, and the run ends in _exit | S 426 to 407 is worth about 0.7 percent of K. Local: instructions 300.7 to 289.7 per record in the counting build, paired T -2.5 percent, M flat at 9.70 | pending | — | — | — |
-| 94 | Helper merges: one function gives a name's home and tag, one closure for arguments and one for claiming a job, a full block uses up its own mask | S 407 to 399 is worth about 0.3 percent of K. Instructions per record unchanged at 289.7 in the counting build | pending | — | — | — |
-| 95 | exp: records file mapped, pages released per segment, page tables touched first, one prefetch per block | Mapped lost in D19 to D24 when exit tore pages down serially on the clock; A found that worth 2.7 ms. No copy, smaller stacks | pending | — | — | — |
-| 96 | exp: mapped file, part and boundary merged, thread start without generics | Same design as d4f32c1, whose T and M tied the read design; these cold cuts cost nothing at run time | pending | — | — | — |
-| 97 | exp: positions by a fixed count of eight TZCNT steps instead of PEXT and GFNI | 14 lines. Local says T up 9 percent but local has misranked this track repeatedly and this was never run on the box | pending | — | — | — |
-| 98 | exp: back to PEXT and GFNI positions on the mapped file | TZCNT gave T 0.0208 and C over D 0.143 against 0.134, for 14 lines, so the box agrees with local here | pending | — | — | — |
-| 99 | exp: mapped file without the prefetch per block | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway. Two lines | pending | — | — | — |
-| 100 | exp: text prefetch back on the mapped file | Without it four samples gave median T 0.0201 and K 45.04 | pending | — | — | — |
-| 101 | exp: 12 segments per thread on the mapped file | Each segment now costs one release with a TLB shootdown to every thread, not two reads, so fewer may pay | pending | — | — | — |
-| 102 | exp: 6 segments per thread on the mapped file | 12 gave K 45.58 on one sample; this shows the trend of fewer releases against worse balance | pending | — | — | — |
-| 103 | exp: 12 segments per thread, sample 2 | One sample cannot decide; C moves 5 percent on one source | pending | — | — | — |
-| 104 | exp: 6 segments per thread, sample 2 | One sample cannot decide; C moves 5 percent on one source | pending | — | — | — |
-| 105 | exp: 12 segments per thread, sample 3 | One sample cannot decide; C moves 5 percent on one source | pending | — | — | — |
-| 106 | exp: 6 segments per thread, sample 3 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 107 | exp: 3 segments per thread, sample 1 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 108 | exp: 6 segments per thread, sample 4 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 109 | exp: 3 segments per thread, sample 2 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 110 | exp: 6 segments per thread, sample 5 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 111 | exp: 3 segments per thread, sample 3 | 6 has K 45.46 and 46.24 against 12 at median 45.56; fewer segments mean fewer TLB shootdowns | pending | — | — | — |
-| 112 | exp: 1seg, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 113 | exp: h105k, sample 1 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 114 | exp: 1seg, sample 2 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 115 | exp: h105k, sample 2 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 116 | exp: 1seg, sample 3 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 117 | exp: h105k, sample 3 | 3 segments per thread median K 45.90; 1 segment could also drop the claim. 105000 homes is 0.32 MB less | pending | — | — | — |
-| 118 | exp: 3seg, sample 7 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 119 | exp: h115k, sample 1 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 120 | exp: 3seg, sample 8 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 121 | exp: h115k, sample 2 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 122 | exp: 3seg, sample 9 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 123 | exp: h115k, sample 3 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 124 | exp: 3seg, sample 10 | 1 segment had an outlier T 0.0274 and 105000 homes median K 44.84, both rejected. 105000 cost 5 percent T, so test the other direction | pending | — | — | — |
-| 125 | exp: h125k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 126 | exp: h140k, sample 1 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 127 | exp: h125k, sample 2 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 128 | exp: h140k, sample 2 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 129 | exp: h125k, sample 3 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 130 | exp: h140k, sample 3 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 131 | exp: h115k, sample 4 | 115000 homes gave median K 46.13 over 5, T 0.0190, against 45.94; test further | pending | — | — | — |
-| 132 | exp: cuts, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 133 | exp: tags16, sample 1 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 134 | exp: cuts, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 135 | exp: tags16, sample 2 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 136 | exp: cuts, sample 3 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 137 | exp: tags16, sample 3 | Cuts: 19 cold lines, hot code the same. Tags16: wrong guesses from 8 bit tag collisions send about 4 percent of records to the slow path, 140000 homes showed T falls with them | pending | — | — | — |
-| 138 | exp: tags16-h105k, sample 1 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
-| 139 | exp: tags16-h110k, sample 1 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
-| 140 | exp: tags16-h105k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
-| 141 | exp: tags16-h110k, sample 2 | 16 bit tags median K 46.25 with T 0.0189 and M 10.95. They remove wrong guesses, so a fuller table may cost less T than before, and memory is worth K | pending | — | — | — |
-| 142 | exp: 16 bit tags at 115000 homes, the best measured source, for handover | Median K 46.25 against 45.95 at 110000 and 45.81 at 105000 | pending | — | — | — |
-| 143 | c-c3: 28 lines cut, empty-name hash fix | S 383 to about 355 | pending | — | — | — |
-| 144 | c-c4 parts shrink geometrically, 8 per thread, sample 1 | less idle at the end | pending | — | — | — |
-| 145 | c-c3 sample 2 | second sample | pending | — | — | — |
-| 146 | c-c4 sample 2 | second sample | pending | — | — | — |
-| 147 | c-c3 sample 3 | third sample | pending | — | — | — |
-| 148 | c-c4 sample 3 | third sample | pending | — | — | — |
-| 149 | c-p1 populate each segment before parsing, sample 1 | faults per 16 pages cost kernel time, and text prefetch stops at unmapped pages | pending | — | — | — |
-| 150 | c-c3 restored | populate sample T 0.0196 K 45.92, no gain in one run, not proven worse | pending | — | — | — |
-| 151 | c-pack2 48-byte short slots packed across lines, 64-byte long ones, sample 1 | memory: local peak 10.22 to 8.65 MB | pending | — | — | — |
-| 152 | c64f 64-byte slots at 104500 homes, sample 1 | memory: local peak 10.26 to 9.47 MB, S -3 | pending | — | — | — |
-| 153 | c-pack2 sample 2 | second sample | pending | — | — | — |
-| 154 | c64f sample 2 | second sample | pending | — | — | — |
-| 155 | c64f sample 3 | third sample | pending | — | — | — |
-| 156 | c-f40 table freed before output, sample 1 | local peak steady at 9.44 MB, worst of 5 sets M | pending | — | — | — |
-| 157 | c-f40 sample 2 | second sample | pending | — | — | — |
-| 158 | c-f40 sample 3 | third sample | pending | — | — | — |
-| 159 | c-p4 packed slots at three huge pages plus small ones, sample 1 | memory: local peak 8.12 MB | pending | — | — | — |
-| 160 | c64f restored | c64f median K 46.64 over 4, c-f40 46.66 over 3 for one more line, so level | pending | — | — | — |
-| 161 | c-k1 find walks hits and free slots in one loop, plain spin, 11 lines cut, sample 1 | S 352 to 341 with hot code unchanged | pending | — | — | — |
-| 162 | c-k1 sample 3 | third sample | pending | — | — | — |
-| 163 | c-ph1 12 segments per thread, pages released after parsing, spills hop by tag, sample 1 | end idle was 8.6 percent of T and windows walked fall from 780k to 251k; local -5.6 percent | pending | — | — | — |
-| 164 | c-ph1 sample 2 | second sample | pending | — | — | — |
-| 165 | c-ph1 sample 3 | third sample | pending | — | — | — |
-| 166 | c-ph2 same with no release at all, sample 1 | exit cost on the box is unknown, S 8 lower | pending | — | — | — |
-| 167 | c-ph2 sample 2 | second sample | pending | — | — | — |
-| 168 | c-kp line cuts with end release and tag hops, sample 1 | c-k1 S 341 and c-ph1 T 0.0192 combined; c-ph2 with no release lost, T 0.0228 | pending | — | — | — |
-| 169 | c-kp sample 2 | second sample | pending | — | — | — |
-| 170 | c-kp sample 3 | third sample | pending | — | — | — |
-| 171 | c-kp2 yield restored in the wait, sample 1 | c-kp T 0.0196 against c-ph1 0.0192, and the plain spin moved hot registers | pending | — | — | — |
-| 172 | c-kp2 sample 2 | second sample | pending | — | — | — |
-| 173 | c-kp2 sample 3 | third sample | pending | — | — | — |
-| 174 | c-kp3 24 segments per thread, sample 1 | a shorter end idle, now that a segment costs no release | pending | — | — | — |
-| 175 | c-kp2 sample 4 | alternate, so box hours even out | pending | — | — | — |
-| 176 | c-kp3 sample 2 | second sample | pending | — | — | — |
-| 177 | c-kp2 sample 5 | alternate | pending | — | — | — |
-| 178 | c-kp3 sample 3 | third sample | pending | — | — | — |
-| 179 | c-kp2 restored, sample 6 | chosen source at HEAD | pending | — | — | — |
-| 180 | c-map files mapped on a 2 MiB boundary, sample 1 | local faults 3094 to 651 and T -8 percent, if the box caches huge folios | pending | — | — | — |
-| 181 | c-map sample 2 | second sample | pending | — | — | — |
-| 182 | c-map sample 3 | third sample | pending | — | — | — |
-| 183 | c-scout cold scout guesses spilled and new names, sample 1 | local find calls 282k to 125k, T -2.3 percent | pending | — | — | — |
-| 184 | c-scout sample 2 | second sample | pending | — | — | — |
-| 185 | c-scout sample 3 | third sample | pending | — | — | — |
-| 186 | c-kp2 restored | chosen source at HEAD until these are judged | pending | — | — | — |
-| 187 | c-ms scout and aligned mapping together, sample 1 | c-scout T 0.0190, c-map M about 10.0 | pending | — | — | — |
-| 188 | c-ms sample 2 | second sample | pending | — | — | — |
-| 189 | c-ms sample 3 | third sample | pending | — | — | — |
-| 190 | c-ms sample 4 | the middle sample hit the slow mode, so two more | pending | — | — | — |
-| 191 | c-ms sample 5 | fifth sample | pending | — | — | — |
-| 192 | c-map sample 4 | c-ms median 46.70 over 7, no better than its parts | pending | — | — | — |
-| 193 | c-map sample 5 | fifth sample | pending | — | — | — |
+| 92 | Twenty line cuts on cold paths: the input files as plain functions, main does its own work, one job claim call, one miss chain, one BOM line | S 446 to 426 is worth about 0.7 percent of K, and instructions fall 302.5 to 300.7 per record, so nothing hot pays for it | run-641687c2ace7 | 0.0204 | 10.4 | 82.3 |
+| 93 | All memory is one zeroed 2 MiB aligned static in the image: no mmap, no NameTable struct, table functions are free functions, and the run ends in _exit | S 426 to 407 is worth about 0.7 percent of K. Local: instructions 300.7 to 289.7 per record in the counting build, paired T -2.5 percent, M flat at 9.70 | run-0766e5fe11fd | 0.0203 | 10.2 | 82.5 |
+| 94 | Helper merges: one function gives a name's home and tag, one closure for arguments and one for claiming a job, a full block uses up its own mask | S 407 to 399 is worth about 0.3 percent of K. Instructions per record unchanged at 289.7 in the counting build | run-ec2daf493b37 | 0.0197 | 10.4 | 82.9 |
+| 95 | exp: records file mapped, pages released per segment, page tables touched first, one prefetch per block; 24 segments per thread (`c-m1`) | Mapping lost at steps 40 and 41 when the exit released the pages on one thread, on the clock, and Track A found that worth 2.7 ms. This releases them in the threads, with no copy and smaller stacks. 1 run, K 45.49, S 397: T and M tied the read design, whose median K was 45.30 over 8 runs | run-45921628f70f | 0.0198 | 10.27 | 82.89 |
+| 96 | exp: the same with cold cuts: part and boundary merged, thread start without generics (`c-m2`) | S 397 to 393 with nothing hot changed. 3 runs, K 45.44, 44.52 (the run after step 97) and 45.40, median 45.40 | run-16920d6e77c9 | 0.0198 | 10.45 | 82.85 |
+| 97 | exp: positions by eight TZCNT steps instead of PEXT and GFNI (`c-m3`) | 14 lines fewer, S 379. Local said T +9%, but local has misranked this track before and this had never run on the box. 1 run: K 44.54, T 0.0208 and C over D 0.143 against 0.134, so the box agrees with local. Rejected, and step 96's source ran again | run-e5f28779adb4 | 0.0208 | 10.39 | 82.43 |
+| 98 | exp: mapped file without the prefetch per block (`c-m4`) | Does a software prefetch of the mapped text pay on the box, or does the core stream it anyway? Two lines, S 391. 4 runs, K 44.95, 44.47, 45.24 and 45.13, median 45.04 against 45.40 with it, T 0.0199 to 0.0207. Two lines don't pay, so the prefetch stays | run-a471d02a4e80 | 0.0202 | 10.42 | 82.63 |
+| 99 | exp: 12 segments per thread on the mapped file (`c-m5`) | Each segment now costs one release with a TLB shootdown to every thread, not two reads, so fewer than 24 may pay. 4 runs, median K 45.56 against 45.40 | run-199076fd5f9b | 0.0196 | 10.43 | 82.92 |
+| 100 | exp: 6 segments per thread (`c-m6`) | 12 gave 45.56 on a few runs; this shows the trend of fewer releases against worse balance. 8 runs, K 45.30 to 46.27, median 45.83 | run-a5fddb609f83 | 0.0194 | 10.45 | 83.00 |
+| 101 | 3 segments per thread (`c-m7`) | The trend went on. 13 runs, K 43.69 to 46.24, median 45.94: the best of the five counts (24: 45.40, 12: 45.56, 6: 45.83, 3: 45.94, 1: 45.17). Kept | run-8c6eb8e879c2 | 0.0193 | 10.39 | 83.11 |
+| 102 | exp: 1 segment per thread (`c-m8`) | One segment each could also drop the claim from the counter. 3 runs, K 45.17, with one at T 0.0274 and K 38.48 (`run-c4e63f75fb05`) and the other two at 45.17 and 45.96. Rejected | run-5e26626baf3b | 0.0199 | 10.51 | 82.74 |
+| 103 | exp: 105,000 homes at 3 segments (`c-m9`) | 0.32 MB less table than 110,000 homes. 3 runs, K 41.34, 45.04 and 44.84, median 44.84, T 0.0205 against 0.0193: it cost about 6% of T. Rejected, and the other direction next | run-c53f1dcb4f21 | 0.0205 | 10.00 | 82.58 |
+| 104 | 115,000 homes (`c-m10`) | Fewer names outside their window, so fewer slow-path lookups, for 0.32 MB more. Median K 46.13 over 6 runs, T 0.0190 against 0.0193 at 110,000. Kept | run-0d65a593ebff | 0.0190 | 10.55 | 83.20 |
+| 105 | exp: 125,000 homes (`c-m11`) | 115,000 gave T 0.0190, so test further. 3 runs, median K 43.37, M 11.50 and T 0.0208 (0.0184 to 0.0217). Rejected | run-e4e41c7f7aed | 0.0208 | 11.50 | 81.86 |
+| 106 | exp: 140,000 homes (`c-m12`) | Same. 5 runs, median K 45.72: the lowest T of any source so far, 0.0184, but M 12.11, 1.6 MB above 115,000 homes, which costs more than the T gains. Rejected | run-5dc3add43cd2 | 0.0184 | 12.11 | 83.00 |
+| 107 | exp: 19 cold lines cut, on 8-bit tags (`c-cut`) | S 393 to 374 with the hot code the same. 8-bit tag collisions send about 4% of records to the slow path. 4 runs, median K 44.85 with T from 0.0188 to 0.0216; its best run, K 46.70 (`run-17dff768e1ab`), is the best of any source up to then. Not kept as it was: step 108 has the same cuts and ran steady, so that spread was probably the box, which we haven't proven | run-446ebca563ed | 0.0204 | 10.65 | 82.40 |
+| 108 | 16-bit tags at 115,000 homes (`c-t16`), with the cuts of step 107 | Wrong guesses from 8-bit tag collisions sent about 4% of records to the slow path. Counted locally over 3.32 million records, `find` ran about 210,000 times: 100,500 first sightings, 68,000 repeats of names that spilled past their window, 33,000 empty names and 8,000 other wrong guesses. S 383, 4 runs, median K 46.22, T 0.0189, M 10.94. Kept | run-d89a8aff6866 | 0.0189 | 10.94 | 83.22 |
+| 109 | exp: 110,000 homes with 16-bit tags (`c-t110`) | With no wrong guesses a fuller table may cost less T than before, and memory is worth K. 4 runs, median K 45.95, T 0.0194, M 10.31. Rejected | run-5d9c96b63565 | 0.0194 | 10.31 | 83.09 |
+| 110 | exp: 105,000 homes with 16-bit tags (`c-t105`) | Same, further. 2 runs, median K 45.81, T 0.0198, M 10.08. Rejected: step 108 was the best measured source, kept for handover | run-a7827a9d0964 | 0.0198 | 10.08 | 83.00 |
+| 111 | 28 lines cut, and the hash is of `len + 1` (`c-c3`) | The empty name hashed to zero, and a zero tag means a free slot, so each of the 33,000 empty names went to `find`. S 383 to 355. 7 runs, median K 46.41, T 0.0191, M 10.82; one slow run at K 42.26 (`run-21036e5c12b7`). Kept | run-22fda38c2069 | 0.0191 | 10.82 | 83.32 |
+| 112 | exp: parts shrink geometrically, 8 per thread (`c-c4`) | Less idle at the end: locally, first to last finish went from 2.3 to 0.7 ms. 3 runs, K 46.03, 41.95 (T 0.0234) and 46.54, median 46.03 against 46.41. Rejected | run-1dbdc369eebf | 0.0194 | 10.97 | 83.15 |
+| 113 | exp: `MADV_POPULATE_READ` on each segment before parsing (`c-p1`) | Faults every 16 pages cost kernel time, and the text prefetch stops at unmapped pages. 1 run: K 45.92, T 0.0196 against 0.0191. No gain in one run, not proven worse. Not kept | run-9860184a210a | 0.0196 | 10.85 | 83.10 |
+| 114 | exp: 48-byte short slots packed across lines, 64-byte long ones (`c-pack2`) | Local peak memory 10.22 to 8.65 MB. 2 runs, K 45.02 and 45.23, median 45.13, S 378: M 9.38 is real memory, but T 0.0211 against 0.0191 costs more than it pays. Rejected | run-97a7fd55f700 | 0.0211 | 9.38 | 82.66 |
+| 115 | 64-byte slots at 104,500 homes, with the populate call covering whole huge pages only (`c64f`) | Local peak 10.26 to 9.47 MB, S 355 to 352. 6 runs, median K 46.55 against 46.41, inside the noise, with M 10.16 against 10.82, and T 0.0196 against 0.0191. Kept | run-ad884f7eced4 | 0.0196 | 10.16 | 83.33 |
+| 116 | exp: the table freed before the output is written (`c-f40`) | Local peak steady at 9.44 MB. 3 runs, K 46.32, 46.66 and 46.84, M 10.15 on the box, no change: median K 46.66 against 46.55 for one more line. Level, so not kept | run-85c300f8aed2 | 0.0195 | 10.15 | 83.44 |
+| 117 | exp: slots packed in three huge pages and some small ones (`c-p4`) | Local peak 8.12 MB. 1 run: K 45.28, M 8.77, S 378, but T 0.0216. Real memory again, and T again costs more than it pays. Rejected | run-b8a2382fa642 | 0.0216 | 8.77 | 82.79 |
+| 118 | `find` walks the hits and the free slots in one loop, and the region wait spins plainly; 11 lines cut (`c-k1`) | S 352 to 341 with the hot code unchanged. 4 runs, median K 46.61 against 46.55, T 0.0198 against 0.0196. Level, so the lines were free; the plain spin went later (step 121) | run-0342419bbecf | 0.0198 | 10.18 | 83.36 |
+| 119 | 12 segments per thread, pages released by the threads together after parsing, spilled names hop by their tag (`c-ph1`) | The end idle was 8.6% of local T, and with the release at the end a segment costs no shootdown, so fine parts are free. Locally the hop by tag cut the windows walked from 780,000 to 251,000, and the whole change cut T by 5.6%. S 360. 4 runs, median K 46.91, T 0.0192 | run-b3b4cd411429 | 0.0192 | 10.16 | 83.55 |
+| 120 | exp: the same with no release at all (`c-ph2`) | Eight lines fewer, S 352; the cost of the exit was unknown on the box. 2 runs, K 43.13 and 42.34, median 42.74, T 0.0228 against 0.0192: the exit costs about 3.6 ms there. Rejected | run-d82eb3c3bb54 | 0.0228 | 10.77 | 81.33 |
+| 121 | exp: the cuts of step 118 with step 119's release and hops (`c-kp`) | S 341 and T 0.0192 combined; step 120 had just lost without the release. 3 runs, K 45.01, 45.94 and 46.53, median 45.94, T 0.0196: the plain spin was the loss | run-54eac98b158d | 0.0196 | 10.33 | 83.11 |
+| 122 | `thread::yield_now` back in the region wait (`c-kp2`) | Step 121's T was 0.0196 against 0.0192, and the plain spin moved hot registers. 8 runs, K 46.53 to 47.04, median 46.85, T 0.0194, M 10.16, S 350. Kept | run-ccbadad62da6 | 0.0194 | 10.16 | 83.53 |
+| 123 | exp: 24 segments per thread (`c-kp3`) | A shorter end idle, now that a segment costs no release. 3 runs, K 46.51, 45.55 and 46.63, median 46.51 against 46.85. Rejected | run-3d09fc8c2f0d | 0.0195 | 10.47 | 83.37 |
+| 124 | exp: a cold scout guesses the slot of spilled and new names (`c-scout`) | Locally `find` calls fell from 282,000 to 125,000 and T by 2.3%. S 365, 15 lines more. 3 runs, K 47.02, 46.61 and 47.02, median 47.02, T 0.0190, M 10.25. Level with step 122 once S is counted, so not kept | run-f26c101de34a | 0.0190 | 10.25 | 83.61 |
+| 125 | exp: the scout and the aligned mapping together (`c-ms`) | Step 124's T 0.0190 and step 126's M about 10.0. S 367. 7 runs, K 41.54 (T 0.0245) to 47.28, median 46.70: not better than either part. Rejected | run-a9eeadb78623 | 0.0192 | 10.09 | 83.46 |
+| 126 | Files mapped on a 2 MiB boundary (`c-map`), the final source | Locally page faults fell from 3,094 to 651 and T by 8%, if the box also maps cached huge folios of the file whole. 5 runs, K 46.46 to 47.12, median 47.01, T 0.0194, M 10.06, S 352. T didn't move against step 122, and K's gain is inside its noise, so the box doesn't seem to gain from it. Kept as the best median measured | run-e27dcd226db9 | 0.0194 | 10.06 | 83.61 |
 
 ## Decision log
 
@@ -419,203 +361,69 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 
 **D94.** Helpers merged: one function gives a name's home and tag, closures for the arguments and for claiming a job. Instructions per record unchanged. Board: K 45.42, 45.29, 45.56 at S 399, median 45.42 against 44.00. Outcome: kept.
 
-**D95.** Keep only if median K over 3 runs beats the current source
+**D95.** exp: Map the records file again, with the pages released by the threads per segment, the page tables touched first and one text prefetch per block. Context: mapping lost at D40 and D41 because the exit released every page on one thread, on the clock; Track A found that worth 2.7 ms, and a release in the threads moves it off the clock. Evidence: `run-45921628f70f`, one run: T 0.0198, M 10.27, S 397, K 45.49, against a median K of 45.30 over 8 runs of the read design. Outcome: T and M tie the read design, so the mapped one is the base for D96 on, to be judged by medians.
 
-**D96.** Keep only if median K over 3 runs beats the current source
+**D96.** Cold cuts on the mapped file: part and boundary merged, thread start without generics. S 397 to 393 with the hot code the same. Three runs gave median K 45.40 (`run-16920d6e77c9` is the median run). Outcome: kept as the base.
 
-**D97.** Keep only if median K over 3 runs beats the current source
+**D97.** Rejected: positions by eight TZCNT steps, 14 lines fewer (S 379). Local said T +9%, but local has misranked this track, so it ran on the box: `run-e5f28779adb4`, T 0.0208, K 44.54, C over D 0.143 against 0.134. The box agrees with local. The PEXT and GFNI build ran again as part of D96's three.
 
-**D98.** TZCNT rejected. Mapped file sampled again
+**D98.** Rejected: no text prefetch per block, two lines (S 391). Four runs gave median K 45.04 against 45.40 with it, and T 0.0199 to 0.0207. Two lines don't pay for that, so the prefetch stays.
 
-**D99.** Compare C over D and T with the mapped samples
+**D99.** exp: 12 segments per thread on the mapped file, down from 24. A segment now costs one release with a TLB shootdown to every thread, so fewer should pay. Four runs, median K 45.56 against 45.40.
 
-**D100.** No-prefetch rejected, two lines do not pay
+**D100.** exp: 6 segments per thread. Eight runs, K 45.30 to 46.27, median 45.83. The trend of fewer releases was still winning.
 
-**D101.** Follow up only if clearly above the mapped samples
+**D101.** 3 segments per thread. Thirteen runs, median K 45.94, the best of the counts tried (24, 12, 6, 3 and 1 gave 45.40, 45.56, 45.83, 45.94 and 45.17). Outcome: kept, until D119 moves the release to the end. Judged on medians, since one source moved 5% in K from run to run.
 
-**D102.** Compare with 12 and 24
+**D102.** Rejected: 1 segment per thread. Three runs, median K 45.17, and one of them at T 0.0274 (`run-c4e63f75fb05`, K 38.48). The most it could save was the claim from the counter.
 
-**D103.** Median of three decides
+**D103.** Rejected: 105,000 homes. 0.32 MB less table, but median K 44.84 over 3 runs and T 0.0205 against 0.0193: about 6% of T for 0.4 MB of M. The other direction next.
 
-**D104.** Median of three decides
+**D104.** 115,000 homes at 3 segments. Median K 46.13 over 6 runs, T 0.0190, M 10.55. Outcome: kept. It adds 0.32 MB of table over 110,000 homes, and T fell by 0.0003 s.
 
-**D105.** Median of three decides
+**D105.** Rejected: 125,000 homes. Median K 43.37 over 3 runs, M 11.50, T 0.0208 on the median run (0.0184 to 0.0217).
 
-**D106.** Median of three decides
+**D106.** Rejected: 140,000 homes. Median K 45.72 over 5 runs, T 0.0184 but M 12.11. T falls as homes rise, because fewer names spill, and M rises with them; the best K was between.
 
-**D107.** Median of three decides
+**D107.** exp: 19 cold lines cut (S 374), still on 8-bit tags. Median K 44.85 over 4 runs with T from 0.0188 to 0.0216, though its best run, K 46.70 (`run-17dff768e1ab`), was the best of any source up to then. 8-bit tag collisions sent about 4% of records to the slow path, which D108 attacks. Outcome: not kept as it was. D108 holds the same cuts and its T was steady, so that spread was probably the box, not the cuts, but we haven't proven it.
 
-**D108.** Median of three decides
+**D108.** 16-bit tags at 115,000 homes. S 383. Four runs, median K 46.22, T 0.0189, M 10.94, against 44.85 for D107 and 46.13 for D104. Counted locally over 3.32 million records, `find` ran about 210,000 times: 100,500 first sightings, 68,000 repeats of names that spilled past their window, 33,000 empty names and 8,000 other wrong guesses. Outcome: kept, and the best measured source for handover. The 68,000 and the 33,000 are what D111 and D119 attack.
 
-**D109.** Median of three decides
+**D109.** Rejected: 110,000 homes with 16-bit tags. Median K 45.95 over 4 runs, T 0.0194, M 10.31. With wrong guesses gone a fuller table might have cost less T than before, and memory is worth K, but T rose more than M fell.
 
-**D110.** Median of three decides
+**D110.** Rejected: 105,000 homes with 16-bit tags. Median K 45.81 over 2 runs, T 0.0198, M 10.08. D108 stands.
 
-**D111.** Median of three decides
+**D111.** 28 lines cut, and the name's hash is of its length plus one. The empty name hashed to zero and a zero tag means a free slot, so every empty name (33,000 records) went to `find`. S 383 to 355. Seven runs, median K 46.41, T 0.0191, M 10.82, against 46.22 for D108; one slow run at K 42.26. Outcome: kept.
 
-**D112.** Median of three decides against 45.90
+**D112.** Rejected: parts that shrink geometrically, 8 per thread. Locally the gap from first to last finish went from 2.3 to 0.7 ms, but on the board three runs gave median K 46.03 against 46.41, one of them at T 0.0234.
 
-**D113.** Median of three decides against 45.90
+**D113.** Rejected for now: `MADV_POPULATE_READ` on each segment before parsing. One run, K 45.92, T 0.0196 against 0.0191. It gained nothing in that run, and one run doesn't prove it worse; it wasn't sampled again.
 
-**D114.** Median of three decides against 45.90
+**D114.** Rejected: 48-byte short slots packed across lines, with 64-byte long ones. Local peak 10.22 to 8.65 MB, on the board M 9.38 (down from 10.82), but T 0.0211 against 0.0191. Two runs, median K 45.13. T cost more than the memory paid, as at D59 and D65. A slot packed across two lines may need two fills, which cost 22% of T at D71; we did not measure that here.
 
-**D115.** Median of three decides against 45.90
+**D115.** 64-byte slots at 104,500 homes, and the populate call covers whole huge pages only, even for the last part. Local peak 10.26 to 9.47 MB and S -3. Six runs, median K 46.55 against 46.41, M 10.16 against 10.82, T 0.0196 against 0.0191. Outcome: kept. The final source has 104,724 homes, the most that fit in those four pages with the rest.
 
-**D116.** Median of three decides against 45.90
+**D116.** Not kept: the table freed before the output is written. Locally the peak was steady at 9.44 MB, but on the box M stayed at 10.15. Median K 46.66 over 3 runs against 46.55 for D115, for one more line. Level.
 
-**D117.** Median of three decides against 45.90
+**D117.** Rejected: slots packed across three huge pages and some small ones, for local peak 8.12 MB. One run: M 8.77, but T 0.0216 and K 45.28. As D114.
 
-**D118.** Median of three decides against 45.90
+**D118.** `find` walks hits and free slots in one loop, and the region wait spins plainly: 11 lines cut, S 352 to 341, the hot code unchanged. Four runs, median K 46.61, T 0.0198. Outcome: level with D115, so kept for the lines; the plain spin goes in D122.
 
-**D119.** Median of three decides against 45.90
+**D119.** 12 segments per thread, pages released by all the threads after the last part is parsed, and spilled names hopping by their tag. The end idle was 8.6% of local T. A release per segment shoots down every thread's TLB, which is why D99 to D101 expected fewer segments to win; one release at the end is shared out in shares of whole 2 MiB. Locally the hop cut the windows walked from 780,000 to 251,000, and the change cut T by 5.6%. Four runs, median K 46.91, T 0.0192, S 360. Outcome: kept, with D120 as the control.
 
-**D120.** Median of three decides against 45.90
+**D120.** Rejected: no release at all (S 352). The cost of the exit on the box was unknown. Two runs, K 43.13 and 42.34, T 0.0228 against 0.0192: the exit costs about 3.6 ms there, so the release stays.
 
-**D121.** Median of three decides against 45.90
+**D121.** The cuts of D118 on top of D119. Three runs, median K 45.94, T 0.0196, against 46.91 and 0.0192 for D119 alone. D122 put the yield back and K returned, so the plain spin was the loss.
 
-**D122.** Median of three decides against 45.90
+**D122.** The region wait yields again. Eight runs, K 46.53 to 47.04, median 46.85, T 0.0194, M 10.16, S 350. Outcome: kept; it has D118's cuts and D119's release.
 
-**D123.** Median of three decides against 45.90
+**D123.** Rejected: 24 segments per thread, now that a segment costs no release. Three runs, median K 46.51 against 46.85.
 
-**D124.** Median of three decides against 45.90
+**D124.** Rejected: a cold scout guesses the slot of spilled and new names. Locally `find` calls fell from 282,000 to 125,000 and T by 2.3%; on the board three runs gave median K 47.02, T 0.0190, M 10.25, S 365. Level with D122 once its 15 more lines are counted.
 
-**D125.** Median of three decides against 46.13
+**D125.** Rejected: the scout together with the aligned mapping. Seven runs, median K 46.70 (41.54 at T 0.0245, up to 47.28), S 367. Not better than its parts.
 
-**D126.** Median of three decides against 46.13
-
-**D127.** Median of three decides against 46.13
-
-**D128.** Median of three decides against 46.13
-
-**D129.** Median of three decides against 46.13
-
-**D130.** Median of three decides against 46.13
-
-**D131.** Median of three decides against 46.13
-
-**D132.** Median of three decides
-
-**D133.** Median of three decides
-
-**D134.** Median of three decides
-
-**D135.** Median of three decides
-
-**D136.** Median of three decides
-
-**D137.** Median of three decides
-
-**D138.** Median of three decides against 46.25
-
-**D139.** Median of three decides against 46.25
-
-**D140.** Median of three decides against 46.25
-
-**D141.** Median of three decides against 46.25
-
-**D142.** Fuller tables rejected. S about 355 builds still to sample
-
-**D143.** exp: judged over 3 samples against c-t16 46.25
-
-**D144.** exp: judged over 3 samples each, c-c3 against c-c4
-
-**D145.** exp: judged over 3 samples each, c-c3 against c-c4
-
-**D146.** exp: judged over 3 samples each, c-c3 against c-c4
-
-**D147.** exp: judged over 3 samples each, c-c3 against c-c4
-
-**D148.** exp: judged over 3 samples each, c-c3 against c-c4
-
-**D149.** exp: judged over 3 samples against c-c3 46.40
-
-**D150.** c-c3 is the chosen source, median K 46.40 over 4
-
-**D151.** exp: judged over 3 samples against c-c3
-
-**D152.** exp: judged over 3 samples against c-c3
-
-**D153.** exp: judged over 3 samples against c-c3
-
-**D154.** exp: judged over 3 samples against c-c3
-
-**D155.** exp: judged over 3 samples against c64f 46.87
-
-**D156.** exp: judged over 3 samples against c64f 46.87
-
-**D157.** exp: judged over 3 samples against c64f 46.87
-
-**D158.** exp: judged over 3 samples against c64f 46.87
-
-**D159.** exp: local T +5 to 10 percent, so the board decides
-
-**D160.** c64f is the chosen source
-
-**D161.** exp: judged over 3 samples against c64f 46.64
-
-**D162.** exp: judged over 3 samples against c64f 46.64
-
-**D163.** exp: judged over 3 samples against c64f 46.64
-
-**D164.** exp: judged over 3 samples against c64f 46.64
-
-**D165.** exp: judged over 3 samples against c64f 46.64
-
-**D166.** exp: judged over 3 samples against c64f 46.64
-
-**D167.** exp: judged over 3 samples against c64f 46.64
-
-**D168.** exp: judged over 3 samples against c-ph1 46.91
-
-**D169.** exp: judged over 3 samples against c-ph1 46.91
-
-**D170.** exp: judged over 3 samples against c-ph1 46.91
-
-**D171.** exp: judged over 3 samples against c-ph1 46.91
-
-**D172.** exp: judged over 3 samples against c-ph1 46.91
-
-**D173.** exp: judged over 3 samples against c-ph1 46.91
-
-**D174.** exp: judged over 3 samples against c-kp2 46.85
-
-**D175.** exp: judged over 3 samples against c-kp2 46.85
-
-**D176.** exp: judged over 3 samples against c-kp2 46.85
-
-**D177.** exp: judged over 3 samples against c-kp2 46.85
-
-**D178.** exp: judged over 3 samples against c-kp2 46.85
-
-**D179.** exp: judged over 3 samples against c-kp2 46.85
-
-**D180.** exp: judged over 3 samples against c-kp2 46.84
-
-**D181.** exp: judged over 3 samples against c-kp2 46.84
-
-**D182.** exp: judged over 3 samples against c-kp2 46.84
-
-**D183.** exp: judged over 3 samples against c-kp2 46.84
-
-**D184.** exp: judged over 3 samples against c-kp2 46.84
-
-**D185.** exp: judged over 3 samples against c-kp2 46.84
-
-**D186.** exp: judged over 3 samples against c-kp2 46.84
-
-**D187.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
-
-**D188.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
-
-**D189.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
-
-**D190.** exp: judged over 5 samples
-
-**D191.** exp: judged over 5 samples
-
-**D192.** c-map or c-kp2 is final, by more samples
-
-**D193.** c-map or c-kp2 is final, by more samples
+**D126.** Map the files on a 2 MiB boundary. Locally page faults fell from 3,094 to 651 and T by 8%, if the box maps cached huge folios of the file whole. On the board, five runs: K 46.46 to 47.12, median 47.01, T 0.0194, M 10.06, S 352. T didn't move against D122's 0.0194, so the box doesn't seem to gain huge-folio mappings, and K's gain is inside the noise. Outcome: the final source; it has the best median of what we measured and costs two lines.
 
 ## What didn't work
 
@@ -627,21 +435,26 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | Parallel regions parser on current code: atomic byte table, code lock and region blocks | Cut the serial stage by parsing disjoint sorted-id ranges in parallel | Quick 59/59, thread sweep 324/324, constant-hash 29/29; counts 393.2 -> 393.0 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.85 misses. 41-pair full A/B was +3.5% (20.7% spread); three-run scorer K 26.63 -> 26.63 while S rose 315 -> 369 | local scratch | reverted |
 | Serial region-table preallocation from the sorted last id | Avoid repeated vector growth while parsing regions | Correctness gates pass; counts 393.2 -> 392.6 instructions/record, 43.9 -> 43.5 branches, 1.53 -> 1.60 misses. 41-pair A/B +0.3% inside 27.9% spread. Matched scorer pairs disagreed: K 26.41 -> 27.34, then 26.99 -> 26.62; peak memory was not consistently lower and S rose 315 -> 326 | local scratch | reverted |
 | A plain TZCNT loop in place of PEXT and GFNI for the position lists | 13 fewer lines, worth about 0.5% of K, if the box ignored the extra instructions as it has others | 61 paired local runs: T +8.7%, about 4% of K. Every block runs it, so we didn't spend box runs on it | local | not applied |
+| An owner for each name's shard in every thread: records mailed to the thread that owns their name | A name's line is only ever written by one thread, so no locked write on a line another core owns | T +77% locally. No box run | local | not applied |
+| 48-byte name slots packed across cache lines (`c-pack2`, `c-p4`) | M falls by about a megabyte | M 9.38 and 8.77 against 10.16, but T 0.0211 and 0.0216 against 0.0196, and K 45.13 and 45.28 against 46.55 | run-97a7fd55f700, run-b8a2382fa642 | reverted |
+| No release of the file's pages (`c-ph2`) | 8 lines fewer; the exit's cost unknown | T 0.0228 against 0.0192: the exit costs about 3.6 ms | run-dd2fa2833129, run-d82eb3c3bb54 | reverted |
+| `MADV_POPULATE_READ` on each segment before parsing (`c-p1`) | Fewer faults, and the text prefetch no longer stops at unmapped pages | K 45.92 in one run, T 0.0196 against 0.0191: no gain, not proven worse | run-9860184a210a | not kept |
 
 ## The final design
 
-The file is cut into 24 segments per thread, which threads claim from a shared counter and read in 32 KiB pieces. Each piece is parsed in two stages: fixed 64-byte blocks list the separators (quote parity by carry-less multiply, positions by PEXT and one GFNI matrix multiply), then each record reads its fields from the list, in two passes over a chunk of 16 blocks. One shared name table keeps a cache line per name (32 bytes of key, one bit per country) behind vector tags over 32-slot windows, and names with no slot go to a locked set. All memory is one zeroed static, aligned for huge pages, that the main thread populates before any other thread starts, and the workers run on stacks in it. See the [README](README.md#approach). Local counts (counts.sh, on Zen 4, so only instruction counts carry over to the box): 227 instructions per record after `2bfc56f`, down from 258 (D69, D70), about 8 fewer once the first two loops merged (row 73), and 0.33 mispredicts per record when last counted (D58).
+The file is mapped on a 2 MiB boundary and cut into 12 parts per thread, which threads claim from a shared counter, each cut just after a CRLF. Each part is parsed where it lies, in two stages: fixed 64-byte blocks list the separators (quote parity by carry-less multiply, positions by PEXT and one GFNI matrix multiply), then each record reads its fields from the list, in two passes over a chunk of 16 blocks. One shared name table keeps a cache line per slot (32 bytes of key, one bit per country) behind 16-bit tags over 32-slot windows. It has 104,724 homes, which fill four huge pages with the rest of the memory, and a name whose window is full walks on by a distance its tag sets, for up to 64 windows. Names with no slot go to a locked set. All memory is one zeroed static, aligned for huge pages, that the main thread populates before any other thread starts, and the workers run on stacks in it. When the parts run out, the threads release the file's pages together, because the exit would otherwise do it on one thread (step 120). See the [README](README.md#approach). The last counts recorded here, from before steps 95 to 126 (counts.sh, on Zen 4, so only instruction counts carry over to the box): 289.7 instructions per record (D93, D94) and 0.33 mispredicts per record (D58).
 
-A separate review tried to break the code of steps 49 and 50: fresh seeds and hostile inputs against the reference (records straddling every position of a piece boundary, names over the table's capacity, records over 1 MiB, thread counts from 1 to 64) gave about 940 comparisons and 7,300 repeat runs with no wrong output, and found one crash on a spec-legal input with names over 32 bytes, since fixed (see the journey). The long-name path it crashed in was replaced later by the locked set (steps 75 to 81).
+A separate review tried to break the code of steps 49 and 50: fresh seeds and hostile inputs against the reference (records straddling every position of a piece boundary, names over the table's capacity, records over 1 MiB, thread counts from 1 to 64) gave about 940 comparisons and 7,300 repeat runs with no wrong output, and found one crash on a spec-legal input with names over 32 bytes, since fixed (see the journey). The long-name path it crashed in was replaced later by the locked set (steps 75 to 81). That review was of the read design, which the mapped one has replaced.
 
 ## How we know it's correct
 
 - Every build is checked by SHA-256 against the naive reference on 15 generator seeds (tiny and sample) and 5 seeds at full scale, plus 20 answer-preserving rewrites of the input and 4 limit cases.
 - A constant-hash test build, where every key collides and the table has only 32 homes, so that names run out of slots and take the locked-set path, gives the same answers.
-- `quick.sh --threads "1 2 3 7 12 64"` on every build moves every cut, because segment sizes follow the thread count.
+- `quick.sh --threads "1 2 3 7 12 64"` on every build moves every cut, because part sizes follow the thread count.
+- **What none of these can see:** the code relies on the file's last record ending in its CRLF terminator (spec 2.2). A file whose last record had none would lose that record. No file in the bank lacks the terminator, so a change that broke the reliance would pass `quick.sh`. See [README](README.md#limits).
 - **Determinism drill on the final source:** `quick.sh --repeat 5` pinned with `taskset -c 0-1`: 54/54 cells, each run five times. Then 12 threads on those same two CPUs, with two `yes` competing for them: 54/54.
 - The spec's edge cases that needed care, and how each is handled: [README](README.md#correctness).
-- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `429da80`, run with `--full` on 2026-11-01 11:40 UTC against the organisers' harness at `adb9316`:
+- **Reproduce it yourself:** `python3 tools/verify.py --tracks c` (Docker, git and Python only). Its report on commit `0f33ae9`, whose source is the final one, run with `--full` on 2026-11-02 at 02:35 UTC against the organisers' harness at `adb9316`:
 
 | Track | Generator seeds | Answer-preserving rewrites | Limit cases | 5 identical runs |
 |---|---|---|---|---|
@@ -649,8 +462,12 @@ A separate review tried to break the code of steps 49 and 50: fresh seeds and ho
 
 ## With another 24 hours
 
-The box showed that line fills per record set T here, more than instructions or the lock, so that's where we'd look.
+The box showed that line fills per record set T here, more than instructions or the lock, and that the parts around the parse (the exit, the idle at the end, the names that spill) were worth as much as the parse. That's where we'd look.
 
-- **Already tested, both lost (D91).** `T0` for the slot prefetch: K 41.66, 43.96, 43.73, median 43.73. Homes on multiples of 32, so that tag windows never straddle a line: K 43.18, 43.28, 41.48, median 43.18. The chosen source's median is 44.00 over 7 runs, and it has ranged from 42.71 to 44.95 with no change, so T0's 0.6% is a lack of gain rather than a proven loss. Aligned homes are about 1.9% down.
-- **Lines.** S is worth about 1% of K per 28 lines, and it's still the largest part of what separates us from the leader. The last pass took out 47 by removing the hand-built mapping and its struct and by merging helpers. What's left that we know of trades T for lines, like the TZCNT loop under [What didn't work](#what-didnt-work).
+- **Already tested, and lost.** On the read design (D91): `T0` for the slot prefetch (K 41.66, 43.96, 43.73, median 43.73) and homes on multiples of 32 (K 43.18, 43.28, 41.48, median 43.18), against a median of 44.00 for the source then. On the mapped design: TZCNT positions (D97), no text prefetch (D98), segment counts from 1 to 24 (D99 to D102), homes from 105,000 to 140,000 (D103 to D110), packed slots (D114, D117), no release (D120), 24 segments with the release at the end (D123), the scout (D124).
+- **Names that spill.** `find` still runs for first sightings and for names outside their first window. The scout cut local `find` calls from 282,000 to 125,000 and was level on the box once its 15 lines were counted (D124). A guess that costs fewer lines is worth another try.
+- **The end of the run.** The end idle of 8.6% of local T is the figure from before fine parts and the shared release; we haven't measured what is left on the box, only that T fell.
+- **Memory.** Packing slots saved up to 1.4 MB of M and lost more in T (D114, D117). A cheaper way to save a megabyte would need no second line per name.
+- **Lines.** S is worth about 1% of K per 28 lines, and it's still the largest part of what separates us from the leader. The last passes took out 28 and 11 lines with K level (D111, D118). What's left that we know of trades T for lines, like the TZCNT loop under [What didn't work](#what-didnt-work).
+- **The slow mode.** Run one unchanged source every few minutes for a day, to see whether the slow runs follow the box's clock or the source.
 - **A local machine like the box.** Local cycles on a Zen 4 ranked cache and lock changes wrongly, so each real answer took a board slot. A Golden Cove machine would have let us test far more of them.

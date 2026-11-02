@@ -41,7 +41,7 @@
 
 #![no_main]
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::{arch::x86_64::*, fs::File, io::IoSlice, io::Write, os::fd::AsRawFd, thread};
 
@@ -1488,6 +1488,9 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
     }
 }
 
+/// Whether the sample is done, which starts the mappers.
+static SAMPLED: AtomicBool = AtomicBool::new(false);
+
 /// `#![no_main]`: without std's runtime setup, which reads /proc/self/maps and gives every thread a
 /// signal stack (an mmap, an mprotect and a sigaltstack each, and again at exit). `env::args` still works.
 #[unsafe(no_mangle)]
@@ -1516,7 +1519,10 @@ pub extern "C" fn main() -> i32 {
         // Fresh pages for what the plan and the scan allocate, so that they needn't stop to fault them in.
         thread::park();
         drop(std::hint::black_box(vec![1u8; 12 << 20]));
-        thread::park();
+        // A thread keeps only one unpark, so both calls may have come by now, and that one may have been the last.
+        while !SAMPLED.load(Acquire) {
+            thread::park();
+        }
         for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
             // SAFETY: this only maps pages of the mapping, and a part starts at a page.
             thread::spawn(move || unsafe { madvise(part.as_ptr(), part.len(), 22) });
@@ -1541,6 +1547,7 @@ pub extern "C" fn main() -> i32 {
         // The sample's finished threads leave behind the stacks that they and `make_plan`'s extra thread reuse,
         // as mapping a new stack would wait on the mappers.
         let df = sample_terms(docs, &plan.terms, threads.min(5));
+        SAMPLED.store(true, Release);
         helper.thread().unpark();
         make_plan(&mut plan, docs, df);
         let file = helper.join().expect("panics abort");

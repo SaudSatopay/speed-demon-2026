@@ -336,7 +336,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         for block in 0..blocks {
             let at = text.as_ptr().add(scan + block * 64);
             // Far enough ahead to pass where the chunk's own loads and a page's end stop the core.
-            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(1024).cast());
+            _mm_prefetch::<_MM_HINT_T1>(at.wrapping_add(1024).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
             let inside = _mm_cvtsi128_si64(parity) as u64 ^ *odd;
@@ -420,7 +420,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             let (id_region, cents) = parse_three([id, region, word << (64 - field)]);
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
-            _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
+            _mm_prefetch::<_MM_HINT_T1>(regions.add((id_region >> 32) as usize).cast());
             let (home, tag) = home_and_tag(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong
@@ -500,7 +500,7 @@ extern "C" fn main() -> i32 {
     let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(1));
+    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
     let open = |name: &str| map(&File::open(arg(1, "/data") + "/" + name + ".csv").unwrap());
     let (records, lookup) = (open("records"), open("regions"));

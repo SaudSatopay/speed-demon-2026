@@ -180,6 +180,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 135 | CLDEMOTE after the locked write (c-d1) | The workers-only-regions run took 49 ns a record alone against about 58 per thread with 12: memory waits set T, and a slot written by another core costs a snoop | pending | — | — | — |
 | 136 | PREFETCHNTA for the text instead of T0 (c-n1) | Text at about the rate of slot lines passes through the caches on its way: NTA should leave more room in them for slots | pending | — | — | — |
 | 137 | Measure only: one thread (c-e2) | M at one thread shows what the 11 spawns add on the box | pending | — | — | — |
+| 138 | Text and region prefetches into L2, not L1 (c-q1) | A core has 16 fill buffers for two threads, and a chunk asks for about 50 lines at once; a prefetch to L2 should give its buffer back early, so slot prefetches stop queueing | pending | — | — | — |
 
 ## Decision log
 
@@ -463,6 +464,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D139.** pending: board, 3 samples
 
 **D140.** pending: one run, then back
+
+**D141.** pending: board, 3 samples
 
 ## What didn't work
 

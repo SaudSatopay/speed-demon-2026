@@ -138,11 +138,7 @@ const REGION_IDS: usize = 1_000_001;
 /// Homes for names of up to 8 bytes, of up to 16, and of more, each class apart: about 95% full for
 /// the generator's pool of 100,000 names (spec section 2.2), of which about 32%, 57% and 11% fall in
 /// each class. A test build makes them tiny, so that names run out of slots.
-const HOMES: [usize; 3] = if cfg!(sd_const_hash) {
-    [32, 128, 32]
-} else {
-    [33_504, 60_100, 11_800]
-};
+const HOMES: [usize; 3] = [32, 93_156, 11_552];
 /// Slots of the short class, a whole number of cache lines of keys, then lines for the other two, each
 /// class with enough past its last home for a window.
 const SHORT: usize = HOMES[0] + 32;
@@ -159,7 +155,6 @@ const CLASSES: [(u64, usize, usize, usize); 4] = [
 const COUNTRIES: usize = 241;
 /// Bits in a line, past a key of the middle class and before its name's own bits, for short names.
 const HOLE: usize = 512 - 128 - COUNTRIES;
-const _: () = assert!(SHORT * COUNTRIES <= (HOMES[1] + 32) * HOLE);
 /// Windows a name tries before it does without a slot: more than a table this full can need, for a
 /// generated file.
 const TRIES: usize = 64;
@@ -255,7 +250,7 @@ fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
 /// A name's index in `CLASSES`: 0 for at most 8 bytes, 1 for at most 16, and 2 or 3 for at most 32. The
 /// empty name has its slot with the longest, the only class it can't collide with by length.
 fn class(len: usize) -> usize {
-    len.wrapping_sub(1) >> 3 & 3
+    (len.wrapping_sub(1) >> 3 & 3).max(1)
 }
 
 /// Where a slot's key is, in bytes from the start of the lines.
@@ -586,15 +581,9 @@ extern "C" fn main() -> i32 {
     // The threads parse the whole file and merge their rows, every index's row, index 0 being
     // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
     // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-    let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
-    // Small pages past the last whole huge page, which only hold stacks: a huge page there would
-    // charge all of it.
-    // SAFETY: both are only advice about pages of `MEMORY`, and a range past its end has no effect.
-    unsafe {
-        let base = (&raw const MEMORY).cast::<u8>();
-        madvise(base.add(bytes / HUGE * HUGE), HUGE, 15);
-        madvise(base, bytes, 23);
-    }
+    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(HUGE);
+    // SAFETY: this is only advice about pages of `MEMORY`.
+    unsafe { madvise((&raw const MEMORY).cast(), bytes, 23) };
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));

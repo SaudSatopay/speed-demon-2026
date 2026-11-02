@@ -22,8 +22,7 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
 use std::{arch::asm, arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
-use std::{hint::select_unpredictable, io::BufWriter, io::Write, mem::offset_of};
-use std::{os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
+use std::{io::BufWriter, io::Write, mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
 
@@ -135,32 +134,18 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1_000_001;
-/// Homes for names of up to 8 bytes, of up to 16, and of more, each class apart: about 95% full for
-/// the generator's pool of 100,000 names (spec section 2.2), of which about 32%, 57% and 11% fall in
-/// each class. A test build makes them tiny, so that names run out of slots.
-const HOMES: [usize; 3] = [32, 93_156, 11_552];
-/// Slots of the short class, a whole number of cache lines of keys, then lines for the other two, each
-/// class with enough past its last home for a window.
-const SHORT: usize = HOMES[0] + 32;
-const LINES: usize = HOMES[1] + HOMES[2] + 64;
-/// By `class`: its homes, its first slot, where in `PADS` a load has zeros on its key's bytes, and how
-/// many words its key has.
-const CLASSES: [(u64, usize, usize, usize); 4] = [
-    (HOMES[0] as u64, 0, 24, 1),
-    (HOMES[1] as u64, SHORT, 16, 2),
-    (HOMES[2] as u64, SHORT + HOMES[1] + 32, 0, 4),
-    (HOMES[2] as u64, SHORT + HOMES[1] + 32, 0, 4),
-];
-/// Bits per name, for the country indices from 0 to 240 (spec section 2.3).
-const COUNTRIES: usize = 241;
-/// Bits in a line, past a key of the middle class and before its name's own bits, for short names.
-const HOLE: usize = 512 - 128 - COUNTRIES;
+/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 96%
+/// full, which is as many as fit in four huge pages with the rest of `Memory`. A test build makes it
+/// tiny, so that names run out of slots.
+const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 104_724 };
+/// Slots, with enough past the last home for its window.
+const SLOTS: usize = HOMES + 32;
 /// Windows a name tries before it does without a slot: more than a table this full can need, for a
 /// generated file.
 const TRIES: usize = 64;
 /// Bytes of stack per thread, enough for its rows and lists.
-const STACK: usize = 32 << 10;
-/// Names longer than this get no slot. No generated name has been seen beyond 27 bytes.
+const STACK: usize = 40 << 10;
+/// Names longer than this get no slot. No generated name has been seen beyond 25 bytes.
 const INLINE_BYTES: usize = 32;
 /// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones. A `Row`
 /// is the size of a cache line and aligned to one, so that the loads never split across two.
@@ -174,24 +159,16 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 /// no branch. A name takes the first slot free in its window. Only when all are full does it move on,
 /// by a distance its tag sets, so that names that spill don't fill the windows next door, which would
 /// make long runs of them full. A home for every slot, not every few, leaves far fewer names outside
-/// their first 32. Names are compared in full, as raw bytes, which encode the value one to one. The
-/// slots are insert-only: a key's words go from zero to their final value once, and a key has no zero
-/// bytes, so a slot that compares equal is complete. A name that gets no slot goes to a locked set
-/// instead. Slots stay full, so it never gets one later.
-///
-/// A name of the two longer classes has one cache line, with its key and bits together, so the line
-/// its write has to own anyway is the only one it misses on: 32 bytes of key for the longest names, and
-/// 16 for the middle class. That leaves a hole in every middle line, and the bits of the short names
-/// fill those holes, end to end, which is what brings the table down by a huge page. A short name's key
-/// is one word, and those are few enough to stay in a core's second-level cache, so it costs little that
-/// they're apart from the bits.
+/// their first 32. Names are compared in full, as raw bytes, which
+/// encode the value one to one. The slots are insert-only: a key's words go from zero to their final
+/// value once, and a key has no zero bytes, so a slot that compares equal is complete. A name that gets
+/// no slot goes to a locked set instead. Slots stay full, so it never gets one later.
 ///
 /// All of it is zeros in the program's image until it's touched, and the alignment gives it huge pages.
 #[repr(C, align(2097152))]
 struct Memory {
-    short: [AtomicU64; SHORT], // The keys of short names, then the lines, with `LINES` of them.
-    lines: [[AtomicU64; 8]; LINES],
-    tags: [AtomicU16; SHORT + LINES],
+    words: [[AtomicU64; 8]; SLOTS], // Each one cache line: four words of key, then 256 bits.
+    tags: [AtomicU16; SLOTS],
     regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
     index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
     stacks: [[AtomicU64; STACK / 8]; 64], // More threads than the box has, or any test asks for.
@@ -240,30 +217,7 @@ fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
     // One more than the length, or the empty name would hash to zero, and its tag mean a free slot.
     let crc = unsafe { _mm_crc32_u64(len as u64 + 1, head) as u32 };
     let hash = if cfg!(sd_const_hash) { 0 } else { crc };
-    let (homes, first, ..) = CLASSES[class(len)];
-    (
-        (u64::from(hash) * homes >> 32) as usize + first,
-        hash as u16,
-    )
-}
-
-/// A name's index in `CLASSES`: 0 for at most 8 bytes, 1 for at most 16, and 2 or 3 for at most 32. The
-/// empty name has its slot with the longest, the only class it can't collide with by length.
-fn class(len: usize) -> usize {
-    (len.wrapping_sub(1) >> 3 & 3).max(1)
-}
-
-/// Where a slot's key is, in bytes from the start of the lines.
-fn key_at(slot: usize) -> isize {
-    let from_lines = slot as isize - SHORT as isize;
-    from_lines << select_unpredictable(from_lines < 0, 3, 6)
-}
-
-/// Which bit, counted from the start of the lines, says that a slot's name has been seen in a country.
-fn bit_of(slot: usize, country: usize) -> usize {
-    let short = slot * COUNTRIES + country;
-    let own = (slot.wrapping_sub(SHORT) * 512).wrapping_add(512 - COUNTRIES + country);
-    select_unpredictable(slot < SHORT, short / HOLE * (512 - HOLE) + short + 128, own)
+    ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u16)
 }
 
 /// One bit per slot of the 32 in `window`, set where the tag is `tag`. Tags are aligned, so a vector
@@ -287,30 +241,27 @@ fn key(text: &[u8], start: usize, len: usize) -> __m256i {
     }
 }
 
-/// Whether the key this far from the start of the lines holds the name, of at most `INLINE_BYTES`, if
-/// it's a key of the name's class. A slot whose writer hasn't finished with it doesn't.
+/// Whether the slot at this offset in bytes holds the name, of at most `INLINE_BYTES`. A slot whose
+/// writer hasn't finished with it doesn't.
 ///
 /// # Safety
-/// `at` must be where a slot's key is.
-unsafe fn holds(at: isize, text: &[u8], start: usize, len: usize) -> bool {
-    // SAFETY: 32 bytes from any key are inside `MEMORY`, and the pad's load is inside its row. x86-64-v3
-    // has AVX2.
+/// `at` must be where a slot's words start.
+unsafe fn holds(at: usize, text: &[u8], start: usize, len: usize) -> bool {
+    // SAFETY: the slot is inside the table. x86-64-v3 has AVX2.
     unsafe {
-        let stored = (&raw const MEMORY.lines).byte_offset(at).cast();
-        let differ = _mm256_xor_si256(key(text, start, len), _mm256_loadu_si256(stored));
-        let pad = PADS.0.as_ptr().byte_add(CLASSES[class(len)].2);
-        _mm256_testc_si256(_mm256_loadu_si256(pad.cast()), differ) == 1
+        let stored = MEMORY.words.as_ptr().byte_add(at);
+        let differ = _mm256_xor_si256(key(text, start, len), _mm256_loadu_si256(stored.cast()));
+        _mm256_testz_si256(differ, differ) == 1
     }
 }
 
-/// Finds the name's slot, or takes a free one for it, and returns it. Only a wrong
+/// Finds the name's slot, or takes a free one for it, and returns its offset in bytes. Only a wrong
 /// guess or a new name comes here. A long name, or one that finds all its `TRIES` windows full, gets
 /// no slot.
 #[cold]
 fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
     let (mut home, hash) = home_and_tag(text, start, len);
     let (tag, tries) = (hash.max(1), if len <= INLINE_BYTES { TRIES } else { 0 });
-    let (homes, first, _, words) = CLASSES[class(len)];
     // Each tag only ever changes from zero to its final tag, and a name only takes a slot when every
     // one before it on its walk is taken. The walk is the same on every thread, so two threads
     // inserting one name both come to the same free slot, one loses the exchange, and it then sees
@@ -323,32 +274,22 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
         while hits != 0 {
             let at = home + hits.trailing_zeros() as usize;
             hits &= hits - 1;
-            let slot = &MEMORY.tags[at];
-            // SAFETY: a slot's key has this class's words, and they're atomics.
-            let stored = unsafe {
-                let stored = (&raw const MEMORY.lines)
-                    .byte_offset(key_at(at))
-                    .cast::<AtomicU64>();
-                std::slice::from_raw_parts(stored, words)
-            };
+            let (slot, words) = (&MEMORY.tags[at], &MEMORY.words[at]);
             if slot.load(Relaxed) == 0 && slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
                 // SAFETY: both are 32 bytes. x86-64-v3 has AVX2.
                 let key: [u64; 4] = unsafe { std::mem::transmute(key(text, start, len)) };
-                stored
-                    .iter()
-                    .zip(key)
-                    .for_each(|(w, k)| w.store(k, Release));
-                return Some(at);
+                words.iter().zip(key).for_each(|(w, k)| w.store(k, Release));
+                return Some(at * 64);
             }
             if slot.load(Relaxed) == tag {
-                while stored[words - 1].load(Acquire) == 0 {}
-                // SAFETY: this is where a slot's key is.
-                if unsafe { holds(key_at(at), text, start, len) } {
-                    return Some(at);
+                while words[3].load(Acquire) == 0 {}
+                // SAFETY: `at * 64` is where a slot's words start.
+                if unsafe { holds(at * 64, text, start, len) } {
+                    return Some(at * 64);
                 }
             }
         }
-        home = first + (home - first + 33 + usize::from(hash)) % homes as usize;
+        home = (home + 33 + usize::from(hash)) % HOMES;
     }
     None
 }
@@ -360,9 +301,6 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
 #[repr(align(64))]
 struct Row([i64; 8]);
 const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
-
-/// What a chunk's first pass finds for a record.
-type Found = (i32, u32, i32, u32, u32);
 
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
@@ -428,7 +366,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
 fn parse_records(text: &[u8], len: usize, rows: &mut [Row; 256]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at.
-    let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0, 0, 0); LISTED / 5]);
+    let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
     // The text starts at a record's start, so outside quotes.
     let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
     while scan < len {
@@ -450,11 +388,11 @@ fn parse_records(text: &[u8], len: usize, rows: &mut [Row; 256]) {
 }
 
 /// Adds up a chunk of whole records from `text`, given five positions for each: where it starts, and
-/// just past its first four separators. `found` is room for what the first pass finds for a record: the
-/// key of its guessed slot, its bit there, its cents, id, and country.
-fn add_records(text: &[u8], listed: &[u32], found: &mut [Found], rows: &mut [Row; 256]) {
+/// just past its first four separators. `found` is room for each record's guessed slot, cents, and id
+/// and region together.
+fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows: &mut [Row; 256]) {
     let (records, _) = listed.as_chunks::<5>();
-    let (lines, regions) = (MEMORY.lines.as_ptr(), MEMORY.regions.as_ptr());
+    let (words, regions) = (MEMORY.words.as_ptr(), MEMORY.regions.as_ptr());
     for (positions, slot) in records.iter().zip(found.iter_mut()) {
         let [mut start, name_at, note_at, region_at, amount_at] = positions.map(|at| at as usize);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
@@ -484,37 +422,28 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [Found], rows: &mut [Row
             // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
             // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
-            let guess = home + slots_with(window, tag).trailing_zeros() as usize;
+            let guess = (home + slots_with(window, tag).trailing_zeros() as usize) * 64;
+            _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
+            asm!(".rept 24", "lea {0}, [{1} + 1]", ".endr", out(reg) _, in(reg) 0usize);
             let cents = (cents as i32 ^ negative) - negative;
-            let region = (id_region >> 32) as u32;
-            *slot = (
-                key_at(guess) as i32,
-                guess as u32,
-                cents,
-                id_region as u32,
-                region,
-            );
+            *slot = (guess as u32, cents as u32, id_region);
         }
     }
-    for (positions, slot) in records.iter().zip(found.iter_mut()) {
+    for (positions, &(guess, cents, id_region)) in records.iter().zip(found.iter()) {
         let [_, name_at, note_at, region_at, _] = positions.map(|at| at as usize);
-        let (guess, cents, id) = (slot.1 as usize, slot.2, slot.3);
         // SAFETY: the first pass kept the region inside the table, and its writes all came before.
-        // Prefetching has no effect on memory.
-        let country = unsafe {
-            let country = regions.add(slot.4 as usize).cast::<u8>().read();
-            (slot.1, slot.4) = (bit_of(guess, usize::from(country)) as u32, country.into());
-            _mm_prefetch::<_MM_HINT_ET0>(lines.byte_add(slot.1 as usize / 8).cast());
-            country
-        };
+        let country = unsafe { regions.add((id_region >> 32) as usize).cast::<u8>().read() };
         let row = &mut rows[usize::from(country)].0;
-        let cents = i64::from(cents);
+        let cents = i64::from(cents as i32);
         row[0] += 1;
-        row[2] += i64::from(id);
+        row[2] += i64::from(id_region as u32);
         row[4] += cents;
         // These hardly ever change, so branches beat conditional moves and two stores.
         (cents < row[1]).then(|| row[1] = cents);
         (cents > row[3]).then(|| row[3] = cents);
+        unsafe {
+            asm!(".rept 24", "lea {0}, [{1} + 1]", ".endr", out(reg) _, in(reg) 0usize);
+        }
         let name = (note_at - name_at - 1) as u32 as usize;
         let both = region_at - name_at - 1;
         // SAFETY: `name_at` is inside the text, and the padding covers the mask. BZHI keeps every bit
@@ -532,29 +461,24 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [Found], rows: &mut [Row
         // fields of no quotes or two both coming to nothing.
         row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
         row[7] += (both - name - 1 - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
-    }
-    for (positions, &(guess, bit, _, _, country)) in records.iter().zip(found.iter()) {
-        let [_, name_at, note_at, ..] = positions.map(|at| at as usize);
-        let row = &mut rows[country as usize].0;
-        let name = (note_at - name_at - 1) as u32 as usize;
         let (start, len) = (name_at + 1, name.wrapping_sub(2));
         // SAFETY: `guess` came from the first pass, and `find` returns a slot too. The name starts
-        // inside the text. A country index is at most 240, so its bit is inside the lines.
+        // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.
         unsafe {
-            let bit = if len <= INLINE_BYTES && holds(guess as isize, text, start, len) {
-                bit as usize
+            let at = if len <= INLINE_BYTES && holds(guess as usize, text, start, len) {
+                guess as usize
             } else if let Some(at) = find(text, start, name.saturating_sub(2)) {
-                bit_of(at, country as usize)
+                at
             } else {
                 let name = text[start..start + name.saturating_sub(2)].to_vec();
-                row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country as u8)));
+                row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country)));
                 continue;
             };
             // Nine records in ten set a new bit, so a plain load first would rarely save the locked
             // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
             // leaves the old bit in the carry, which adds one to the row's repeats if it had been set.
-            asm!("lock bts [{}], {}", "adc qword ptr [{} + 48], 0",
-                in(reg) lines, in(reg) bit, in(reg) row.as_mut_ptr());
+            asm!("lock bts [{} + {} + 32], {}", "adc qword ptr [{} + 48], 0",
+                in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
         }
     }
 }
@@ -582,6 +506,8 @@ extern "C" fn main() -> i32 {
     // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
     // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
     let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(HUGE);
+    // Whole huge pages only, even for the last part: small pages cost more time than the rest of that
+    // huge page costs in memory. The size of `MEMORY` is a multiple of them, so this stays inside it.
     // SAFETY: this is only advice about pages of `MEMORY`.
     unsafe { madvise((&raw const MEMORY).cast(), bytes, 23) };
     LOCKED.lock().unwrap().0.reserve(256);

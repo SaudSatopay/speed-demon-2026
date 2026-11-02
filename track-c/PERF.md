@@ -206,6 +206,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 161 | c-l7: name classes, longer classes own their line in the first pass | Bisects why the c-l builds lost 12 percent of T; the suspect is asking for the line late. 1 run: K 43.58, T 0.0234, M 8.13, S 411. No better than c-l3, so asking late for the line is not the cost. Rejected on this run, with no time for 3 samples before feature freeze: it would have needed T down 15%, beyond the noise of about 10% of T | run-67f0c40ec025 | 0.0234 | 8.13 | 81.96 |
 | 162 | Back to c-s7, the final source | c-l7 asked to own the line in the first pass: T 0.0234, M 8.13, S 411, K 43.58, no better than c-l3, so the late request is not what costs the c-l builds their T. K 46.82, T 0.0194, M 10.44. Same source as step 153, now median K 46.73 over 8, T 0.0195, M 10.13 to 10.54. The final source | run-fd234bc3c56f | 0.0194 | 10.44 | 83.52 |
 | 163 | c-v7: 32-byte slots, a compact exact-key arena, table on 4 KiB pages | Two slots share a line and keys move to an arena, which lowers M by a huge page or more | pending | — | — | — |
+| 164 | Back to c-s7, the final source | c-v7 lost on the box: T 0.0281 and 0.0297, M 10.10 and 10.15, S 438, K 37.74 and 36.62 against a median of about 46.7 | pending | — | — | — |
 
 ## Decision log
 
@@ -541,6 +542,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D165.** c-s7 stays final at feature freeze: c-l7 K 43.58, T 0.0234 on one run, so the early request for the line did not recover the T. We stopped without the planned 3 samples, as the gap was beyond the noise and the freeze was 25 minutes away.
 
 **D166.** Decide on 3 samples against c-s7, which stays final
+
+**D167.** c-s7 stays final; c-v7 rejected
 
 ## What didn't work
 

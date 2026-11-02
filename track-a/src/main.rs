@@ -79,11 +79,12 @@ struct Table {
     slots: [AtomicU16; SLOTS],
     /// Lines reserved so far.
     used: AtomicUsize,
-    /// One more than the log positions where threads first and last came to each hour, the last 0 if
-    /// none has and `usize::MAX` once the hour is claimed. Once a line came too late for its hour, all
-    /// are `[0, usize::MAX]`. `panic = "abort"` means no thread dies holding a lock, so the `expect` on a
-    /// lock never fires.
-    spans: Mutex<[[usize; 2]; HOURS]>,
+    /// Hours claimed so far, or `usize::MAX` once a line came too late for its hour. It changes only
+    /// with `last_seen` locked, and is read so too until the threads are done.
+    claimed: AtomicUsize,
+    /// One more than the log position where a thread last came to each hour, or 0 if none has.
+    /// `panic = "abort"` means no thread dies holding a lock, so the `expect` on a lock never fires.
+    last_seen: Mutex<[usize; HOURS]>,
     /// The latest order of the ids, kept for the hours to come.
     order: Mutex<Arc<Order>>,
 }
@@ -266,12 +267,12 @@ fn parse(text: &[u8], table: &Table, hours: &[Hour], mut next: impl FnMut() -> O
                 // Before any claim of this hour, this shows the claimer that this segment holds it
                 // up, as its position is at or past the low mark. After one, it's too late, which
                 // ends the round.
-                let mut spans = table.spans.lock().expect("poisoned");
-                if spans[hour][1] == usize::MAX {
-                    spans.fill([0, usize::MAX]);
+                let mut last_seen = table.last_seen.lock().expect("poisoned");
+                last_seen[hour] = last_seen[hour].max(line + 1);
+                if hour < table.claimed.load(Relaxed) {
+                    table.claimed.store(usize::MAX, Relaxed);
                     return;
                 }
-                spans[hour] = [spans[hour][0].min(line + 1), spans[hour][1].max(line + 1)];
             }
             // The endpoint starts after the timestamp, the method and their two spaces.
             let at = line + 29 + (METHOD_LENGTHS >> 4 * (method & 15) & 15) as usize;
@@ -495,9 +496,9 @@ fn append(hours: &[Hour], next: &Mutex<usize>, mut file: &File) {
 }
 
 /// One round over the log, in which an hour is due when the reading is past where a thread last came
-/// to it by `margin` bytes. Says whether it got to the end, as a line that comes too late stops
+/// to it by this share of the log. Says whether it got to the end, as a line that comes too late stops
 /// it.
-fn round(log: &[u8], out: &Path, threads: usize, margin: usize) -> bool {
+fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
     let file = File::create(out.join("summary.txt")).expect("summary.txt");
     let end = log.len() - PADDING;
     // Each hour's room, in words, as whole pages. Enough for every line: the shortest has 39 bytes, and
@@ -519,7 +520,8 @@ fn round(log: &[u8], out: &Path, threads: usize, margin: usize) -> bool {
         lines: unsafe { from_raw_parts(base.add(HOURS * room * 4).cast(), IDS) },
         slots: [const { AtomicU16::new(0) }; SLOTS],
         used: AtomicUsize::new(1),
-        spans: Mutex::new([[usize::MAX, 0]; HOURS]),
+        claimed: AtomicUsize::new(0),
+        last_seen: Mutex::new([0; HOURS]),
         order: Mutex::default(),
     };
     let digits: Vec<usize> = (0..1024).collect();
@@ -538,37 +540,29 @@ fn round(log: &[u8], out: &Path, threads: usize, margin: usize) -> bool {
             reached[me].store(cursor.load(Relaxed), Release);
             // Only finishers take the lock here, as a thread put to sleep on it wakes up late and maybe on
             // another CPU, and its segment holds up the rest.
-            let left = finisher && {
-                let mut spans = table.spans.lock().expect("poisoned");
-                // A thread past the end has no line left: only that lets go of an hour with no line.
-                let due = |&[first, last]: &[usize; 2]| {
-                    let clear = |r| r >= last + margin || r + SEGMENT + margin < first;
-                    let free = |r| r >= end || last > 0 && clear(r);
-                    // A segment not yet taken could still hold the hour.
-                    last < usize::MAX
-                        && cursor.load(Relaxed) >= (last + margin).min(end)
-                        && reached.iter().all(|r| free(r.load(Acquire)))
-                };
+            let mut h = HOURS;
+            if finisher {
+                let low = reached.iter().map(|r| r.load(Acquire)).min().unwrap();
+                let seen = table.last_seen.lock().expect("poisoned");
+                h = table.claimed.load(Relaxed);
                 // An hour with no line yet has 0, and it's due only when all reading is done. Nothing
                 // waits for a thread that fell behind: on a shared machine, the others would then sit out
                 // its whole turn off the core, and that happens all the time, so a wait here turned a busy
                 // box into a 4 times slower run. Its records pile up meanwhile, which costs memory only
                 // while the box is busy.
-                if let Some(h) = spans.iter().position(due) {
-                    spans[h][1] = usize::MAX;
-                    drop(spans);
+                if h < HOURS && (low >= end || seen[h] > 0 && seen[h] + end / share < low) {
+                    table.claimed.store(h + 1, Relaxed);
+                    drop(seen);
                     // While it writes, this thread holds no hour back.
                     reached[me].store(usize::MAX, Release);
                     write_hour(h, &hours[h], &table, &digits, &mut scratch);
                     append(&hours, &next_out, &file);
                     continue;
                 }
-                spans.iter().any(|s| s[1] < usize::MAX)
-            };
+            }
             let start = cursor.fetch_add(SEGMENT, Relaxed);
-            // Exactly where this thread is now, which a claim can then trust, even once past the end.
-            reached[me].store(start, Release);
-            if start < end || !left {
+            // At the end, once more with the mark at the end, which lets go of the last hours.
+            if start < end || reached[me].load(Relaxed) >= end && h >= HOURS {
                 return (start < end).then_some([start, (start + SEGMENT).min(end)]);
             }
             // The wait gives up its core: a spinning thread would keep the one it waits for off a shared core.
@@ -592,7 +586,7 @@ fn round(log: &[u8], out: &Path, threads: usize, margin: usize) -> bool {
         worker(0);
     });
     append(&hours, &next_out, &file);
-    table.spans.lock().expect("poisoned")[0][0] > 0
+    table.claimed.load(Relaxed) == HOURS
 }
 
 /// The C entry point: see `#![no_main]` at the top.
@@ -619,7 +613,7 @@ extern "C" fn main() -> i32 {
         assert!(base as isize != -1 && (end == 0 || mapped == base), "mmap");
         from_raw_parts(base, end + PADDING)
     };
-    let round = |share| round(text, arg(2, "/out").as_ref(), threads, end / share);
+    let round = |share| round(text, arg(2, "/out").as_ref(), threads, share);
     // A 48th of the log is several times the disorder that the spec's shards make. If it's not enough,
     // the second round has no hour due until the log is done.
     _ = round(48) || round(1);

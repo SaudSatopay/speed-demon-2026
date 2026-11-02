@@ -221,19 +221,12 @@ fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
     ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u16)
 }
 
-/// One bit per slot of the 32 in `window`, set where the tag is `tag` or the slot is free. Tags are aligned, so a vector
+/// One bit per slot of the 32 in `window`, set where the tag is `tag`. Tags are aligned, so a vector
 /// load can't tear one, and a tag of 16 bits rarely matches another name before its own.
 fn slots_with(window: [__m256i; 2], tag: u16) -> u32 {
     // SAFETY: x86-64-v3 has AVX2.
     unsafe {
-        let wanted = _mm256_set1_epi16(tag as i16);
-        let free = _mm256_setzero_si256();
-        let is = |tags| {
-            _mm256_or_si256(
-                _mm256_cmpeq_epi16(tags, wanted),
-                _mm256_cmpeq_epi16(tags, free),
-            )
-        };
+        let is = |tags| _mm256_cmpeq_epi16(tags, _mm256_set1_epi16(tag as i16));
         let bytes = _mm256_packs_epi16(is(window[0]), is(window[1]));
         _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xD8>(bytes)) as u32
     }
@@ -278,7 +271,7 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
         // SAFETY: a home is below `HOMES`, so 32 below the end of the tags, and the load needs no
         // alignment.
         let window = unsafe { std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast()) };
-        let mut hits = slots_with(window, tag);
+        let mut hits = slots_with(window, tag) | slots_with(window, 0);
         while hits != 0 {
             let at = home + hits.trailing_zeros() as usize;
             hits &= hits - 1;
@@ -309,10 +302,6 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
 #[repr(align(64))]
 struct Row([i64; 8]);
 const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
-
-/// What the first empty name a thread sees in a country adds to the row's repeats, in place of one.
-/// Empty names get no slot: one in a hundred records would fight over its cache line.
-const EMPTY_SEEN: i64 = 1 << 40;
 
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
@@ -434,11 +423,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
             let (home, tag) = home_and_tag(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
-            // update then needs no second trip to take it from the core that wrote it last. A new name
-            // gets the line of the free slot it will take, and a name that has a slot always finds
-            // its tag before any free one, as slots fill in order. A wrong guess costs a search. A
-            // name's tag is the low 16 bits of its hash, or 1 for zero, which means free; here a zero
-            // is a wrong guess too, and costs one name in 65,536 less than a check.
+            // update then needs no second trip to take it from the core that wrote it last. A wrong
+            // guess costs a search. A name's tag is the low 16 bits of its hash, or 1 for zero, which
+            // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
+            // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
             let hits = slots_with(window, tag);
             let guess = (home + hits.trailing_zeros() as usize) * 64;
@@ -482,13 +470,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
         unsafe {
             let at = if len <= INLINE_BYTES && holds(guess as usize, text, start, len) {
                 guess as usize
-            } else if name <= 2 {
-                row[6] += if row[6] < EMPTY_SEEN { EMPTY_SEEN } else { 1 };
-                continue;
-            } else if let Some(at) = find(text, start, name - 2) {
+            } else if let Some(at) = find(text, start, name.saturating_sub(2)) {
                 at
             } else {
-                let name = text[start..start + name - 2].to_vec();
+                let name = text[start..start + name.saturating_sub(2)].to_vec();
                 row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country)));
                 continue;
             };
@@ -592,9 +577,7 @@ extern "C" fn main() -> i32 {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
             write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100).unwrap();
         }
-        // Each thread that saw an empty name counted it once, and only one of those is distinct.
-        let repeats = (row[6] & (EMPTY_SEEN - 1)) + (row[6] >> 40).max(1) - 1;
-        writeln!(out, " {} {} {}", row[0] - repeats, row[5], row[7]).unwrap();
+        writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7]).unwrap();
     }
     out.flush().unwrap();
     // Not a return. The handlers that `exit` runs write a byte at the start of the zeroed part of the

@@ -193,6 +193,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 148 | exp: empty names get no slot, each thread counts them in its row (c-e0) | One record in a hundred has an empty name and all went to find and fought over one line | pending | — | — | — |
 | 149 | exp: first pass prefetches the free slot a new name will take (c-f0) | 100,000 first sightings each miss on an unprefetched slot line, about a tenth of T by estimate | pending | — | — | — |
 | 150 | exp: both: empty names per thread, free slot prefetched (c-ef) | The two together, if each alone is real | pending | — | — | — |
+| 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.17 over 2: none beats c-map at 46.82 over 17 | pending | — | — | — |
 
 ## Decision log
 
@@ -502,6 +503,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D152.** Keep if the median K beats c-map over 3 samples
 
 **D153.** Keep if the median K beats c-map over 3 samples
+
+**D154.** Final unless something beats its median over 3 samples
 
 ## What didn't work
 

@@ -172,6 +172,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 127 | c-fp find from the first pass when a name has no tag in its window, sample 1 | c-scout gave T 0.0190 for 15 lines; this asks find itself, for 5 | pending | — | — | — |
 | 128 | c-fp sample 2 | second sample | pending | — | — | — |
 | 129 | c-fp sample 3 | third sample | pending | — | — | — |
+| 130 | back to c-map | c-fp, find from the first pass, median K 45.49 over 3 with T 0.0194 to 0.0209, against c-map 46.95 over 8 | pending | — | — | — |
 
 ## Decision log
 
@@ -433,6 +434,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D128.** exp: judged over 3 samples against c-map 46.94
 
 **D129.** exp: judged over 3 samples against c-map 46.94
+
+**D130.** c-map stays the final source; c-fp rejected
 
 ## What didn't work
 

@@ -1520,7 +1520,7 @@ pub extern "C" fn main() -> i32 {
         }
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
         // Fresh pages for what the plan and the scan allocate, so that they needn't stop to fault them in.
-        drop(std::hint::black_box(vec![1u8; 20 << 20]));
+        drop(std::hint::black_box(vec![1u8; 12 << 20]));
         thread::park();
         mappers.iter().for_each(|mapper| mapper.thread().unpark());
         file

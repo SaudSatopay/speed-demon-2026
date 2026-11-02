@@ -9,7 +9,7 @@
 - S is 352 code lines against the reference's 56, which costs (56/352)^0.15, K x 0.75; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
 - M is 15.5 to 16.3 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.
 - **T has a slow mode on identical code, and we don't fully know why.** On D68's build it was about 0.0205 against 0.0163, in 2 of 8 runs. Making the main thread a worker, so that no more threads than CPUs want to run, gave seven clean runs (D74), but later runs read about 0.018 again (D75). It may be a smaller mode, or a busier box.
-- The log is mapped, so the parse's loads wait on memory instead of a copy done earlier. One prefetch per line, 1,536 bytes ahead, covers some of that. Mapping lost on the board three times before D65, because exit took the log's pages down one at a time on one thread, and the clock runs to exit. Threads that are done now share that release. What the release alone is worth is not established (D66).
+- The log is mapped, so the parse's loads wait on memory instead of a copy done earlier. One prefetch per line, 1,536 bytes ahead, covers some of that. Mapping lost on the board three times before D65, because exit took the log's pages down one at a time on one thread, and the clock runs to exit. Threads that are done now share that release. Without the release, T reads about 5 ms more (D80).
 - A line for an hour already claimed restarts the whole run. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. No seed does this, but the spec doesn't rule it out.
 - Finishing limits T on the box: it is about 30% of all thread time there, against 17% locally, and with three finishers in place of four T read 0.0226 against 0.0192 (D58). D48 timed it at 8.5 ms, before D60 cut the text step from 40M to 26M ticks summed over threads. We haven't timed finishing again since, and found no cheaper scatter.
 
@@ -275,6 +275,11 @@ Checks on the mapped build: grid 44/44, threads 234/234, stress 0 wrong in 300, 
 
 **D78.** Only seven threads releasing the log, so that the other readers leave and free the hyper-threads next to the finishers (`48a8919d`). Locally T -2.5 to -3.5% over 300 paired runs. Six board runs: T 16.0 to 16.7 and one 18.8, against 15.7 to 16.1 for D77's fast runs. Local timing misled us again. Rejected.
 
+
+**D79.** Blocks of half a page (`925b1970`), for fewer unused record words. Alternated with D77's build on the board: 12 runs against 9, final estimate +0.4%, and 21 runs against 22 over a longer stretch, -0.5%; M about equal in the alternation. A tie, so the simpler D77 stays. `hammer.py`: 104,496 runs, 0 bad.
+
+**D80.** D77's build with no release loop, and one binary search for a big rank (`48999faf`, S 345). Four runs: T 20.7, 21.6, 21.0, 22.3 ms, against about 15.9 (`run-b07d2bf18784`, `run-28e6ad51ca86`, `run-0efa036f36a9`, `run-9146c707f40b`). So the shared release is worth about 5 ms on the box, and settles what D66's confounded pair left open. Locally the same removal read -1 to -3%, as this PC's exit is cheaper. Rejected.
+
 ## What didn't work
 
 Local timing misled us often on this track, because this PC has a smaller L1 and a virtual machine's costly kernel entries, so the board judged anything that wasn't a plain cut in instructions.
@@ -317,12 +322,13 @@ Local timing misled us often on this track, because this PC has a smaller L1 and
 - Sanitizers, last run on D68's build, before D70 to D77 changed its threads and locks. Address sanitizer: no reports on seeds 1 and 2, tiny and sample, with the right hashes. Thread sanitizer: the right hashes. We classified its reports only for the most common types, around `Arc<Order>` and the allocator's calls in `write_hour`, with an uninstrumented standard mutex, and believe them false alarms. We haven't examined them all.
 - `hammer.py` on the final build, seed 20261103: 102,619 runs at 1 to 64 threads, 0 bad.
 - An adversarial review of the final code found no wrong answer on input the spec allows. It found one crash that the generator can't reach: a hand-built log of 1,842 keys of two 64-byte lines each, in the same order on every thread, makes `id_of` abort, as lost compare-and-swaps waste lines until the ids run out. Its other limits are outside the spec too, and are in the [README](README.md#limits).
+- **`tools/verify.py --full`** on commit `dd99294`, whose source is the final one: generator seeds 35/35, answer-preserving rewrites 4/4, limit cases 5/5, 5 identical runs yes, 44/44 outputs matching the naive reference's SHA-256.
+- **Determinism drill:** `quick.sh --repeat 5`, 39/39 pinned to two CPUs, and 39/39 with two `yes` running as well.
 - **Reproduce it yourself:** `python3 tools/verify.py --full` (Docker, git and Python only).
 
 ## With another 24 hours
 
 - **Find what's left of the slow mode (D75).** T reads about 0.018 instead of 0.0158 in some runs, on identical code. Only the box shows it.
-- **Settle the release.** D66's pair ran in a slow stretch, so what the release is worth alone is unknown. Alternating board runs with and without it would show.
 - **Fix the abort in `id_of`.** A rare case: lost compare-and-swaps waste lines of the key table, and 1,842 two-line keys in the same order on every thread can use up the ids. No generated input does this.
 - **Time finishing again.** The 8.5 ms is from before D60. With three finishers T read 0.0226, so finishing is where the box's time is; what is left to cut there is not known. The radix variants we tried lost (D63).
 - **Prices.** 1% of T is 0.5% of K, 1 MB of M is about 1.3% of K (0.2 / 15.7), and 10 lines of S are 0.4%. M is still 5.6 MB above the output, which holds records of hours not yet finished and four finishers' scratch. The free list of arrays that cut cycles 5% cost 5.5 MB (D63), a bad trade at those prices.

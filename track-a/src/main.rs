@@ -41,6 +41,9 @@ const ID_SHIFT: u32 = 20;
 const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
+/// Bytes of the log that a thread takes out of the address space at a time, at the end.
+const RELEASE: usize = 1 << 23;
+
 /// Spare bytes after the log, so that a load at a short fixed distance from a line needs no check of
 /// its own. Whatever a line holds, the farthest load ends 185 bytes after its start: at most 44 to the
 /// endpoint, two blocks to find its closing space, and 13 past that for the latency's load.
@@ -394,15 +397,15 @@ fn format_hour(h: usize, recs: &[u32], ends: &[u32], big: &[u64], order: &Order,
         let n @ 1.. = group.len() else { continue };
         let errors = group.iter().map(|r| r & 1).sum::<u32>() as u64;
         // Nearest rank, as the spec defines it. A group's big latencies are its last records, as they
-        // sort highest, so a rank among them reads the real value from `big`, as many places from the end
-        // of the id's as it is from the end of the group.
+        // sort highest, so a rank among them reads the real value from `big`, by two binary searches.
         let pct = |p: usize| {
-            let rank = (p * n + 99) / 100;
-            let latency = group[rank - 1] >> 1 & BIG_LATENCY;
-            if latency < BIG_LATENCY {
-                return u64::from(latency);
+            let index = (p * n + 99) / 100 - 1;
+            let small = |r: &u32| r >> 1 & BIG_LATENCY < BIG_LATENCY;
+            if small(&group[index]) {
+                return u64::from(group[index] >> 1 & BIG_LATENCY);
             }
-            big[big.partition_point(|e| e >> 32 <= id as u64) - (n + 1 - rank)] & 0xFFFF_FFFF
+            let first = big.partition_point(|e| e >> 32 < id as u64);
+            big[first + index - group.partition_point(small)] & 0xFFFF_FFFF
         };
         let (p50, p95, p99) = (pct(50), pct(95), pct(99));
         let rate = errors * 1_000_000 / n as u64;
@@ -524,15 +527,15 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         order: Mutex::default(),
     };
     let digits: Vec<usize> = (0..1024).collect();
-    let (cursor, next_out) = (AtomicUsize::new(0), Mutex::new(0));
+    let (cursor, next_out, released) = (AtomicUsize::new(0), Mutex::new(0), AtomicUsize::new(0));
+    // A lower bound on the log position of any line each thread may yet read.
+    let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
     // Tying a segment's size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
     // smaller than a line on tiny inputs.
     // Threads faulting in the same large folio of the page cache sleep on its lock, so on a big log
     // they stay out of each other's folios.
     let unit = if end < 1 << 26 { 1 } else { 1 << 20 };
     let segment = (end / threads / 64 + 1).next_multiple_of(unit);
-    // A lower bound on the log position of any line each thread may yet read.
-    let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
     // What each thread does: finish an hour whenever one is due, if it's a finisher, and read.
     let worker = &|me: usize| {
         // The first few threads also finish hours: enough to keep up with the rest, and few, since each
@@ -575,6 +578,16 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             thread::yield_now();
         };
         parse(log, &table, &hours, next_segment);
+        // Exit would take the log's pages out of the address space one by one on the last thread, and
+        // the clock counts that, so whichever threads are done share the work first. From the log's
+        // start on, as threads still reading are near its end, and a page taken from them just comes back.
+        let claims = (0..).map(|_| released.fetch_add(RELEASE, Relaxed));
+        for at in claims.take_while(|&at| at < end) {
+            let page = log[at..].as_ptr().cast_mut();
+            // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`
+            // is a multiple of a page, and a failure would only leave them for exit.
+            unsafe { madvise(page, RELEASE.min(end - at), MADV_DONTNEED) };
+        }
     };
     // This thread is one of them, so that no more threads than CPUs ever want to run: one that starts
     // on a busy CPU can wait there for a whole tick, and then it holds every hour up.

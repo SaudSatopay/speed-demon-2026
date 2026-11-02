@@ -222,6 +222,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 186 | c-kp2 restored | chosen source at HEAD until these are judged | pending | — | — | — |
 | 187 | c-ms scout and aligned mapping together, sample 1 | c-scout T 0.0190, c-map M about 10.0 | pending | — | — | — |
 | 188 | c-ms sample 2 | second sample | pending | — | — | — |
+| 189 | c-ms sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -601,6 +602,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D187.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
 
 **D188.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
+
+**D189.** exp: judged over 3 samples against c-kp2 46.84, c-map 47.01, c-scout 47.02
 
 ## What didn't work
 

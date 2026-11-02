@@ -2,8 +2,6 @@
 
 Aggregates per country, from a hostile 200 MB CSV joined against a region table. Rust, standard library only.
 
-Current trial: v24, S437; board T and M are pending. See [PERF.md](PERF.md).
-
 ## Where everything is
 
 | What | Where |

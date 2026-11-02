@@ -21,7 +21,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering::*};
-use std::{arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
+use std::{arch::asm, arch::x86_64::*, collections::BTreeSet, fs::File, hint::black_box, thread};
 use std::{io::BufWriter, io::Write, mem::offset_of, os::fd::AsRawFd, ptr::null_mut, sync::Mutex};
 
 type Start = unsafe extern "C" fn(*mut u8) -> *mut u8;
@@ -145,42 +145,32 @@ const SLOTS: usize = HOMES + 32;
 const TRIES: usize = 64;
 /// Bytes of stack per thread, enough for its rows and lists.
 const STACK: usize = 40 << 10;
-/// Longer names use the exact locked fallback; ordinary generated names are at most 25 bytes.
-const INLINE_BYTES: usize = 31;
-/// The country bitmap covers the 240 countries. Unmatched names use a separate sparse bitset.
-const COUNTRY_BYTES: usize = 30;
-/// A slot's arena offsets are local to its 2048-slot segment.
-const ARENA_SLOT_BITS: usize = 11;
-const ARENA_SLOTS: usize = 1 << ARENA_SLOT_BITS;
-const ARENA_WORDS: usize = ARENA_SLOTS * 4;
-const ARENA_SHARDS: usize = SLOTS.div_ceil(ARENA_SLOTS);
+/// Names longer than this get no slot. No generated name has been seen beyond 25 bytes.
+const INLINE_BYTES: usize = 32;
+/// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones. A `Row`
+/// is the size of a cache line and aligned to one, so that the loads never split across two.
+static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 
-/// One name's exact country bitmap and an offset to its exact raw bytes in the arena.
-#[repr(C, align(32))]
-struct NameSlot {
-    countries: [AtomicU8; COUNTRY_BYTES],
-    key: AtomicU16,
-}
-const _: [(); 32] = [(); std::mem::size_of::<NameSlot>()];
-
-/// The key arena is separate from the huge-page table. Pages are touched as key bytes are written.
-#[repr(C, align(4096))]
-struct NameArena {
-    words: [[AtomicU64; ARENA_WORDS]; ARENA_SHARDS],
-}
-// SAFETY: zero is a valid value of each atomic.
-static ARENA: NameArena = unsafe { std::mem::zeroed() };
-static ARENA_NEXT: [AtomicUsize; ARENA_SHARDS] = [const { AtomicUsize::new(0) }; ARENA_SHARDS];
-
-/// Two 32-byte slots share each line. Byte tags filter by exact length and three hash bits;
-/// every matching tag still compares all key bytes.
+/// Distinct names per country, in one table shared by all threads, with no locks. Each slot holds a
+/// name's bytes, padded with ones, and one bit per country that has seen this name. The tags, two bytes
+/// per slot, zero while it's free and then 16 bits of the hash of its name, say which slot to open, so
+/// a lookup costs one cache miss, with no probing through other names' lines. A name's home is a slot,
+/// and one vector holds the tags of the 32 slots from there, so it costs the same in any of them, with
+/// no branch. A name takes the first slot free in its window. Only when all are full does it move on,
+/// by a distance its tag sets, so that names that spill don't fill the windows next door, which would
+/// make long runs of them full. A home for every slot, not every few, leaves far fewer names outside
+/// their first 32. Names are compared in full, as raw bytes, which
+/// encode the value one to one. The slots are insert-only: a key's words go from zero to their final
+/// value once, and a key has no zero bytes, so a slot that compares equal is complete. A name that gets
+/// no slot goes to a locked set instead. Slots stay full, so it never gets one later.
+///
+/// All of it is zeros in the program's image until it's touched, and the alignment gives it huge pages.
 #[repr(C, align(2097152))]
 struct Memory {
-    slots: [NameSlot; SLOTS],
-    unmatched: [AtomicU8; SLOTS.div_ceil(8)],
-    tags: [AtomicU8; SLOTS],
+    words: [[AtomicU64; 8]; SLOTS], // Each one cache line: four words of key, then 256 bits.
+    tags: [AtomicU16; SLOTS],
     regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
-    index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code.
+    index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
     stacks: [[AtomicU64; STACK / 8]; 64], // More threads than the box has, or any test asks for.
 }
 // SAFETY: zero is a valid value of each atomic.
@@ -214,127 +204,92 @@ fn parse_regions(text: &'static [u8], len: usize) {
     }
 }
 
-/// A hash of the name's length and first 8 bytes, used to filter the 32-slot window. The byte tag
-/// stores the exact length and low hash bits; the key offset carries three more hash bits.
-fn home_and_tag(len: usize, head: u64) -> (usize, u8, u16) {
-    // One more than the length, or an empty name's tag would be zero and mean a free slot.
+/// A hash of the name's length and first 8 bytes, with whatever follows it masked off: the pool's
+/// names rarely share them. BZHI reads only the low 8 bits of its count, so a name of 32 bytes or
+/// more can keep extra bytes. That's still the same word for the same name, and the key decides
+/// anyway. A test build swaps this for a constant, so that every key collides and any logic that
+/// trusts a hash without comparing the key shows up as a wrong answer. Returns the name's home, and
+/// the hash's low 16 bits for its tag.
+fn home_and_tag(text: &[u8], start: usize, len: usize) -> (usize, u16) {
+    // SAFETY: a name starts inside the text and the padding covers the load. BZHI is in BMI2 and
+    // CRC32 in SSE4.2, and x86-64-v3 includes both.
+    let head = unsafe { _bzhi_u64(load_u64(text, start), (len as u32) << 3) };
+    // One more than the length, or the empty name would hash to zero, and its tag mean a free slot.
     let crc = unsafe { _mm_crc32_u64(len as u64 + 1, head) as u32 };
     let hash = if cfg!(sd_const_hash) { 0 } else { crc };
-    let tag = (((len as u8) << 3) | (hash as u8 & 0x07)).max(1);
-    (
-        (u64::from(hash) * HOMES as u64 >> 32) as usize,
-        tag,
-        hash as u16,
-    )
+    ((u64::from(hash) * HOMES as u64 >> 32) as usize, hash as u16)
 }
 
-/// One bit per slot of the 32 in window, set where the tag matches.
-fn slots_with(window: __m256i, tag: u8) -> u32 {
+/// One bit per slot of the 32 in `window`, set where the tag is `tag`. Tags are aligned, so a vector
+/// load can't tear one, and a tag of 16 bits rarely matches another name before its own.
+fn slots_with(window: [__m256i; 2], tag: u16) -> u32 {
     // SAFETY: x86-64-v3 has AVX2.
     unsafe {
-        let is = _mm256_cmpeq_epi8(window, _mm256_set1_epi8(tag as i8));
-        _mm256_movemask_epi8(is) as u32
+        let is = |tags| _mm256_cmpeq_epi16(tags, _mm256_set1_epi16(tag as i16));
+        let bytes = _mm256_packs_epi16(is(window[0]), is(window[1]));
+        _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xD8>(bytes)) as u32
     }
 }
 
-/// Whether a slot holds the same name. Its nonzero offset is published after the exact key words.
-/// The tag and hash narrow candidates; only exact byte comparison establishes equality.
+/// The key of a name of at most `INLINE_BYTES`.
+fn key(text: &[u8], start: usize, len: usize) -> __m256i {
+    // SAFETY: the name starts inside the text and the padding covers the load. Its length keeps
+    // the other load inside the table. x86-64-v3 has AVX2.
+    unsafe {
+        let pad = _mm256_loadu_si256(PADS.0.as_ptr().byte_add(INLINE_BYTES - len).cast());
+        _mm256_or_si256(_mm256_loadu_si256(text.as_ptr().add(start).cast()), pad)
+    }
+}
+
+/// Whether the slot at this offset in bytes holds the name, of at most `INLINE_BYTES`. A slot whose
+/// writer hasn't finished with it doesn't.
 ///
 /// # Safety
-/// The slot must be occupied and its tag must include len.
-unsafe fn holds(slot: usize, head: u64, text: &[u8], start: usize, len: usize) -> bool {
-    let key = &MEMORY.slots[slot].key;
-    let stored = loop {
-        let value = key.load(Acquire);
-        if value != 0 {
-            break usize::from(value) - 1;
-        }
-        std::hint::spin_loop();
-    };
-    let shard = slot >> ARENA_SLOT_BITS;
-    if len == 0 {
-        return true;
-    }
-    // SAFETY: the mapped record bytes have padding for these loads.
-    let expected = head;
-    if ARENA.words[shard][stored].load(Relaxed) != expected {
-        return false;
-    }
-    if len <= 8 {
-        return true;
-    }
-    // SAFETY: the mapped record bytes have padding for these loads.
-    let expected = unsafe { _bzhi_u64(load_u64(text, start + 8), ((len - 8).min(8) * 8) as u32) };
-    if ARENA.words[shard][stored + 1].load(Relaxed) != expected {
-        return false;
-    }
-    if len <= 16 {
-        return true;
-    }
-    // SAFETY: the mapped record bytes have padding for these loads.
-    let expected = unsafe { _bzhi_u64(load_u64(text, start + 16), ((len - 16).min(8) * 8) as u32) };
-    if ARENA.words[shard][stored + 2].load(Relaxed) != expected {
-        return false;
-    }
-    if len <= 24 {
-        return true;
-    }
-    // SAFETY: the mapped record bytes have padding for these loads.
+/// `at` must be where a slot's words start.
+unsafe fn holds(at: usize, text: &[u8], start: usize, len: usize) -> bool {
+    // SAFETY: the slot is inside the table. x86-64-v3 has AVX2.
     unsafe {
-        _bzhi_u64(load_u64(text, start + 24), ((len - 24) * 8) as u32)
-            == ARENA.words[shard][stored + 3].load(Relaxed)
+        let stored = MEMORY.words.as_ptr().byte_add(at);
+        let differ = _mm256_xor_si256(key(text, start, len), _mm256_loadu_si256(stored.cast()));
+        _mm256_testz_si256(differ, differ) == 1
     }
 }
 
-/// Saves the raw key once. The slot segment bounds its word offset to 16 bits.
-unsafe fn save_name(slot: usize, text: &[u8], start: usize, len: usize) {
-    let shard = slot >> ARENA_SLOT_BITS;
-    let words = len.div_ceil(8).max(1);
-    let offset = ARENA_NEXT[shard].fetch_add(words, Relaxed);
-    assert!(offset + words <= ARENA_WORDS);
-    for word in 0..words {
-        let at = word * 8;
-        let take = len.saturating_sub(at).min(8);
-        let value = if take == 0 {
-            0
-        } else {
-            // SAFETY: the mapped record bytes have padding for this load.
-            unsafe { _bzhi_u64(load_u64(text, start + at), (take * 8) as u32) }
-        };
-        ARENA.words[shard][offset + word].store(value, Relaxed);
-    }
-    MEMORY.slots[slot].key.store((offset + 1) as u16, Release);
-}
-
-/// Finds the name's slot, or takes a free one for it. Longer keys use the exact locked fallback.
+/// Finds the name's slot, or takes a free one for it, and returns its offset in bytes. Only a wrong
+/// guess or a new name comes here. A long name, or one that finds all its `TRIES` windows full, gets
+/// no slot.
 #[cold]
-fn find(text: &[u8], start: usize, len: usize, head: u64) -> Option<usize> {
-    if len > INLINE_BYTES {
-        return None;
-    }
-    let (mut home, tag, step) = home_and_tag(len, head);
-    for _ in 0..TRIES {
-        // SAFETY: home is below HOMES, leaving 32 tags through the end of SLOTS.
+fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
+    let (mut home, hash) = home_and_tag(text, start, len);
+    let (tag, tries) = (hash.max(1), if len <= INLINE_BYTES { TRIES } else { 0 });
+    // Each tag only ever changes from zero to its final tag, and a name only takes a slot when every
+    // one before it on its walk is taken. The walk is the same on every thread, so two threads
+    // inserting one name both come to the same free slot, one loses the exchange, and it then sees
+    // the winner's tag there.
+    for _ in 0..tries {
+        // SAFETY: a home is below `HOMES`, so 32 below the end of the tags, and the load needs no
+        // alignment.
         let window = unsafe { std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast()) };
         let mut hits = slots_with(window, tag) | slots_with(window, 0);
         while hits != 0 {
             let at = home + hits.trailing_zeros() as usize;
             hits &= hits - 1;
-            let entry = &MEMORY.tags[at];
-            if entry.load(Relaxed) == 0 && entry.compare_exchange(0, tag, Relaxed, Relaxed).is_ok()
-            {
-                // SAFETY: this thread owns the empty tag until it publishes the key offset.
-                unsafe { save_name(at, text, start, len) };
-                return Some(at);
+            let (slot, words) = (&MEMORY.tags[at], &MEMORY.words[at]);
+            if slot.load(Relaxed) == 0 && slot.compare_exchange(0, tag, Relaxed, Relaxed).is_ok() {
+                // SAFETY: both are 32 bytes. x86-64-v3 has AVX2.
+                let key: [u64; 4] = unsafe { std::mem::transmute(key(text, start, len)) };
+                words.iter().zip(key).for_each(|(w, k)| w.store(k, Release));
+                return Some(at * 64);
             }
-            if entry.load(Relaxed) == tag
-                // SAFETY: the tag includes the exact length; the arena comparison checks every byte.
-                && unsafe { holds(at, head, text, start, len) }
-            {
-                return Some(at);
+            if slot.load(Relaxed) == tag {
+                while words[3].load(Acquire) == 0 {}
+                // SAFETY: `at * 64` is where a slot's words start.
+                if unsafe { holds(at * 64, text, start, len) } {
+                    return Some(at * 64);
+                }
             }
         }
-        home = (home + 33 + usize::from(step)) % HOMES;
+        home = (home + 33 + usize::from(hash)) % HOMES;
     }
     None
 }
@@ -411,7 +366,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
 fn parse_records(text: &[u8], len: usize, rows: &mut [Row; 256]) {
     // The positions just past commas and line ends outside quotes, after a record's start, so a
     // record's five come after the position it starts at.
-    let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0, 0); LISTED / 5]);
+    let (mut listed, mut found) = ([0u32; LISTED], [(0, 0, 0); LISTED / 5]);
     // The text starts at a record's start, so outside quotes.
     let (mut count, mut scan, mut odd_so_far) = (1, 0, 0);
     while scan < len {
@@ -435,14 +390,9 @@ fn parse_records(text: &[u8], len: usize, rows: &mut [Row; 256]) {
 /// Adds up a chunk of whole records from `text`, given five positions for each: where it starts, and
 /// just past its first four separators. `found` is room for each record's guessed slot, cents, and id
 /// and region together.
-fn add_records(
-    text: &[u8],
-    listed: &[u32],
-    found: &mut [(u32, u32, u64, u64)],
-    rows: &mut [Row; 256],
-) {
+fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows: &mut [Row; 256]) {
     let (records, _) = listed.as_chunks::<5>();
-    let (slots, regions) = (MEMORY.slots.as_ptr(), MEMORY.regions.as_ptr());
+    let (words, regions) = (MEMORY.words.as_ptr(), MEMORY.regions.as_ptr());
     for (positions, slot) in records.iter().zip(found.iter_mut()) {
         let [mut start, name_at, note_at, region_at, amount_at] = positions.map(|at| at as usize);
         // SAFETY: every position is inside the text, or just after it, so the padding covers the
@@ -465,29 +415,20 @@ fn add_records(
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
             _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
-            let len = (note_at - name_at).saturating_sub(3);
-            let head = _bzhi_u64(load_u64(text, name_at + 1), (len as u32) << 3);
-            let (home, tag, _) = home_and_tag(len, head);
+            let (home, tag) = home_and_tag(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong
-            // guess costs a search. The byte tag stores length and three hash bits; three more
-            // hash bits share the key offset. Tag zero stays free, and all matches compare every
-            // key byte.
+            // guess costs a search. A name's tag is the low 16 bits of its hash, or 1 for zero, which
+            // means free; here a zero finds a free slot, which is a wrong guess too, and costs one
+            // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
-            let matches = slots_with(window, tag);
-            let guess = home + matches.trailing_zeros() as usize;
-            _mm_prefetch::<_MM_HINT_ET0>(slots.add(guess).cast());
-
+            let guess = (home + slots_with(window, tag).trailing_zeros() as usize) * 64;
+            _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
-            *slot = (
-                if matches == 0 { u32::MAX } else { guess as u32 },
-                cents as u32,
-                id_region,
-                head,
-            );
+            *slot = (guess as u32, cents as u32, id_region);
         }
     }
-    for (positions, &(guess, cents, id_region, head)) in records.iter().zip(found.iter()) {
+    for (positions, &(guess, cents, id_region)) in records.iter().zip(found.iter()) {
         let [_, name_at, note_at, region_at, _] = positions.map(|at| at as usize);
         // SAFETY: the first pass kept the region inside the table, and its writes all came before.
         let country = unsafe { regions.add((id_region >> 32) as usize).cast::<u8>().read() };
@@ -516,31 +457,24 @@ fn add_records(
         // fields of no quotes or two both coming to nothing.
         row[5] += (name - name_quotes / 2).saturating_sub(1) as i64;
         row[7] += (both - name - 1 - (quotes - name_quotes) / 2).saturating_sub(1) as i64;
-        let (start, len) = (name_at + 1, name.saturating_sub(2));
-        // SAFETY: guess came from the first pass, and find returns a valid slot too.
+        let (start, len) = (name_at + 1, name.wrapping_sub(2));
+        // SAFETY: `guess` came from the first pass, and `find` returns a slot too. The name starts
+        // inside the text. A slot's 256 bits start 4 words in, and a byte can't index past them.
         unsafe {
-            let at = if guess != u32::MAX
-                && len <= INLINE_BYTES
-                && holds(guess as usize, head, text, start, len)
-            {
+            let at = if len <= INLINE_BYTES && holds(guess as usize, text, start, len) {
                 guess as usize
-            } else if let Some(at) = find(text, start, len, head) {
+            } else if let Some(at) = find(text, start, name.saturating_sub(2)) {
                 at
             } else {
-                let name = text[start..start + len].to_vec();
+                let name = text[start..start + name.saturating_sub(2)].to_vec();
                 row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country)));
                 continue;
             };
-            if country == 0 {
-                let mask = 1 << (at & 7);
-                let old = MEMORY.unmatched[at >> 3].fetch_or(mask, Relaxed);
-                row[6] += i64::from(old & mask != 0);
-            } else {
-                let bit = usize::from(country) - 1;
-                let mask = 1 << (bit & 7);
-                let old = MEMORY.slots[at].countries[bit >> 3].fetch_or(mask, Relaxed);
-                row[6] += i64::from(old & mask != 0);
-            }
+            // Nine records in ten set a new bit, so a plain load first would rarely save the locked
+            // write, and the prefetch has already asked to own the line. BTS finds the word itself, and
+            // leaves the old bit in the carry, which adds one to the row's repeats if it had been set.
+            asm!("lock bts [{} + {} + 32], {}", "adc qword ptr [{} + 48], 0",
+                in(reg) words, in(reg) at, in(reg) usize::from(country), in(reg) row.as_mut_ptr());
         }
     }
 }
@@ -567,18 +501,11 @@ extern "C" fn main() -> i32 {
     // The threads parse the whole file and merge their rows, every index's row, index 0 being
     // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
     // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(4096);
-    // Keep the side arena on 4 KiB pages so unused capacity stays uncharged.
-    unsafe {
-        madvise(
-            (&raw const ARENA).cast(),
-            std::mem::size_of::<NameArena>(),
-            15,
-        )
-    };
-    // Keep the table on regular pages, including just the stacks this run uses.
-    // SAFETY: the range is page-aligned and stays inside MEMORY.
-    unsafe { madvise((&raw const MEMORY).cast(), bytes, 15) };
+    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(HUGE);
+    // Whole huge pages only, even for the last part: small pages cost more time than the rest of that
+    // huge page costs in memory. The size of `MEMORY` is a multiple of them, so this stays inside it.
+    // SAFETY: this is only advice about pages of `MEMORY`.
+    unsafe { madvise((&raw const MEMORY).cast(), bytes, 23) };
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));

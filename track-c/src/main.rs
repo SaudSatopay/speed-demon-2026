@@ -516,7 +516,9 @@ extern "C" fn main() -> i32 {
             parsed.fetch_add(1, Release);
         }
         // Not a barrier: nobody should wait for a thread that hasn't started, or be woken up.
-        while parsed.load(Acquire) < line_parts {}
+        while parsed.load(Acquire) < line_parts {
+            thread::yield_now();
+        }
         let mut rows = [EMPTY_ROW; 256];
         // 12 segments per thread: when they run out, each thread still has its last to finish, and
         // the threads done first sit idle. Fine ones keep that short, and cost no shootdown.

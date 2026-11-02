@@ -1,7 +1,7 @@
 //! Track B (Index): boolean and phrase queries over a 254 MB corpus.
 //!
 //! One scan of the corpus answers every query as it goes, so no postings are ever stored. The threads
-//! share every phase but the plan's decisions, which take one thread. In order:
+//! share every phase but the plan's decisions, which take two threads. In order:
 //!
 //! 1. **Parse** (`parse_queries`). The queries are read first, into one table of their terms, so that
 //!    only those terms are ever looked up.
@@ -411,7 +411,7 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize, helper: thread::Threa
     let (next_part, next_term) = (AtomicUsize::new(0), AtomicUsize::new(FIRST_TERM));
     let mut parts = on_threads(threads, || {
         let part = claim(&next_part, text.len() / threads + 1, text.len()).unwrap_or_default();
-        // The threads have started, which mapping their stacks would have waited on the helper's page faults.
+        // These threads have their stacks now: mapping one would have waited on the helper's page faults.
         (part.end == text.len()).then(|| helper.unpark());
         (part.start == 0).then(|| table.get_or_init(new_table));
         let room = part.len() / 8;
@@ -1507,10 +1507,8 @@ pub extern "C" fn main() -> i32 {
     let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = if asked > 0 { asked } else { allowed };
     let (docs, queries) = (map_file(&data, "docs.txt"), map_file(&data, "queries.txt"));
-    // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
-    // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
-    // faults. They wait for the parse, whose new threads need the lock that this holds. An old kernel
+    // faults. They wait for the sample, as new threads need the lock that this holds. An old kernel
     // doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
     // One more thread starts them and creates the output, so that this one needn't wait for either.
     let helper = thread::spawn(move || {
@@ -1525,6 +1523,8 @@ pub extern "C" fn main() -> i32 {
         }
         file
     });
+    // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
+    // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     let mut plan = parse_queries(queries, threads, 1 << 16, helper.thread().clone());
     // The threads for the scan start now, before the mappers hold up anything that maps memory, and from one
     // thread of their own, so that this one needn't wait. They sleep until the plan is done.
@@ -1537,8 +1537,9 @@ pub extern "C" fn main() -> i32 {
     };
     thread::scope(|scope| {
         scope.spawn(|| (1..threads).for_each(|_| drop(scope.spawn(&work))));
-        // The mappers start after the sample, as one thread makes the plan and the others are free for them. The
-        // sample's threads leave them and `make_plan`'s extra thread their stacks, as a new one would wait.
+        // The mappers start after the sample, as the plan takes two threads and the others are free for them.
+        // The sample's finished threads leave behind the stacks that they and `make_plan`'s extra thread reuse,
+        // as mapping a new stack would wait on the mappers.
         let df = sample_terms(docs, &plan.terms, threads.min(5));
         helper.thread().unpark();
         make_plan(&mut plan, docs, df);

@@ -212,6 +212,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 176 | c-kp3 sample 2 | second sample | pending | — | — | — |
 | 177 | c-kp2 sample 5 | alternate | pending | — | — | — |
 | 178 | c-kp3 sample 3 | third sample | pending | — | — | — |
+| 179 | c-kp2 restored, sample 6 | chosen source at HEAD | pending | — | — | — |
 
 ## Decision log
 
@@ -571,6 +572,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D177.** exp: judged over 3 samples against c-kp2 46.85
 
 **D178.** exp: judged over 3 samples against c-kp2 46.85
+
+**D179.** exp: judged over 3 samples against c-kp2 46.85
 
 ## What didn't work
 

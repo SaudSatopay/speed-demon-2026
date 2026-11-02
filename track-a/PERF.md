@@ -2,11 +2,11 @@
 
 **Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D82), at S 343. Our best run is of the same design at S 352: `run-4e5bbad388d3`, **0.0155 s / 16.4 MB**, K = **58.41**. The final build's best so far is `run-d5636fc5b2c8`, 0.0157 s / 15.5 MB, K = 58.38. Most board runs of this build read T 0.0157 to 0.0161, and some runs read 0.018 to 0.020. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
 
-**Current trial:** five threads may finish hours during reading, instead of four; S remains 343. Quick 39/39, six-thread-count sweep 234/234, constant-hash tiny 20/20, and official pre-push grid 44/44 pass. First board sample run-378a6c4d0263: T 0.01995 s, M 19.9 MB, K 49.74. All tracks were slow in this batch; repeat before deciding.
-
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
 ## Where it loses
+
+- **Five finishers (trials 41fe7e2 and b7d9c3c):** the board returned T 0.01995 / 0.01608 s, M 19.9 / 17.2 MB, K 49.74 / 57.05. The four-finisher best remains K 58.58 (0.0155 s / 16.1 MB); the extra finisher did not pay. Reverted.
 
 - S is 343 code lines against the reference's 56, which costs (56/343)^0.15, K x 0.76; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
 - M is 15.5 to 17.0 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.

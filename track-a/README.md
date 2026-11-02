@@ -2,8 +2,6 @@
 
 Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Rust, standard library only.
 
-Current trial: five finishing threads; board result pending. See [PERF.md](PERF.md).
-
 ## Where everything is
 
 | What | Where |

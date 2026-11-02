@@ -236,17 +236,17 @@ flowchart LR
 
 ## Board numbers
 
-This table is refreshed from the board; the chart above is a rounded snapshot of it. The numbers come from the live board's feed at **2026-11-02 13:10:22 UTC (Mon 18:40 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
+This table is refreshed from the board; the chart above is a rounded snapshot of it. The numbers come from the live board's feed at **2026-11-02 14:45:18 UTC (Mon 20:15 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
 
 | Track | Best run | Commit | T (s) | M (MB) | S | K | Speed points | Rank by K | Latest run: K |
 |---|---|---|---|---|---|---|---|---|---|
-| A | `run-a3d80d9d43be` | `c438b24` | 0.0156 | 16.1 | 343 | 58.58 | 88.4 | 3 of 136 | 56.43 (`run-444ec5d75e48`) |
-| B | `run-4d59d4dfba18` | `4d9e164` | 0.0643 | 29.2 | 1076 | 44.70 | 82.5 | 2 of 109 | 43.55 (`run-04ca7a5fe873`) |
-| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 7 of 116 | 47.00 (`run-c263798748db`) |
-| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 16 of 116 | 27.25 (`run-d29c920eeaa9`) |
-| Overall | | | | | | | 84.84 | 3 of 115 | |
+| A | `run-a3d80d9d43be` | `c438b24` | 0.0156 | 16.1 | 343 | 58.58 | 88.4 | 3 of 133 | 58.24 (`run-6cadaf29bbe1`) |
+| B | `run-4d59d4dfba18` | `4d9e164` | 0.0643 | 29.2 | 1076 | 44.70 | 82.5 | 2 of 102 | 43.60 (`run-d224ac60ff4d`) |
+| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 6 of 110 | 46.33 (`run-3a6c8f697d8b`) |
+| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 15 of 112 | 27.22 (`run-10b8011d566a`) |
+| Overall | | | | | | | 84.84 | 3 of 109 | |
 
-The overall row is the board's: speed points only, over the 115 teams with three scored tracks. The judges' share of the score comes after the freeze.
+The overall row is the board's: speed points only, over the 109 teams with three scored tracks. The judges' share of the score comes after the freeze.
 
 A best run can come from an earlier commit than the head of this branch; the commit column says which. The headline at the top of a PERF.md can lag this table until the freeze. Where they differ, this table is newer. Every step in a PERF.md names the board run that measured it, and the failed experiments are kept too.
 
@@ -319,7 +319,7 @@ Our first push came 4 minutes 50 seconds after kickoff. GitHub's activity log sh
 
 ## AI use
 
-Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). Every decision and number in the PERF.md files was checked, and can be explained, by the author.
+Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). The author directed the work and followed its results on the board; board numbers carry run IDs that anyone can check.
 
 ## Licence
 

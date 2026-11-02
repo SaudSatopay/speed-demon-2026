@@ -68,4 +68,4 @@ None. `mmap`, `madvise` and `prctl` are declared directly against glibc, which `
 
 ## AI use
 
-Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). Every decision and number in PERF.md was checked, and can be explained, by the author.
+Written with AI assistance (Claude Code and Codex (GPT-6 Luna)). The author directed the work and followed its results on the board; board numbers carry run IDs that anyone can check.

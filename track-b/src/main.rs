@@ -1460,18 +1460,23 @@ pub extern "C" fn main() -> i32 {
     // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
     // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
-    // faults. They wait for the parse, whose new threads need the lock that this holds. An old kernel
-    // doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
+    // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
+    // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
     // One more thread starts them and creates the output, so that this one needn't wait for either.
     let helper = thread::spawn(move || {
+        let mut mappers = vec![];
+        for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
+            mappers.push(thread::spawn(move || {
+                thread::park();
+                // SAFETY: this only maps pages of the mapping, and a part starts at a page.
+                unsafe { madvise(part.as_ptr(), part.len(), 22) };
+            }));
+        }
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
         // Fresh pages for what the plan and the scan allocate, so that they needn't stop to fault them in.
         drop(std::hint::black_box(vec![1u8; 12 << 20]));
         thread::park();
-        for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
-            // SAFETY: this only maps pages of the mapping, and a part starts at a page.
-            thread::spawn(move || unsafe { madvise(part.as_ptr(), part.len(), 22) });
-        }
+        mappers.iter().for_each(|mapper| mapper.thread().unpark());
         file
     });
     let mut plan = parse_queries(queries, threads, 1 << 16);

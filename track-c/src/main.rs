@@ -520,7 +520,7 @@ extern "C" fn main() -> i32 {
             thread::yield_now();
         }
         let mut rows = [EMPTY_ROW; 256];
-        // 12 segments per thread: when they run out, each thread still has its last to finish, and
+        // 24 segments per thread: when they run out, each thread still has its last to finish, and
         // the threads done first sit idle. Fine ones keep that short, and cost no shootdown.
         while let Some((pos, end)) = part(records, &segments, threads * 12, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);

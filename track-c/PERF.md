@@ -183,6 +183,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 138 | Text and region prefetches into L2, not L1 (c-q1) | A core has 16 fill buffers for two threads, and a chunk asks for about 50 lines at once; a prefetch to L2 should give its buffer back early, so slot prefetches stop queueing | pending | — | — | — |
 | 139 | Back to c-x1 for more samples | One run so far, T 0.0195; c-q1 T 0.0199 and c-n1 0.0197 show no gain | pending | — | — | — |
 | 140 | C: back to c-map, with a one-stage Dockerfile | The line counter includes the Dockerfile; one stage takes it from 7 lines to 4, S 352 to 349, with the same binary | pending | — | — | — |
+| 141 | exp: 1 MiB of file-backed rodata read at start (c-big) | Test whether the program file pages count in M on the box: 1.5 MB above the table is unexplained, and the binary maps 0.9 MB | pending | — | — | — |
 
 ## Decision log
 
@@ -472,6 +473,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D142.** pending: board, 3 samples
 
 **D143.** pending: board shows T and M unchanged
+
+**D144.** Measurement only, restore c-m3 after
 
 ## What didn't work
 

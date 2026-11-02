@@ -38,6 +38,9 @@ unsafe extern "C" {
     fn pthread_join(id: u64, result: *mut *mut u8) -> i32;
 }
 
+/// A measurement only: a mebibyte of the program's file, read once.
+static BIG: [u8; 1 << 20] = [1; 1 << 20];
+
 /// Zero bytes after a mapped file, so that block loads can run past its end.
 const PADDING: usize = 128;
 
@@ -497,6 +500,9 @@ unsafe extern "C" fn start(work: *mut u8) -> *mut u8 {
 /// which this program needs, and the timer counts all of it.
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
+    (0..1 << 20)
+        .step_by(4096)
+        .for_each(|at| _ = black_box(BIG[at]));
     let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.

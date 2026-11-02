@@ -210,6 +210,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 174 | c-kp3 24 segments per thread, sample 1 | a shorter end idle, now that a segment costs no release | pending | — | — | — |
 | 175 | c-kp2 sample 4 | alternate, so box hours even out | pending | — | — | — |
 | 176 | c-kp3 sample 2 | second sample | pending | — | — | — |
+| 177 | c-kp2 sample 5 | alternate | pending | — | — | — |
 
 ## Decision log
 
@@ -565,6 +566,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D175.** exp: judged over 3 samples against c-kp2 46.85
 
 **D176.** exp: judged over 3 samples against c-kp2 46.85
+
+**D177.** exp: judged over 3 samples against c-kp2 46.85
 
 ## What didn't work
 

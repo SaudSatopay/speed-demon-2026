@@ -176,11 +176,11 @@ static PADS: Row = Row([0, 0, 0, 0, -1, -1, -1, -1]);
 struct Memory {
     bits: [[AtomicU64; 4]; SLOTS],
     keys: [[AtomicU64; 2]; SLOTS],
-    tails: [[AtomicU64; 2]; TAILS + 1],
-    tails_taken: AtomicUsize,
     tags: [AtomicU16; SLOTS],
     regions: [AtomicU8; REGION_IDS], // The join table, country indices by region id.
     index_of: [AtomicU8; 26 * 26 * 26], // Country indices by code, which takes every one in `[A-Z]{3}`.
+    tails: [[AtomicU64; 2]; TAILS + 1],
+    tails_taken: AtomicUsize,
     stacks: [[AtomicU64; STACK / 8]; 64], // More threads than the box has, or any test asks for.
 }
 // SAFETY: zero is a valid value of each atomic.

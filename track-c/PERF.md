@@ -172,6 +172,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 127 | exp: find called from the first pass when a name has no tag in its window, then back to c-map | c-scout gave T 0.0190 for 15 lines, and this asks `find` itself for 4. Median K 45.49 over 3 (44.62, 46.89, 45.49), T 0.0194 to 0.0209, against c-map 46.95 over 8. Rejected | run-d1f33d3aec37 | 0.0204 | 10.2 | — |
 | 128 | exp: bits two to a line, keys apart, 133,000 homes (c-sp1) | Measures the second fill: bits lines are half the size, so the same four huge pages hold far more homes | pending | — | — | — |
 | 129 | exp: keys apart, 104,724 homes, three huge pages and small ones (c-sp2) | The split leaves the table small enough to give back a huge page | pending | — | — | — |
+| 130 | exp: small pages hold only tails and stacks (c-sp3) | c-sp2 had the end of the join table on small pages, read by every record | pending | — | — | — |
 
 ## Decision log
 
@@ -439,6 +440,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D131.** Keep only if median beats 46.94 over 3
 
 **D132.** Keep only if median beats 46.94 over 3
+
+**D133.** Keep only if median beats 46.94 over 3
 
 ## What didn't work
 

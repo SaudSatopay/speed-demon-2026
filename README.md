@@ -11,7 +11,7 @@
 ![Output](https://img.shields.io/badge/output-byte--identical-7c3aed?style=for-the-badge)
 ![Licence](https://img.shields.io/badge/licence-MIT-0969da?style=for-the-badge)
 
-**[The tracks](#the-tracks)** · **[Board numbers](#board-numbers)** · **[Check our claims](#check-our-claims)** · **[Limits](#limits)** · **[What we have not verified](#what-we-have-not-verified)**
+**[The tracks](#the-tracks)** · **[The score](#how-the-score-works)** · **[Designs](#how-each-one-works)** · **[Board numbers](#board-numbers)** · **[Check our claims](#check-our-claims)** · **[Limits](#limits)** · **[What we have not verified](#what-we-have-not-verified)**
 
 </div>
 
@@ -20,6 +20,10 @@
 Four rewrites of the organisers' naive Python references, one per track. Each is written in Rust with only the standard library (zero dependencies) and built offline into its own Docker image. A solo entry by Saud Satopay.
 
 Each track's output is compared byte for byte (SHA-256) with the reference's by one command ([below](#check-our-claims)). It covers 171 datasets, plus five repeated runs of each track.
+
+<div align="center">
+<img src="assets/stats.svg" alt="4 tracks rewritten, 0 dependencies, 171 datasets checked, 431 commits on the board, 346 steps logged in PERF.md." width="100%">
+</div>
 
 <div align="center">
 <img src="assets/speedups.svg" alt="Times faster and times less memory than the reference, best board runs on Nov 2. A: about 2,050 times faster, 14 times less memory. B: about 880 and 75. C: about 760 and 37. D: about 500 and 21." width="100%">
@@ -72,9 +76,28 @@ A hostile 200 MB CSV joined to a region table and summed in integer cents.
 
 T is wall time, M peak memory and S the code lines the board counts, all as the board measures them. K and speed points are the board's own scores for a run; each PERF.md explains how M and S enter them.
 
+## How the score works
+
+Each track's speed score comes from one number, K, which compares a run with the naive reference on the same machine:
+
+```text
+K = (T_ref / T)^0.50 × min(M_ref / M, 50)^0.20 × min(S_ref / S, 1)^0.15 × (D_ref / D)^0.15
+
+speed points = 50 × log10(K)
+```
+
+| Axis | What it measures | Weight | What that means here |
+|---|---|---:|---|
+| **T** | Wall time, the mean of the middle 3 of 5 runs | 0.50 | Half the score, with no cap. Every 2× is worth the same 7.5 points |
+| **M** | Peak memory, the worst of 5 runs | 0.20 | Counts up to 50× better than the reference, so on Track B anything under 44 MB scores the same |
+| **S** | Code lines, after the organisers' formatter | 0.15 | Larger than the reference costs, so every line has to earn its place |
+| **D** | Dependencies | 0.15 | Zero extra dependencies costs nothing, and we use none |
+
+A wrong byte in any output scores that track zero. Speed is 65% of a track's total; judges score the other 35% on code quality, technique and the optimisation log.
+
 ## How each one works
 
-<details open>
+<details>
 <summary><b>A · Ingest:</b> parse in place, finish each hour as soon as the reading has passed it</summary>
 
 ```mermaid
@@ -89,6 +112,18 @@ flowchart LR
   classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
   class L,O io;
 ```
+
+**Why it's fast**
+
+- **No date parsing and no objects per line.** The reference spends about 77% of its time in `strptime`, and 228 MB on Python ints. Here the hour is one multiply of an 8-byte load, and a line is one 32-bit integer whose plain order is the order the percentiles need.
+- **Mapping the log, with a prefetch per line and a shared release.** The parse reads the log's pages in place, with no copy into a buffer. Mapping lost to reading in pieces three times, because the clock runs to exit and exit took the log's pages down on one thread.
+- **Hours finished during the read.** Memory peaks when records and text are both held. Finishing an hour as soon as the reading is past it took M from 18.8 to 16.4 MB, and T from 0.0245 to 0.0221, because no thread sits waiting for the output stage.
+- **Almost no slow paths per line.** Keys sit in whole 64-byte lines, so one block compare settles 92% of lines, with no branch on the length of a key that fits. Before this, 13.7% of lines took the slow path; now 8.4% do.
+- **Three linear passes per hour.** A record holds an endpoint id, a latency and an error flag. Two radix passes over the latency and one over the ids, in the endpoints' byte order, leave each endpoint's latencies sorted, with no comparison sort except for the side list of big latencies, below.
+- **Text written over its own records.** The hour's array has room for its text, so an hour's text takes few new pages: on seed 1 it runs past its records in 30 of 72 hours, by 63 KB at most.
+
+More: [approach and limits](track-a/README.md) · [every step and failed experiment](track-a/PERF.md)
+
 </details>
 
 <details>
@@ -104,6 +139,19 @@ flowchart LR
   classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
   class Q,O io;
 ```
+
+**Why it's fast**
+
+- **Only the queries' terms are indexed.** The reference builds a set for each of 609,833 terms. Here a token that no query uses costs one lookup and nothing else.
+- **No posting is stored.** Queries with rare anchors are answered at those anchors, and the rest by blocks of documents, over bits that a thread reuses for each block. That took M from 42 to 27 MB locally, which scored nothing, as M was already under the 44.0 MB where more savings stop counting.
+- **Stages per document, with no branch per token.** Token edges come from 64-byte masks and a table per byte; keys and hashes of four tokens at a time in AVX2; every token's set compared in a loop so short that the cache misses overlap, with no prefetch of the sets. Going from a token at a time to this took T from 0.308 to 0.211 s, then with fewer instructions per token to 0.100 s, and without postings and with stamps to 0.078 s.
+- **Truth tables instead of formulas.** A BOOL check packs the marks of up to five other terms into a number, whose bit in a 32-bit table says whether the document counts. Three terms take 8 bytes, which covers 27,994 of the 31,615 checks on seed 1.
+- **Marks that never need clearing.** A mark is a byte equal to the document's number in its block, so a new document sees none of the last one's, and a block's end clears them all.
+- **Phrases check only around their rarest term.** No positions are stored, and most tokens trigger no check.
+- **A count, a sum and the smallest ids come straight from the scan.** The reference sorts every result set. Block queries use nibble tables in AVX2 for counts and sums of positions in one pass.
+
+More: [approach and limits](track-b/README.md) · [every step and failed experiment](track-b/PERF.md)
+
 </details>
 
 <details>
@@ -120,6 +168,19 @@ flowchart LR
   classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
   class F,O io;
 ```
+
+**Why it's fast**
+
+- **No chain from record to record.** A parser that finds each field from the end of the last is limited by that chain of loads, about 75 cycles per record here, not by its instruction count. Listing separators from fixed blocks breaks it.
+- **No branch for most of the hostile parts.** Quote parity comes from arithmetic, so `""` pairs, commas in quotes and LFs in quotes need no branch. Mispredicts were 0.33 per record when last counted (local, PERF.md D58).
+- **Three numbers in one vector,** and an amount's point skipped by its weights: a saturating subtract turns the sign and the point into zero digits.
+- **A mapped file, and its pages released together.** A copy of the file would take as long as much of the parse, so the threads read it where it lies. When they're done they give its pages back between them: without that, T was 0.0228 on the board against 0.0192, because the exit released the pages on one thread (PERF.md, journey steps 119 and 120).
+- **One cache line per name lookup,** guessed from the tags and prefetched for ownership before the locked write. A single `LOCK BTS` finds the country's bit.
+- **No page charged from a worker's CPU.** `memory.peak` counts each CPU's unused charge batch, up to 252 KB per CPU that charges anything, so this took M from 12.9 to 10.6 MB on the board (journey steps 24 and 25).
+- **No std runtime before `main`,** which saves about 15 system calls that the timer counts.
+
+More: [approach and limits](track-c/README.md) · [every step and failed experiment](track-c/PERF.md)
+
 </details>
 
 <details>
@@ -136,6 +197,19 @@ flowchart LR
   classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
   class G,O io;
 ```
+
+**Why it's fast**
+
+- **Two-ended search.** The reference searches from the source only, so it settles everything closer than the target.
+- **Sides alternate by work, not by the smaller top.** Queries from a small island, and queries to a target nothing reaches, finish after a few settles rather than crossing the whole main body.
+- **Neighbours close in memory.** The input's ids are random, so renumbering takes the queries from about 190 ms to about 105 ms.
+- **Batched build.** A batch of edges prefetches its cache lines and lets them arrive together.
+- **Fewer nodes to search.** Removing low-degree nodes with shortcuts took T from 0.166 to 0.152 s and M from 67.9 to 46.0 MB on the board (steps 17 to 19), and removing it now costs 9% of K (step 27).
+- **A coarse radix queue.** Keys never go below the last block popped, so a key moves a few times in all, with no comparisons against other keys, and nothing sorts inside a block. Local counts fell from 1,202 to 1,154 instructions and from 7.32 to 5.88 mispredicts per edge (D17).
+- **Search state sized to the search.** Labels live in 64-node pages, found through a u16 directory. A median search stays in the fastest caches, and the largest fills about 585 KB.
+
+More: [approach and limits](track-d/README.md) · [every step and failed experiment](track-d/PERF.md)
+
 </details>
 
 ## How a change reached the board
@@ -153,6 +227,12 @@ flowchart LR
   class K good;
   class X bad;
 ```
+
+## The 72 hours
+
+<div align="center">
+<img src="assets/timeline.svg" alt="Each track's best speed points over the event, from the board's run log." width="100%">
+</div>
 
 ## Board numbers
 

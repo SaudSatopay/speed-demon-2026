@@ -171,6 +171,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 126 | Files mapped on a 2 MiB boundary (`c-map`), the final source | Locally page faults fell from 3,094 to 651 and T by 8%, if the box also maps cached huge folios of the file whole. 5 runs, K 46.46 to 47.12, median 47.01, T 0.0194, M 10.06, S 352. T didn't move against step 122, and K's gain is inside its noise, so the box doesn't seem to gain from it. Kept as the best median measured | run-e27dcd226db9 | 0.0194 | 10.06 | 83.61 |
 | 127 | c-fp find from the first pass when a name has no tag in its window, sample 1 | c-scout gave T 0.0190 for 15 lines; this asks find itself, for 5 | pending | — | — | — |
 | 128 | c-fp sample 2 | second sample | pending | — | — | — |
+| 129 | c-fp sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -430,6 +431,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D127.** exp: judged over 3 samples against c-map 46.94
 
 **D128.** exp: judged over 3 samples against c-map 46.94
+
+**D129.** exp: judged over 3 samples against c-map 46.94
 
 ## What didn't work
 

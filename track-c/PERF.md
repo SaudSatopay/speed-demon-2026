@@ -196,6 +196,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 151 | C: back to c-map with the one-stage Dockerfile (c-m3), the final source | c-e0 median K 46.70 over 3, c-f0 46.55 over 4, c-ef 46.25 over 3: none beats c-map at 46.82 over 17. First run here K 46.26, then c-m3 has K 46.88, 46.79, 46.26. Kept | run-bb5f373588a0 | 0.0200 | 10.04 | 83.26 |
 | 152 | exp: bit planes computed where used, the page release as an iterator, three lets folded, one assert gone (c-s10) | Hoped for 10 lines fewer, but rustfmt broke up three of the folds, so S went up, to 353. 10 runs on the same code: median K 46.64, T 0.0195, M 10.2. Not kept, and the folds went | run-43d27ad255c0 | 0.0195 | 10.18 | 83.37 |
 | 153 | Seven lines cut off the hot path (c-s7): bit planes computed where used, the page release as an iterator, one let folded, one assert gone | S 349 to 342. 3 runs: K 46.68, 46.81, 46.87, median 46.81, T 0.0194, against c-map's median 46.79 over 19. M 10.26 to 10.54 against about 10.1, though `c-s10` with the same code had 9.95 to 10.41, so that may be the box. Kept, the final source | run-8b505a462403 | 0.0194 | 10.50 | 83.40 |
+| 154 | exp: name classes, short names keys apart and bits in holes, three huge pages (c-l1) | Rivals hold M 8 at our T; only a smaller table lowers M | pending | — | — | — |
 
 ## Decision log
 
@@ -511,6 +512,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D155.** Not kept: `c-s10`. Rustfmt expanded three of its folds, so S rose to 353. The code itself held, at T 0.0195 over 10 runs, so D156 keeps the cuts that are real.
 
 **D156.** Kept: `c-s7`, seven real lines cut, S 342. Median K 46.81 over 3 against c-map's 46.79 over 19: a tie in K, so the lines are worth having and T didn't pay for them. The final source. M is watched: 10.26 to 10.54 here.
+
+**D157.** On trial against c-s7
 
 ## What didn't work
 

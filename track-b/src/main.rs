@@ -711,8 +711,8 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
         let trailing = steps.iter().rev().take_while(|step| is_or(step));
         let sure = trailing.max_by_key(|&&term| df[term as usize]);
         let (sum, sure_count) = (sum_of(&query_anchors), sure.map_or(0, |&t| df[t as usize]));
-        let common_sure = sure_count * 48 >= df[0] && (sum - sure_count) * 48 < df[0];
-        if sum * 48 >= df[0] && !common_sure {
+        let common_sure = sure_count * 64 >= df[0] && (sum - sure_count) * 64 < df[0];
+        if sum * 64 >= df[0] && !common_sure {
             block_queries.push(query);
             for term in steps.iter().map(|step| step & TERM_BITS) {
                 used.extend((store_of[term as usize] == NEITHER).then_some(term));
@@ -738,8 +738,10 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
         }
         let skipped = usize::from(sure.is_some());
         for (at, &term) in query_anchors.iter().enumerate().skip(skipped) {
-            flags[term as usize] |= BOOL_ANCHOR;
-            checks.push((term, (query, make_check(steps, term, &query_anchors[..at]))));
+            // A check that can't count, as in `x NOT x`, or at a repeated anchor, needs no visit.
+            let check = make_check(steps, term, &query_anchors[..at]);
+            flags[term as usize] |= u32::from(check.truth != 0) * BOOL_ANCHOR;
+            checks.extend((check.truth != 0).then_some((term, (query, check))));
         }
     }
 

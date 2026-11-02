@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 470" width="1280" height="470" role="img" aria-label="Times faster and times less memory than the reference, best board runs on Nov 2. Track A: about 2,050 times faster, 14 times less memory. Track B: about 880 times faster, 75 times less memory. Track C: about 760 times faster, 37 times less memory. Track D: about 500 times faster, 21 times less memory.">
+  <defs>
+    <linearGradient id="t" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd23f"/><stop offset="1" stop-color="#ff5a36"/></linearGradient>
+    <linearGradient id="m" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#3b82f6"/></linearGradient>
+    <style>
+      text { font-family: "Segoe UI", Inter, system-ui, -apple-system, Helvetica, Arial, sans-serif; fill: #f6f6f2; }
+      .h { font-size: 30px; font-weight: 800; }
+      .sub { font-size: 18px; font-weight: 500; fill: #c9c9d2; }
+      .tr { font-size: 26px; font-weight: 800; }
+      .nm { font-size: 17px; font-weight: 500; fill: #c9c9d2; }
+      .v { font-size: 21px; font-weight: 800; }
+      .tick { font-size: 15px; font-weight: 500; fill: #8f8f9a; }
+    </style>
+  </defs>
+  <rect width="1280" height="470" rx="22" fill="#111116"/>
+  <text x="48" y="58" class="h">How far from the reference</text>
+  <text x="48" y="88" class="sub">Best board runs on Nov 2, rounded. Log scale. Board numbers are in the table below.</text>
+  <rect x="860" y="42" width="26" height="14" rx="4" fill="url(#t)"/><text x="896" y="55" class="sub">times faster</text>
+  <rect x="1040" y="42" width="26" height="14" rx="4" fill="url(#m)"/><text x="1076" y="55" class="sub">times less memory</text>
+  <g stroke="#2c2c33" stroke-width="1">
+    <path d="M240 110V420M500 110V420M760 110V420M1020 110V420"/>
+  </g>
+  <text x="240" y="446" class="tick" text-anchor="middle">1×</text>
+  <text x="500" y="446" class="tick" text-anchor="middle">10×</text>
+  <text x="760" y="446" class="tick" text-anchor="middle">100×</text>
+  <text x="1020" y="446" class="tick" text-anchor="middle">1,000×</text>
+
+  <text x="48" y="146" class="tr">A</text><text x="80" y="146" class="nm">Ingest</text>
+  <rect x="240" y="118" width="861" height="20" rx="6" fill="url(#t)"/><text x="1113" y="136" class="v">2,050×</text>
+  <rect x="240" y="142" width="298" height="20" rx="6" fill="url(#m)"/><text x="550" y="160" class="v">14×</text>
+
+  <text x="48" y="222" class="tr">B</text><text x="80" y="222" class="nm">Index</text>
+  <rect x="240" y="194" width="765" height="20" rx="6" fill="url(#t)"/><text x="1017" y="212" class="v">880×</text>
+  <rect x="240" y="218" width="488" height="20" rx="6" fill="url(#m)"/><text x="740" y="236" class="v">75×</text>
+
+  <text x="48" y="298" class="tr">C</text><text x="80" y="298" class="nm">Join</text>
+  <rect x="240" y="270" width="749" height="20" rx="6" fill="url(#t)"/><text x="1001" y="288" class="v">760×</text>
+  <rect x="240" y="294" width="408" height="20" rx="6" fill="url(#m)"/><text x="660" y="312" class="v">37×</text>
+
+  <text x="48" y="374" class="tr">D</text><text x="80" y="374" class="nm">Traverse</text>
+  <rect x="240" y="346" width="702" height="20" rx="6" fill="url(#t)"/><text x="954" y="364" class="v">500×</text>
+  <rect x="240" y="370" width="344" height="20" rx="6" fill="url(#m)"/><text x="596" y="388" class="v">21×</text>
+</svg>

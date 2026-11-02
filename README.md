@@ -1,30 +1,169 @@
 # ALL STAR · Speed Demon 2026
 
+<div align="center">
+
+<img src="assets/banner.svg" alt="ALL STAR, Speed Demon 2026. Four naive Python programs, four zero-dependency Rust rewrites, every output byte-identical." width="100%">
+
+<br>
+
+![Rust](https://img.shields.io/badge/Rust-standard_library_only-e8590c?style=for-the-badge&logo=rust&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-0-2ea043?style=for-the-badge)
+![Output](https://img.shields.io/badge/output-byte--identical-7c3aed?style=for-the-badge)
+![Licence](https://img.shields.io/badge/licence-MIT-0969da?style=for-the-badge)
+
+**[The tracks](#the-tracks)** · **[Board numbers](#board-numbers)** · **[Check our claims](#check-our-claims)** · **[Limits](#limits)** · **[What we have not verified](#what-we-have-not-verified)**
+
+</div>
+
+<br>
+
 Four rewrites of the organisers' naive Python references, one per track. Each is written in Rust with only the standard library (zero dependencies) and built offline into its own Docker image. A solo entry by Saud Satopay.
 
 Each track's output is compared byte for byte (SHA-256) with the reference's by one command ([below](#check-our-claims)). It covers 171 datasets, plus five repeated runs of each track.
 
+<div align="center">
+<img src="assets/speedups.svg" alt="Times faster and times less memory than the reference, best board runs on Nov 2. A: about 2,050 times faster, 14 times less memory. B: about 880 and 75. C: about 760 and 37. D: about 500 and 21." width="100%">
+</div>
+
 ## The tracks
 
-| Track | What it does | Reference on the box (T · M · S) | Details |
-|---|---|---|---|
-| A · Ingest | Per-hour, per-endpoint latency percentiles over a 3.1M-line request log | 32.05 s · 228 MB · 56 | [README](track-a/README.md) · [PERF.md](track-a/PERF.md) |
-| B · Index | Boolean and phrase queries over a 254 MB corpus of 250,000 documents | 56.35 s · 2,200 MB · 91 | [README](track-b/README.md) · [PERF.md](track-b/PERF.md) |
-| C · Join | A hostile 200 MB CSV joined to a region table and summed in integer cents | 14.44 s · 367 MB · 108 | [README](track-c/README.md) · [PERF.md](track-c/PERF.md) |
-| D · Traverse | 2,000 shortest paths on a directed graph of 1.74M nodes and 5M edges | 72.69 s · 893 MB · 43 | [README](track-d/README.md) · [PERF.md](track-d/PERF.md) |
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🪵 A · Ingest
+Per-hour, per-endpoint latency percentiles over a 3.1M-line request log.
+
+**Reference on the box:** 32.05 s · 228 MB · 56 lines<br>
+[README](track-a/README.md) · [PERF.md](track-a/PERF.md)
+
+</td>
+<td width="50%" valign="top">
+
+### 🔎 B · Index
+Boolean and phrase queries over a 254 MB corpus of 250,000 documents.
+
+**Reference on the box:** 56.35 s · 2,200 MB · 91 lines<br>
+[README](track-b/README.md) · [PERF.md](track-b/PERF.md)
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 🔗 C · Join
+A hostile 200 MB CSV joined to a region table and summed in integer cents.
+
+**Reference on the box:** 14.44 s · 367 MB · 108 lines<br>
+[README](track-c/README.md) · [PERF.md](track-c/PERF.md)
+
+</td>
+<td width="50%" valign="top">
+
+### 🧭 D · Traverse
+2,000 shortest paths on a directed graph of 1.74M nodes and 5M edges.
+
+**Reference on the box:** 72.69 s · 893 MB · 43 lines<br>
+[README](track-d/README.md) · [PERF.md](track-d/PERF.md)
+
+</td>
+</tr>
+</table>
 
 T is wall time, M peak memory and S the code lines the board counts, all as the board measures them. K and speed points are the board's own scores for a run; each PERF.md explains how M and S enter them.
 
+## How each one works
+
+<details open>
+<summary><b>A · Ingest:</b> parse in place, finish each hour as soon as the reading has passed it</summary>
+
+```mermaid
+flowchart LR
+  L["Mapped log"] --> S["12 threads claim<br/>segments from a counter"]
+  S --> P["Parse each line<br/>at fixed offsets"]
+  P --> K["Lock-free table:<br/>endpoint to id"]
+  P --> R["One 32-bit record<br/>per line, per hour"]
+  R --> F["4 finishers: 3 stable<br/>radix passes per hour"]
+  K --> F
+  F --> O["Ready hours appended<br/>in order, pages given back"]
+  classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
+  class L,O io;
+```
+</details>
+
+<details>
+<summary><b>B · Index:</b> no postings stored, one scan answers every query</summary>
+
+```mermaid
+flowchart LR
+  Q["Read the queries first:<br/>about 75,000 terms"] --> A["1% sample finds common<br/>terms, picks anchors"]
+  A --> T["Threads claim ranges<br/>of the corpus in order"]
+  T --> S["Per document: find tokens,<br/>look up, mark, act"]
+  S --> C["Threads add up<br/>their counts"]
+  C --> O["All answers<br/>printed in order"]
+  classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
+  class Q,O io;
+```
+</details>
+
+<details>
+<summary><b>C · Join:</b> two stages over a hostile CSV, one shared table of names</summary>
+
+```mermaid
+flowchart LR
+  F["Mapped CSV, cut<br/>just after a CRLF"] --> P["Threads claim parts<br/>from a counter"]
+  P --> B["Stage 1: 64-byte blocks,<br/>carry-less multiply gives<br/>quote parity"]
+  B --> R["Stage 2: records<br/>from the separators"]
+  J["Region id to<br/>country array"] --> R
+  R --> N["Lock-free table<br/>of distinct names"]
+  N --> O["Output sorted<br/>when written"]
+  classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
+  class F,O io;
+```
+</details>
+
+<details>
+<summary><b>D · Traverse:</b> renumber and simplify the graph, then search from both ends</summary>
+
+```mermaid
+flowchart LR
+  G["Mapped graph,<br/>parsed in 2 passes"] --> N["Number nodes in round<br/>patches, neighbours close"]
+  N --> A["Compressed<br/>adjacency array"]
+  Q["The queries"] --> M["Remove low-degree nodes<br/>no query needs, add shortcuts"]
+  A --> M
+  M --> D["Two-ended Dijkstra<br/>per query, across threads"]
+  D --> O["Distances<br/>in order"]
+  classDef io fill:#ff7a2f,stroke:#ff7a2f,color:#111;
+  class G,O io;
+```
+</details>
+
+## How a change reached the board
+
+```mermaid
+flowchart LR
+  I["One idea,<br/>one push"] --> C["All datasets, thread sweep,<br/>constant-hash build"]
+  C --> G["Pre-push gate:<br/>offline build, grid"]
+  G --> R["Board runs on the<br/>organisers' box"]
+  R --> D{"Better over<br/>several runs?"}
+  D -- yes --> K["Kept, with its run ID<br/>in PERF.md"]
+  D -- no --> X["Reverted, and logged<br/>as a failed experiment"]
+  classDef good fill:#2ea043,stroke:#2ea043,color:#fff;
+  classDef bad fill:#d1242f,stroke:#d1242f,color:#fff;
+  class K good;
+  class X bad;
+```
+
 ## Board numbers
 
-This is the only place in this README where numbers change. They come from the live board's feed at **2026-11-02 11:49:02 UTC (Mon 17:19 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
+This table is refreshed from the board; the chart above is a rounded snapshot of it. The numbers come from the live board's feed at **2026-11-02 13:10:22 UTC (Mon 18:40 IST)** and the board's run history, and none is a local timing. Ranks are by K among the teams scored on that track at that time. Each row is the track's best scored run so far; the last column shows the latest run, to show how much one source moves between runs.
 
 | Track | Best run | Commit | T (s) | M (MB) | S | K | Speed points | Rank by K | Latest run: K |
 |---|---|---|---|---|---|---|---|---|---|
-| A | `run-a3d80d9d43be` | `c438b24` | 0.0156 | 16.1 | 343 | 58.58 | 88.4 | 3 of 136 | 56.94 (`run-e9f3b90435fa`) |
-| B | `run-4d59d4dfba18` | `4d9e164` | 0.0643 | 29.2 | 1076 | 44.70 | 82.5 | 2 of 109 | 43.81 (`run-deac1404c01f`) |
-| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 7 of 116 | 44.20 (`run-db358eb1bf1f`) |
-| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 16 of 116 | 24.02 (`run-ce33b2f0836c`) |
+| A | `run-a3d80d9d43be` | `c438b24` | 0.0156 | 16.1 | 343 | 58.58 | 88.4 | 3 of 136 | 56.43 (`run-444ec5d75e48`) |
+| B | `run-4d59d4dfba18` | `4d9e164` | 0.0643 | 29.2 | 1076 | 44.70 | 82.5 | 2 of 109 | 43.55 (`run-04ca7a5fe873`) |
+| C | `run-d8ffdb6e4d14` | `ba16c53` | 0.0189 | 10.0 | 367 | 47.28 | 83.7 | 7 of 116 | 47.00 (`run-c263798748db`) |
+| D | `run-ba733dba1abf` | `f579765` | 0.1444 | 42.2 | 620 | 27.68 | 72.1 | 16 of 116 | 27.25 (`run-d29c920eeaa9`) |
 | Overall | | | | | | | 84.84 | 3 of 115 | |
 
 The overall row is the board's: speed points only, over the 115 teams with three scored tracks. The judges' share of the score comes after the freeze.
@@ -63,22 +202,40 @@ One line per track. The full list is in each track's README, under Limits.
 
 ## How we worked
 
+<details>
+<summary>Show</summary>
+
 - **Correct first.** A bank of datasets ran on every build: generator seeds, answer-preserving rewrites of them (line endings, BOMs, quoting, order) and synthetic files at each spec's limits. It ran natively in seconds, then in the board's sandbox. A pre-push gate was set up to refuse a push that failed its Dockerfile check, its offline build or the correctness grid.
 - **Measured like the box.** The local scorer uses the organisers' timer from exec to exit, cgroup `memory.peak`, a trimmed mean of repeated runs, and the box's huge-page setting. Local numbers only ranked candidate builds, and `ab.sh` counted a change only if it beat twice the run-to-run spread.
 - **One idea per push,** so each board run measures one change. The dev machine is WSL2 with no hardware counters, so instruction and branch-miss counts come from cachegrind, and are cited in the PERF.md entries.
 
+
+</details>
+
 ## Shared design choices
+
+<details>
+<summary>Show</summary>
 
 - **Rust, standard library only.** Each image builds on `rust:1-slim-trixie`, pinned by digest, with `cargo build --release --offline`. A, B and D run on `debian:13-slim` in a second stage; C has one stage and runs where it was built. `mmap`, `madvise` and a few other calls are declared by hand against glibc, which `std` already links, so there is no `libc` crate.
 - **Threads.** The count is `SD_THREADS` if set, otherwise `available_parallelism()`, which respects the container's CPU set, capped at 12. A, B and D use `std::thread::scope`; C creates its threads with `pthread` calls it declares itself. Work is handed out from atomic counters.
 - **Build flags** are in each track's `.cargo/config.toml`: `target-cpu=x86-64-v3` on all four. A, B and C also link glibc statically, as T counts from exec, and switch off three tuning features meant for much older CPUs. C adds `pclmulqdq`, `prfchw` and `gfni`.
 - **One output file.** Each program writes exactly one file into `/out` (`summary.txt`, `results.txt`, `aggregates.txt` or `distances.txt`), in pieces.
 
+
+</details>
+
 ## Before the event
+
+<details>
+<summary>Show</summary>
 
 Reading the specs against the harness source turned up two places where the docs and the code disagreed: the dataset the board uses for Track B, and the final-scoring timeout. We reported both on Discord, and the organisers fixed them the same day ([da9d695](https://github.com/hackathon-raptors/speed-demon-2026/commit/da9d695)). No solution code was written before kickoff. `tools/` is test tooling outside the track folders, as the rules allow.
 
 Our first push came 4 minutes 50 seconds after kickoff. GitHub's activity log shows the repo unchanged from the starter until then (15:04:50 UTC, commit `90b27c9`). The session log shows the first Rust source written at 15:02:45 UTC. What existed before kickoff was prose design notes, test tooling, and build files with no track logic (`Cargo.toml`, `.cargo/config.toml`, the `Dockerfile`), which rule 05 allows. An AI agent wrote v1 from those notes. We can share the full session log with the organisers.
+
+
+</details>
 
 ## AI use
 

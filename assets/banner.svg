@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="ALL STAR, Speed Demon 2026. Four naive Python programs, four zero-dependency Rust rewrites, every output byte-identical.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0b10"/><stop offset=".55" stop-color="#17101a"/><stop offset="1" stop-color="#2a0f12"/>
+    </linearGradient>
+    <linearGradient id="fire" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd23f"/><stop offset=".5" stop-color="#ff7a2f"/><stop offset="1" stop-color="#ff2d55"/>
+    </linearGradient>
+    <linearGradient id="streak" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff7a2f" stop-opacity="0"/><stop offset="1" stop-color="#ffb02e" stop-opacity=".85"/>
+    </linearGradient>
+    <clipPath id="frame"><rect width="1280" height="340" rx="22"/></clipPath>
+    <style>
+      .streak { animation: run 2.6s linear infinite; }
+      .s2 { animation-duration: 1.9s; animation-delay: -.7s; }
+      .s3 { animation-duration: 3.2s; animation-delay: -1.4s; }
+      .s4 { animation-duration: 2.2s; animation-delay: -2s; }
+      @keyframes run { from { transform: translateX(-520px); } to { transform: translateX(1400px); } }
+      @media (prefers-reduced-motion: reduce) { .streak { animation: none; } }
+      text { font-family: "Segoe UI", Inter, system-ui, -apple-system, Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="340" fill="url(#bg)"/>
+    <g opacity=".08" stroke="#ffffff" stroke-width="1">
+      <path d="M0 68H1280M0 136H1280M0 204H1280M0 272H1280"/>
+      <path d="M160 0V340M320 0V340M480 0V340M640 0V340M800 0V340M960 0V340M1120 0V340"/>
+    </g>
+    <rect class="streak" x="0" y="52" width="460" height="3" rx="2" fill="url(#streak)"/>
+    <rect class="streak s2" x="0" y="118" width="340" height="2" rx="1" fill="url(#streak)"/>
+    <rect class="streak s3" x="0" y="238" width="500" height="3" rx="2" fill="url(#streak)"/>
+    <rect class="streak s4" x="0" y="298" width="300" height="2" rx="1" fill="url(#streak)"/>
+    <text x="72" y="104" font-size="26" font-weight="700" letter-spacing="7" fill="#f6f6f2" opacity=".85">ALL STAR</text>
+    <text x="68" y="194" font-size="92" font-weight="900" letter-spacing="-2" fill="url(#fire)">SPEED DEMON</text>
+    <text x="72" y="244" font-size="27" font-weight="600" fill="#f6f6f2">Four naive Python programs. Four zero-dependency Rust rewrites.</text>
+    <text x="72" y="282" font-size="22" font-weight="500" fill="#c9c9d2">Every output byte-identical, checked by SHA-256.</text>
+    <g transform="translate(1050 92)">
+      <path d="M78 0C92 44 142 66 142 128C142 178 104 208 66 208C26 208 0 176 0 136C0 106 16 86 32 70C36 92 46 104 58 108C52 70 58 30 78 0Z" fill="url(#fire)"/>
+      <path d="M72 96C80 122 104 134 104 162C104 186 86 200 68 200C48 200 36 184 36 166C36 146 50 136 58 124C60 134 64 140 68 142C66 126 66 110 72 96Z" fill="#ffe28a"/>
+    </g>
+    <text x="1208" y="322" text-anchor="end" font-size="18" font-weight="700" letter-spacing="2" fill="#f6f6f2" opacity=".7">2026</text>
+  </g>
+</svg>

@@ -238,6 +238,7 @@ fn slots_with(window: __m256i, tag: u8) -> u32 {
 }
 
 /// Whether a slot holds the same name. Its nonzero offset is published after the exact key words.
+/// The tag and hash narrow candidates; only exact byte comparison establishes equality.
 ///
 /// # Safety
 /// The slot must be occupied and its tag must include len.

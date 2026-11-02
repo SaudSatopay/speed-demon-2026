@@ -46,9 +46,9 @@ const HUGE: usize = 1 << 21;
 
 /// Maps a file for reading, followed by `PADDING` zeros. Returns the file's bytes with those after
 /// them. It starts on a 2 MiB boundary, because that's the only way the kernel can map cached huge
-/// folios of the file whole, with one fault each. Touches one page in every 2 MiB, so that this thread
-/// allocates any page tables: a worker that did would charge a batch of pages to its CPU, and a batch
-/// counts in the peak (see above).
+/// folios of the file whole, with one fault each. Touches one page in every 2 MiB of its first eighth
+/// or more, so that this thread allocates those page tables: a worker that did would charge a batch of
+/// pages to its CPU, and a batch counts in the peak (see above). `main` touches the rest later.
 fn map(file: &File) -> &'static [u8] {
     let len = file.metadata().unwrap().len() as usize;
     // SAFETY: the first mapping is new, and the second replaces part of it, with room left for the
@@ -61,7 +61,7 @@ fn map(file: &File) -> &'static [u8] {
         mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // Private, at this address.
         std::slice::from_raw_parts(base, len + PADDING)
     };
-    let pages = (0..len + HUGE).step_by(HUGE);
+    let pages = (0..len / 8 + 2 * HUGE).step_by(HUGE);
     pages.for_each(|at| _ = black_box(text[at.min(len)]));
     text
 }
@@ -135,17 +135,17 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1_000_001;
-/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 96%
+/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 94%
 /// full, which is as many as fit in four huge pages with the rest of `Memory`. A test build makes it
 /// tiny, so that names run out of slots.
-const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 104_724 };
+const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 106_188 };
 /// Slots, with enough past the last home for its window.
 const SLOTS: usize = HOMES + 32;
 /// Windows a name tries before it does without a slot: more than a table this full can need, for a
 /// generated file.
 const TRIES: usize = 64;
 /// Bytes of stack per thread, enough for its rows and lists.
-const STACK: usize = 40 << 10;
+const STACK: usize = 32 << 10;
 /// Names longer than this get no slot. No generated name has been seen beyond 25 bytes.
 const INLINE_BYTES: usize = 32;
 /// A 32-byte load at `INLINE_BYTES - len` bytes in has `len` zero bytes, and the rest all ones. A `Row`
@@ -336,7 +336,7 @@ fn separators(text: &[u8], scan: usize, blocks: usize, out: &mut [u32], odd: &mu
         for block in 0..blocks {
             let at = text.as_ptr().add(scan + block * 64);
             // Far enough ahead to pass where the chunk's own loads and a page's end stop the core.
-            _mm_prefetch::<_MM_HINT_T1>(at.wrapping_add(1024).cast());
+            _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(1024).cast());
             let quotes = byte_mask(at, |block| _mm256_cmpeq_epi8(block, quote));
             let parity = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(quotes as i64), ones);
             let inside = _mm_cvtsi128_si64(parity) as u64 ^ *odd;
@@ -420,7 +420,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             let (id_region, cents) = parse_three([id, region, word << (64 - field)]);
             // A minus sign is the one thing that sorts below a digit.
             let negative = -i32::from((word as u8) < b'0');
-            _mm_prefetch::<_MM_HINT_T1>(regions.add((id_region >> 32) as usize).cast());
+            _mm_prefetch::<_MM_HINT_T0>(regions.add((id_region >> 32) as usize).cast());
             let (home, tag) = home_and_tag(text, name_at + 1, (note_at - name_at).wrapping_sub(3));
             // Guesses the name's slot from the tags, and asks to own its line, for a write: a locked
             // update then needs no second trip to take it from the core that wrote it last. A wrong
@@ -532,6 +532,11 @@ extern "C" fn main() -> i32 {
         while let Some((pos, end)) = part(records, &segments, threads * 12, b"\r\n") {
             parse_records(&records[pos..], end - pos, &mut rows);
         }
+        // Before the release, so that threads waiting here don't wait with pages left to release.
+        for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
+            [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);
+            (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
+        }
         // Parsing is over, so each release can only stop threads still on their last segment, which a
         // release per segment would do all run. Threads share the releases: the exit would do them on
         // one. Any pages still in use just map again. Whole 2 MiB, so that none has to split a huge
@@ -544,10 +549,6 @@ extern "C" fn main() -> i32 {
             unsafe { madvise(records.as_ptr().add(from), len, 4) };
             from = released.fetch_add(chunk, Relaxed);
         }
-        for (Row(total), Row(row)) in totals.lock().unwrap().iter_mut().zip(&rows) {
-            [0, 2, 4, 5, 6, 7].iter().for_each(|&i| total[i] += row[i]);
-            (total[1], total[3]) = (total[1].min(row[1]), total[3].max(row[3]));
-        }
     };
     let (work, mut ids): (&(dyn Fn() + Sync), _) = (&work, vec![0u64; threads - 1]);
     // SAFETY: each thread has its own stack, inside `MEMORY`, and is joined before `work` ends.
@@ -558,6 +559,10 @@ extern "C" fn main() -> i32 {
             pthread_attr_setstack(&mut attr, MEMORY.stacks[at].as_ptr() as *mut u8, STACK);
             assert!(pthread_create(id, &attr, start, &raw const work as *mut u8) == 0);
         }
+        // Page tables for the rest of the file. The threads are parsing by now, and they need many
+        // times as long to reach the part of it `map` didn't touch.
+        let pages = (0..records.len()).step_by(HUGE);
+        pages.for_each(|at| _ = black_box(records[at]));
         work();
         ids.iter().for_each(|&id| _ = pthread_join(id, null_mut()));
     }

@@ -181,6 +181,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 136 | PREFETCHNTA for the text instead of T0 (c-n1) | Text at about the rate of slot lines passes through the caches on its way: NTA should leave more room in them for slots | pending | — | — | — |
 | 137 | Measure only: one thread (c-e2) | M at one thread shows what the 11 spawns add on the box | pending | — | — | — |
 | 138 | Text and region prefetches into L2, not L1 (c-q1) | A core has 16 fill buffers for two threads, and a chunk asks for about 50 lines at once; a prefetch to L2 should give its buffer back early, so slot prefetches stop queueing | pending | — | — | — |
+| 139 | Back to c-x1 for more samples | One run so far, T 0.0195; c-q1 T 0.0199 and c-n1 0.0197 show no gain | pending | — | — | — |
 
 ## Decision log
 
@@ -466,6 +467,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D140.** pending: one run, then back
 
 **D141.** pending: board, 3 samples
+
+**D142.** pending: board, 3 samples
 
 ## What didn't work
 

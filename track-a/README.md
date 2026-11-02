@@ -16,7 +16,7 @@ Per-hour, per-endpoint latency percentiles over a 3.1M-line HTTP request log. Ru
 ## Limits
 
 - It relies on three spec guarantees: every timestamp is 27 bytes inside the fixed 72-hour window, every line is well formed, and a seed has 1,842 endpoints. A line outside the window either aborts, when its hour falls outside the 72, or is counted in a wrong hour, as the hour comes only from the bits that differ inside the window. An endpoint table past 4,094 lines of keys aborts.
-- The spec promises no bound on how late a line can come. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. A line for an hour already claimed stops the run and starts it again with no early finish, which about doubles T. The worst disorder on our seeds is 1/315 of the log, and 280 full runs saw no restart.
+- The spec promises no bound on how late a line can come. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. A line for an hour already claimed stops the run and starts it again with no early finish, which about doubles T. The worst disorder on our seeds is 1/315 of the log, and 280 full runs of an earlier build (PERF.md, D40) saw no restart.
 - Readers never wait for a thread that falls behind, so on a busy machine records pile up: M rises by about 2 MB, while T stays about 1.5 times better than with a wait.
 - Threads that lose a race to publish a key leave its lines unused. A hand-built log of 1,842 keys of two lines each, in the same order on every thread, can use up the ids and abort. The generator can't make one.
 - T has a slow mode we can't fully explain: on identical code, some board runs read about 0.018 against 0.0158. See [PERF.md](PERF.md#where-it-loses).

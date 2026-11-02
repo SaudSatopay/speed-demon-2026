@@ -1,13 +1,13 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D77), at S 352. Our best run of it is `run-57b80bd49a9c`: **0.0157 s / 15.8 MB**, K = **58.00**. Most board runs of this build read T 0.0157 to 0.0161, and some runs read 0.018 to 0.020. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
+**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D77), at S 352. Our best run of it is `run-4e5bbad388d3`: **0.0155 s / 16.4 MB**, K = **58.41**; its median K over 28 runs is 57.47. Most board runs of this build read T 0.0157 to 0.0161, and some runs read 0.018 to 0.020. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
 ## Where it loses
 
 - S is 352 code lines against the reference's 56, which costs (56/352)^0.15, K x 0.75; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
-- M is 15.5 to 16.3 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.
+- M is 15.5 to 17.0 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.
 - **T has a slow mode on identical code, and we don't fully know why.** On D68's build it was about 0.0205 against 0.0163, in 2 of 8 runs. Making the main thread a worker, so that no more threads than CPUs want to run, gave seven clean runs (D74), but later runs read about 0.018 again (D75). It may be a smaller mode, or a busier box.
 - The log is mapped, so the parse's loads wait on memory instead of a copy done earlier. One prefetch per line, 1,536 bytes ahead, covers some of that. Mapping lost on the board three times before D65, because exit took the log's pages down one at a time on one thread, and the clock runs to exit. Threads that are done now share that release. Without the release, T reads about 5 ms more (D80).
 - A line for an hour already claimed restarts the whole run. Hours are claimed in order, each once the reading is 1/48 of the log past its last line so far. No seed does this, but the spec doesn't rule it out.
@@ -279,6 +279,8 @@ Checks on the mapped build: grid 44/44, threads 234/234, stress 0 wrong in 300, 
 **D79.** Blocks of half a page (`925b1970`), for fewer unused record words. Alternated with D77's build on the board: 12 runs against 9, final estimate +0.4%, and 21 runs against 22 over a longer stretch, -0.5%; M about equal in the alternation. A tie, so the simpler D77 stays. `hammer.py`: 104,496 runs, 0 bad.
 
 **D80.** D77's build with no release loop, and one binary search for a big rank (`48999faf`, S 345). Four runs: T 20.7, 21.6, 21.0, 22.3 ms, against about 15.9 (`run-b07d2bf18784`, `run-28e6ad51ca86`, `run-0efa036f36a9`, `run-9146c707f40b`). So the shared release is worth about 5 ms on the box, and settles what D66's confounded pair left open. Locally the same removal read -1 to -3%, as this PC's exit is cheaper. Rejected.
+
+**D81.** Each thread releases the log segments it read itself, in place of the shared release (`0ffd28c4`, S 355). Three runs: T 16.5, 17.2, 16.4 ms, M up to 16.1 MB, K 56.39, 55.02, 56.78 (`run-575443b2c22b`, `run-feed71f9d09f`, `run-16773b7b55d8`), against about 15.9 ms at S 352. A fourth sample was stopped. Rejected.
 
 ## What didn't work
 

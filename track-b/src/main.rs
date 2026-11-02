@@ -906,11 +906,9 @@ const SUM_BITS: u32 = 40;
 const TOO_BIG: u64 = 1 << 62;
 
 /// Puts a document among a list's ten smallest.
-fn insert_smallest(smallest: &mut [u32; SMALLEST], doc: u32) {
-    let mut before = [0; SMALLEST];
-    before[1..].copy_from_slice(&smallest[..SMALLEST - 1]);
-    for at in 0..SMALLEST {
-        smallest[at] = smallest[at].min(before[at].max(doc));
+fn insert_smallest(smallest: &mut [u32; SMALLEST], mut doc: u32) {
+    for held in smallest {
+        (*held, doc) = (doc.min(*held), doc.max(*held));
     }
 }
 

@@ -135,10 +135,10 @@ fn parse_three(words: [u64; 3]) -> (u64, u32) {
 /// Entries in the join table. Region ids stay below a million (spec section 2.3), so the last entry
 /// is past every one of them, and stays unmatched, for every id above them.
 const REGION_IDS: usize = 1_000_001;
-/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 75%
-/// full, which is as many as fit in four huge pages with the rest of `Memory`. A test build makes it
+/// Homes for a name: enough for the generator's pool of 100,000 names (spec section 2.2), at about 96%
+/// full. A test build makes it
 /// tiny, so that names run out of slots.
-const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 133_000 };
+const HOMES: usize = if cfg!(sd_const_hash) { 1 << 5 } else { 104_724 };
 /// Slots, with enough past the last home for its window.
 const SLOTS: usize = HOMES + 32;
 /// Windows a name tries before it does without a slot: more than a table this full can need, for a
@@ -552,11 +552,15 @@ extern "C" fn main() -> i32 {
     // The threads parse the whole file and merge their rows, every index's row, index 0 being
     // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
     // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(HUGE);
-    // Whole huge pages only, even for the last part: small pages cost more time than the rest of that
-    // huge page costs in memory. The size of `MEMORY` is a multiple of them, so this stays inside it.
-    // SAFETY: this is only advice about pages of `MEMORY`.
-    unsafe { madvise((&raw const MEMORY).cast(), bytes, 23) };
+    let bytes = offset_of!(Memory, stacks) + (threads - 1) * STACK;
+    // Small pages past the last whole huge page: the stacks and the last of the join table need few
+    // entries, and a huge page there would charge all of it.
+    // SAFETY: this is only advice about pages of `MEMORY`. 15 is `MADV_NOHUGEPAGE`.
+    unsafe {
+        let base = (&raw const MEMORY).cast::<u8>();
+        madvise(base.add(bytes / HUGE * HUGE), HUGE, 15);
+        madvise(base, bytes, 23);
+    }
     LOCKED.lock().unwrap().0.reserve(256);
     let (lines, segments, line_parts) = (AtomicUsize::new(0), AtomicUsize::new(0), threads * 8);
     let (parsed, totals) = (AtomicUsize::new(0), Mutex::new([EMPTY_ROW; 256]));

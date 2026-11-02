@@ -1507,7 +1507,7 @@ pub extern "C" fn main() -> i32 {
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
     let asked = std::env::var("SD_THREADS").map_or(0, |v| v.parse().unwrap_or(0));
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(10));
+    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = if asked > 0 { asked } else { allowed };
     let (docs, queries) = (map_file(&data, "docs.txt"), map_file(&data, "queries.txt"));
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their

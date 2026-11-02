@@ -1,5 +1,7 @@
 # Track C: performance log
 
+**Current trial:** default worker cap lowered from 12 to 6; `SD_THREADS` still overrides it. Candidate board run pending.
+
 **Result:** the reference takes **14.44 s / 367 MB** on the board. Our final source is `c-s7`: `c-map` with a one-stage Dockerfile (D143) and seven lines cut off the hot path (D156), S 342 in place of 352. Its median K is **46.67** over 16 runs, T 0.0196, M 10.01 to 10.59 MB. Our best run of nearly the same code is `run-540bab063106`, of `c-map`: **0.0193 s / 10.0 MB**, K **47.12** and **83.66** speed points. That's one of the 5 runs of step 126, which gave T 0.0193 to 0.0197 s, M 10.00 to 10.33 MB and a median K of 47.01 (D126).
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks c`. Output SHA-256 on seed 1: `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.

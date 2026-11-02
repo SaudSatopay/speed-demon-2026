@@ -2,6 +2,8 @@
 
 **Result:** the reference takes **56.35 s / 2,200 MB** on the board. This design (`s2-y`) has a median K of **44.35** over 5 board runs (`run-09eb7dfb83e3`, `run-308cd4b414d9`, `run-15c9c75ad33c`, `run-0d4ba97358a4`, `run-06a4871e5ef2`), at S 1,077, with T 0.0653 s and M 31.8 MB at the median. Its best run, `run-06a4871e5ef2`, read **0.0645 s / 33.7 MB**: K = **44.60**, **82.5 speed points**. T has two modes on one build: the 15 runs of `ab`, the design before the cuts, span T 0.0681 to 0.0726.
 
+**Rejected trial (Nov 2):** capping default workers at 10 passed quick 38/38, thread sweep 228/228, constant-hash 19/19, and the pre-push grid 43/43, but board run `run-2e6fedff9618` measured T 0.076 s, M 30.6 MB, S 1,077, K 41.06. The prior 12-worker code remains the choice: its best run `run-4d59d4dfba18` scored K 44.70 at T 0.064 s, M 29.2 MB, S 1,076.
+
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks b`. Output SHA-256 on seed 1: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
 
 ## Where it loses

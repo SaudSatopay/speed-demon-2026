@@ -38,9 +38,6 @@ unsafe extern "C" {
     fn pthread_join(id: u64, result: *mut *mut u8) -> i32;
 }
 
-/// A measurement only: a mebibyte of the program's file, read once.
-static BIG: [u8; 1 << 20] = [1; 1 << 20];
-
 /// Zero bytes after a mapped file, so that block loads can run past its end.
 const PADDING: usize = 128;
 
@@ -306,6 +303,10 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
 struct Row([i64; 8]);
 const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
+/// What the first empty name a thread sees in a country adds to the row's repeats, in place of one.
+/// Empty names get no slot: one in a hundred records would fight over its cache line.
+const EMPTY_SEEN: i64 = 1 << 40;
+
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
 const BLOCKS: usize = 16;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
@@ -473,10 +474,13 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
         unsafe {
             let at = if len <= INLINE_BYTES && holds(guess as usize, text, start, len) {
                 guess as usize
-            } else if let Some(at) = find(text, start, name.saturating_sub(2)) {
+            } else if name <= 2 {
+                row[6] += if row[6] < EMPTY_SEEN { EMPTY_SEEN } else { 1 };
+                continue;
+            } else if let Some(at) = find(text, start, name - 2) {
                 at
             } else {
-                let name = text[start..start + name.saturating_sub(2)].to_vec();
+                let name = text[start..start + name - 2].to_vec();
                 row[6] += i64::from(!LOCKED.lock().unwrap().1.insert((name, country)));
                 continue;
             };
@@ -500,9 +504,6 @@ unsafe extern "C" fn start(work: *mut u8) -> *mut u8 {
 /// which this program needs, and the timer counts all of it.
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
-    (0..1 << 20)
-        .step_by(4096)
-        .for_each(|at| _ = black_box(BIG[at]));
     let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
@@ -583,7 +584,9 @@ extern "C" fn main() -> i32 {
             let (sign, magnitude) = (if *cents < 0 { "-" } else { "" }, cents.unsigned_abs());
             write!(out, " {sign}{}.{:02}", magnitude / 100, magnitude % 100).unwrap();
         }
-        writeln!(out, " {} {} {}", row[0] - row[6], row[5], row[7]).unwrap();
+        // Each thread that saw an empty name counted it once, and only one of those is distinct.
+        let repeats = (row[6] & (EMPTY_SEEN - 1)) + (row[6] >> 40).max(1) - 1;
+        writeln!(out, " {} {} {}", row[0] - repeats, row[5], row[7]).unwrap();
     }
     out.flush().unwrap();
     // Not a return. The handlers that `exit` runs write a byte at the start of the zeroed part of the

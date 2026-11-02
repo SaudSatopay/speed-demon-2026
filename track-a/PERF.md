@@ -1,12 +1,12 @@
 # Track A: performance log
 
-**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D77), at S 352. Our best run of it is `run-4e5bbad388d3`: **0.0155 s / 16.4 MB**, K = **58.41**; its median K over 28 runs is 57.47. Most board runs of this build read T 0.0157 to 0.0161, and some runs read 0.018 to 0.020. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
+**Result:** the reference takes **32.05 s / 228 MB** on the board. The final build maps the log (D65 to D82), at S 343. Our best run is of the same design at S 352: `run-4e5bbad388d3`, **0.0155 s / 16.4 MB**, K = **58.41**. The final build's best so far is `run-d5636fc5b2c8`, 0.0157 s / 15.5 MB, K = 58.38. Most board runs of this build read T 0.0157 to 0.0161, and some runs read 0.018 to 0.020. The pread build it replaced read T 0.0185 to 0.0188 over five runs, K 52.7 to 52.9, at S 377.
 
 **Check it yourself:** the board run named there, or locally `python3 tools/verify.py --tracks a`. Output SHA-256 on seed 1: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
 
 ## Where it loses
 
-- S is 352 code lines against the reference's 56, which costs (56/352)^0.15, K x 0.75; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
+- S is 343 code lines against the reference's 56, which costs (56/343)^0.15, K x 0.76; at S 377 that was about 6.2 speed points. D61's readability cost K x 0.977. The reference is short because Python does the work.
 - M is 15.5 to 17.0 MB, about 6 MB above the 10.1 MB of output the scorer charges to every entry. What's left is mostly records of hours not yet finished. The log's pages are not in it: `/data` is warmed outside the run's cgroup.
 - **T has a slow mode on identical code, and we don't fully know why.** On D68's build it was about 0.0205 against 0.0163, in 2 of 8 runs. Making the main thread a worker, so that no more threads than CPUs want to run, gave seven clean runs (D74), but later runs read about 0.018 again (D75). It may be a smaller mode, or a busier box.
 - The log is mapped, so the parse's loads wait on memory instead of a copy done earlier. One prefetch per line, 1,536 bytes ahead, covers some of that. Mapping lost on the board three times before D65, because exit took the log's pages down one at a time on one thread, and the clock runs to exit. Threads that are done now share that release. Without the release, T reads about 5 ms more (D80).
@@ -110,6 +110,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 74 | exp: whole-MiB segments on big logs | Locally, threads sleep on the page cache's folio lock in `filemap_fault`; 1 MiB aligned segments cut those sleeps 98% | run-b67cdb83207a | 0.0157 | 15.6 | 57.8 |
 | 75 | exp: the main thread is worker 0 | No thirteenth runnable thread while main spawns the others, as one tick behind another thread is about +4 ms | run-b4d09aa68674 | 0.0157 | 15.5 | 57.8 |
 | 76 | exp: 13 real lines cut | S against the same T, as the cost of lines is in K | run-57b80bd49a9c | 0.0157 | 15.8 | 88.2 |
+| 77 | exp: 9 real lines cut | S against the same T, as the cost of lines is in K | run-d5636fc5b2c8 | 0.0157 | 15.5 | 58.4 |
 
 ## Decision log
 
@@ -282,6 +283,8 @@ Checks on the mapped build: grid 44/44, threads 234/234, stress 0 wrong in 300, 
 
 **D81.** Each thread releases the log segments it read itself, in place of the shared release (`0ffd28c4`, S 355). Three runs: T 16.5, 17.2, 16.4 ms, M up to 16.1 MB, K 56.39, 55.02, 56.78 (`run-575443b2c22b`, `run-feed71f9d09f`, `run-16773b7b55d8`), against about 15.9 ms at S 352. A fourth sample was stopped. Rejected.
 
+**D82.** Decision: 9 real lines cut (`2efc644`, S 352 -> 343), the final build. `load` now also reads a table line, replacing a duplicate; one binary search for a big rank; `order_ids` moved into its one caller; a fixed 1 MiB `SEGMENT`, as full-scale logs already had; smaller merges of locals. We kept the named `parse_latency` and `finisher`, 4 more lines, for readability. Instructions per record about level: -0.2% at full scale with these cuts and the two we then undid. `checks.sh` passes; `hammer.py`, seed 20261104: 130,233 runs, 0 bad. Six runs against nine of D77's build over the same hours: median K 57.30 against 57.56, and mean K 57.77 against 57.73 leaving out the slow runs, which hit both builds at T 18.4 to 18.8. `best_vs_head.py`: median 57.57 over 7 against 57.46 over 32. A tie on the board so far. Kept because it is shorter and the arithmetic favours it: 9 lines are K +0.4%, smaller than the noise here.
+
 ## What didn't work
 
 Local timing misled us often on this track, because this PC has a smaller L1 and a virtual machine's costly kernel entries, so the board judged anything that wasn't a plain cut in instructions.
@@ -322,9 +325,9 @@ Local timing misled us often on this track, because this PC has a smaller L1 and
 - A lock-free table's races don't show up on one pass. D26 tells how one passed the whole grid, and 300 repeated runs at 2 to 14 threads now run before any change to the table goes out.
 - Logs in other orders: shuffled, reversed, rotated, and with lines moved just past the margin, pass with no restart. Four more kinds restart on nearly every run: 2% chunks in random order, the first and last lines swapped, and all of one endpoint's lines moved to the end, for a rare key and for the longest.
 - Sanitizers, last run on D68's build, before D70 to D77 changed its threads and locks. Address sanitizer: no reports on seeds 1 and 2, tiny and sample, with the right hashes. Thread sanitizer: the right hashes. We classified its reports only for the most common types, around `Arc<Order>` and the allocator's calls in `write_hour`, with an uninstrumented standard mutex, and believe them false alarms. We haven't examined them all.
-- `hammer.py` on the final build, seed 20261103: 102,619 runs at 1 to 64 threads, 0 bad.
+- `hammer.py` on the final build, seed 20261104: 130,233 runs at 1 to 64 threads, 0 bad.
 - An adversarial review of the final code found no wrong answer on input the spec allows. It found one crash that the generator can't reach: a hand-built log of 1,842 keys of two 64-byte lines each, in the same order on every thread, makes `id_of` abort, as lost compare-and-swaps waste lines until the ids run out. Its other limits are outside the spec too, and are in the [README](README.md#limits).
-- **`tools/verify.py --full`** on commit `dd99294`, whose source is the final one: generator seeds 35/35, answer-preserving rewrites 4/4, limit cases 5/5, 5 identical runs yes, 44/44 outputs matching the naive reference's SHA-256.
+- **`tools/verify.py --full`** on commit `48889ef`, whose source is the final one: generator seeds 35/35, answer-preserving rewrites 4/4, limit cases 5/5, 5 identical runs yes, 44/44 outputs matching the naive reference's SHA-256.
 - **Determinism drill:** `quick.sh --repeat 5`, 39/39 pinned to two CPUs, and 39/39 with two `yes` running as well.
 - **Reproduce it yourself:** `python3 tools/verify.py --full` (Docker, git and Python only).
 

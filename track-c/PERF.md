@@ -206,6 +206,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 170 | c-kp sample 3 | third sample | pending | — | — | — |
 | 171 | c-kp2 yield restored in the wait, sample 1 | c-kp T 0.0196 against c-ph1 0.0192, and the plain spin moved hot registers | pending | — | — | — |
 | 172 | c-kp2 sample 2 | second sample | pending | — | — | — |
+| 173 | c-kp2 sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -553,6 +554,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D171.** exp: judged over 3 samples against c-ph1 46.91
 
 **D172.** exp: judged over 3 samples against c-ph1 46.91
+
+**D173.** exp: judged over 3 samples against c-ph1 46.91
 
 ## What didn't work
 

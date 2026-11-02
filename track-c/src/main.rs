@@ -41,27 +41,20 @@ unsafe extern "C" {
 /// Zero bytes after a mapped file, so that block loads can run past its end.
 const PADDING: usize = 128;
 
-/// The size of a huge page.
-const HUGE: usize = 1 << 21;
-
 /// Maps a file for reading, followed by `PADDING` zeros. Returns the file's bytes with those after
-/// them. It starts on a 2 MiB boundary, because that's the only way the kernel can map cached huge
-/// folios of the file whole, with one fault each. Touches one page in every 2 MiB, so that this thread
-/// allocates any page tables: a worker that did would charge a batch of pages to its CPU, and a batch
-/// counts in the peak (see above).
+/// them. Touches one page in every 2 MiB, so that this thread allocates the page tables: a worker
+/// that did would charge a batch of pages to its CPU, and a batch counts in the peak (see above).
 fn map(file: &File) -> &'static [u8] {
     let len = file.metadata().unwrap().len() as usize;
-    // SAFETY: the first mapping is new, and the second replaces part of it, with room left for the
-    // padding. Read-only private file pages stay valid for the run, since nothing changes the data
-    // files.
+    // SAFETY: the first mapping is new, and the second replaces its start. Read-only private file
+    // pages stay valid for the run, since nothing changes the data files.
     let text = unsafe {
-        let room = mmap(null_mut(), len + PADDING + HUGE, 1, 0x22, -1, 0); // Private, anonymous.
-        assert_ne!(room as isize, -1);
-        let base = room.map_addr(|at| at.next_multiple_of(HUGE));
+        let base = mmap(null_mut(), len + PADDING, 1, 0x22, -1, 0); // Private and anonymous.
+        assert_ne!(base as isize, -1);
         mmap(base, len, 1, 0x12, file.as_raw_fd(), 0); // Private, at this address.
         std::slice::from_raw_parts(base, len + PADDING)
     };
-    let pages = (0..len + HUGE).step_by(HUGE);
+    let pages = (0..len + (1 << 21)).step_by(1 << 21);
     pages.for_each(|at| _ = black_box(text[at.min(len)]));
     text
 }
@@ -295,6 +288,25 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
     None
 }
 
+/// Where a name with no tag in its first window should look: the first slot on its walk with its tag,
+/// or the first free one, which is where it will go if no other thread takes it. Just a guess for
+/// `add_records` to prefetch and compare, so that spilled names skip `find`, and new ones find their
+/// line owned. Slot 0 if its walk finds nothing.
+#[cold]
+fn scout(mut home: usize, hash: u16) -> usize {
+    for _ in 0..TRIES {
+        // SAFETY: a home is below `HOMES`, so 32 below the end of the tags, and the load needs no
+        // alignment.
+        let window = unsafe { std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast()) };
+        let hits = slots_with(window, hash.max(1)) | slots_with(window, 0);
+        if hits != 0 {
+            return (home + hits.trailing_zeros() as usize) * 64;
+        }
+        home = (home + 33 + usize::from(hash)) % HOMES;
+    }
+    0
+}
+
 /// A country's totals, one cache line: its count; lowest amount; id sum; highest amount; amount sum;
 /// name bytes; how many of its records repeat a name; and note bytes. That order keeps sums apart, or
 /// the compiler pairs their additions up as vector instructions, which take more than the two would.
@@ -429,7 +441,10 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
             let hits = slots_with(window, tag);
-            let guess = (home + hits.trailing_zeros() as usize) * 64;
+            let mut guess = (home + hits.trailing_zeros() as usize) * 64;
+            if hits == 0 {
+                guess = scout(home, tag);
+            }
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
             *slot = (guess as u32, cents as u32, id_region);
@@ -508,7 +523,7 @@ extern "C" fn main() -> i32 {
     // The threads parse the whole file and merge their rows, every index's row, index 0 being
     // `_UNMATCHED`. They share the regions too, and all of those are done before any record is parsed.
     // Tying the part sizes to the thread count also makes the SD_THREADS test sweep move every cut.
-    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(HUGE);
+    let bytes = (offset_of!(Memory, stacks) + (threads - 1) * STACK).next_multiple_of(1 << 21);
     // Whole huge pages only, even for the last part: small pages cost more time than the rest of that
     // huge page costs in memory. The size of `MEMORY` is a multiple of them, so this stays inside it.
     // SAFETY: this is only advice about pages of `MEMORY`.
@@ -534,9 +549,8 @@ extern "C" fn main() -> i32 {
         }
         // Parsing is over, so each release can only stop threads still on their last segment, which a
         // release per segment would do all run. Threads share the releases: the exit would do them on
-        // one. Any pages still in use just map again. Whole 2 MiB, so that none has to split a huge
-        // mapping.
-        let chunk = records.len().div_ceil(threads * 3).next_multiple_of(HUGE);
+        // one. Any pages still in use just map again.
+        let chunk = records.len().div_ceil(threads * 3).next_multiple_of(4096);
         let mut from = released.fetch_add(chunk, Relaxed);
         while from < records.len() {
             let len = chunk.min(records.len() - from);

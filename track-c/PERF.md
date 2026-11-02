@@ -216,6 +216,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 180 | c-map files mapped on a 2 MiB boundary, sample 1 | local faults 3094 to 651 and T -8 percent, if the box caches huge folios | pending | — | — | — |
 | 181 | c-map sample 2 | second sample | pending | — | — | — |
 | 182 | c-map sample 3 | third sample | pending | — | — | — |
+| 183 | c-scout cold scout guesses spilled and new names, sample 1 | local find calls 282k to 125k, T -2.3 percent | pending | — | — | — |
 
 ## Decision log
 
@@ -583,6 +584,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D181.** exp: judged over 3 samples against c-kp2 46.84
 
 **D182.** exp: judged over 3 samples against c-kp2 46.84
+
+**D183.** exp: judged over 3 samples against c-kp2 46.84
 
 ## What didn't work
 

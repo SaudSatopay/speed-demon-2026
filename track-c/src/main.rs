@@ -429,7 +429,13 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
             let hits = slots_with(window, tag);
-            let guess = (home + hits.trailing_zeros() as usize) * 64;
+            let mut guess = (home + hits.trailing_zeros() as usize) * 64;
+            // No tag in its first window: a new name or one that spilled. Its search might as well
+            // be here, where the slot's line then gets used while it's still in this core's cache.
+            if hits == 0 {
+                let len = (note_at - name_at - 1).saturating_sub(2);
+                guess = find(text, name_at + 1, len).unwrap_or(0);
+            }
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
             *slot = (guess as u32, cents as u32, id_region);

@@ -41,8 +41,8 @@
 
 #![no_main]
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Mutex, OnceLock, RwLock};
 use std::{arch::x86_64::*, fs::File, io::IoSlice, io::Write, os::fd::AsRawFd, thread};
 
 /// Term 0 is every token that no query uses, and the empty ways of the term table hold it. A truth
@@ -398,22 +398,16 @@ const TERM_BATCH: usize = 64;
 /// start in its part of the text.
 fn parse_queries(text: &[u8], threads: usize, sets: usize, helper: thread::Thread) -> Plan<'_> {
     let mut plan = Plan::default();
-    // Empty sets. The first thread makes them while the others read their lines, which don't need them.
-    let (table, new_table) = (OnceLock::new(), || {
-        // SAFETY: zeros are a valid TermSet.
-        let empty = unsafe { Box::<[TermSet]>::new_zeroed_slice(sets).assume_init() };
-        TermTable {
-            sets: empty.into_vec(),
-            text,
-            count: 0,
-        }
-    });
+    // Empty sets, from the kernel's zeros as threads first touch them. Threads that fault in the same huge
+    // page each allocate one, which the memory peak counts, but below 44 MB that scores nothing.
+    // SAFETY: zeros are a valid TermSet.
+    let empty = unsafe { Box::<[TermSet]>::new_zeroed_slice(sets).assume_init() };
+    (plan.terms.text, plan.terms.sets) = (text, empty.into_vec());
     let (next_part, next_term) = (AtomicUsize::new(0), AtomicUsize::new(FIRST_TERM));
     let mut parts = on_threads(threads, || {
         let part = claim(&next_part, text.len() / threads + 1, text.len()).unwrap_or_default();
         // The threads have started, which mapping their stacks would have waited on the helper's page faults.
         (part.end == text.len()).then(|| helper.unpark());
-        (part.start == 0).then(|| table.get_or_init(new_table));
         let room = part.len() / 8;
         let (mut queries, mut steps) = (Vec::with_capacity(room), Vec::with_capacity(room));
         let (mut edges, mut own, mut tokens) = (vec![], 0, Vec::with_capacity(room));
@@ -437,26 +431,21 @@ fn parse_queries(text: &[u8], threads: usize, sets: usize, helper: thread::Threa
             queries.push(Query(is_bool, from, steps.len() as u32));
         }
         // The terms go in once the lines are read, each one's set fetched ahead of it, as most are cache misses.
-        let terms = table.get_or_init(new_table);
         for (at, step) in steps.iter_mut().enumerate() {
             let ahead = tokens.get(at + 8).unwrap_or(&tokens[at]);
-            let set = terms.set_of(keys_of(ahead).0);
+            let set = plan.terms.set_of(keys_of(ahead).0);
             // SAFETY: the set is in the table, and a prefetch has no other effect.
-            unsafe { _mm_prefetch(terms.sets.as_ptr().add(set).cast(), _MM_HINT_T0) };
-            *step |= terms.intern(tokens[at], &next_term, &mut own);
+            unsafe { _mm_prefetch(plan.terms.sets.as_ptr().add(set).cast(), _MM_HINT_T0) };
+            *step |= plan.terms.intern(tokens[at], &next_term, &mut own);
         }
         (part.start, queries, steps)
     });
-    plan.terms = table.into_inner().expect("each thread needs it");
     plan.terms.count = next_term.into_inner();
     // Far more terms than the table was sized for: the queries are read again, into a larger one.
     if plan.terms.count > FIRST_TERM + TERMS_PER_SET * sets {
         return parse_queries(text, threads, sets * 4, helper);
     }
     parts.sort_unstable_by_key(|part| part.0);
-    // Enough for most, as a query takes over 32 bytes of its text, and a step over 8.
-    plan.queries.reserve(text.len() / 32);
-    plan.steps.reserve(text.len() / 8);
     for (_, mut queries, steps) in parts {
         let base = plan.steps.len() as u32;
         plan.steps.extend(steps);
@@ -804,97 +793,92 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
     (plan.rowed_count, plan.sparse_count) = (start[1] as usize, (start[2] - start[1]) as usize);
     let own = flags.iter_mut().zip(&new_number).zip(&store_of);
     own.for_each(|((flag, new), &store)| *flag |= new | u32::from(store == COLUMN_ONLY) * SPARSE);
-    // The rest splits into parts that share nothing they write, and one more thread takes the phrases.
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            // Each anchor term's phrases.
-            let renumber = |a: &mut (u32, (u32, u32))| a.0 = new_number[a.0 as usize];
-            anchored.iter_mut().for_each(renumber);
-            let (start, phrases) = group(plan.terms.count, &anchored);
-            // The last range is empty, past the last key, and gives the end of the last term's phrases.
-            for range in start.windows(2) {
-                let of_term = &phrases[range[0] as usize..range[1] as usize];
-                let at = plan.phrases.len();
-                for &(query, position) in of_term {
-                    let Query(_, from, to) = plan.queries[query as usize];
-                    plan.phrases.extend([query, position, to - from]);
-                    let steps = plan.steps[from as usize..to as usize].iter();
-                    plan.phrases
-                        .extend(steps.map(|&step| new_number[step as usize]));
-                }
-                let mut near = 0;
-                if let ([_], &[_, position, len, ref terms @ ..]) = (of_term, &plan.phrases[at..]) {
-                    let before = u32::from(position + 1 == len);
-                    let term = terms.get((position + 1).wrapping_sub(2 * before) as usize);
-                    near = term.map_or(0, |term| term | before << 31);
-                }
-                plan.phrase_start.push((at as u32, near));
-            }
-            plan.phrases.extend([0; 8]);
-        });
-        // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
-        for set in &mut plan.terms.sets {
-            for word in &mut set.rest[..NO_WAY] {
-                *word = flags[(*word & TERM_BITS) as usize] | (*word & !TERM_BITS);
-            }
+    // Empty ways hold term 0, whose word stays 0, so this needs no branch on which ways are in use.
+    for set in &mut plan.terms.sets {
+        for word in &mut set.rest[..NO_WAY] {
+            *word = flags[(*word & TERM_BITS) as usize] | (*word & !TERM_BITS);
         }
-
-        // Then a term's checks, the short ones of all terms first. A short check holds up to 3 other terms.
-        let (term_count, answers) = (plan.terms.count, query_count + term_tallies + 1);
-        for (term, (_, check)) in &mut checks {
-            check.terms = check.terms.map(|term| new_number[term as usize]);
-            let long = check.terms[3] != 0 || check.terms[..3].iter().any(|&t| t > PACKED_MAX);
-            *term = new_number[*term as usize] + u32::from(long) * term_count as u32;
-        }
-        let (starts, checks) = group(2 * term_count, &checks);
-        let or = |word: u64, (at, term): (&u32, u32)| word | u64::from(term) << at;
-        let pack = |&(_, Check { truth, terms }): &(u32, Check)| {
-            PACKED_AT.iter().zip(terms).fold(u64::from(truth as u8), or)
-        };
-        let (short, long) = checks.split_at(starts[term_count] as usize);
-        plan.short_checks = short.iter().map(pack).collect();
-        plan.long_checks = long.iter().map(|&(_, check)| check).collect();
-
-        // Then what goes by blocks: the common terms alone, as runs of one step, and the queries, those of the
-        // same length together, so that the loop over a query's steps rarely mispredicts its exit. A step there
-        // holds a column's number for its term.
-        let length = |q: &u32| plan.queries[*q as usize].2 - plan.queries[*q as usize].1;
-        let longest = block_queries.iter().map(length).max().unwrap_or(0) as usize;
-        let keyed: Vec<_> = block_queries.iter().map(|q| (length(q), *q)).collect();
-        let (_, block_queries) = group(longest + 1, &keyed);
-        plan.block_steps = vec![vec![]; longest + 2];
-        let column = |term: &u32| new_number[*term as usize] - FIRST_TERM as u32;
-        plan.block_steps[1].extend(block_terms.iter().map(column));
-        for &query in &block_queries {
+    }
+    // Then each anchor term's phrases.
+    let renumber = |a: &mut (u32, (u32, u32))| a.0 = new_number[a.0 as usize];
+    anchored.iter_mut().for_each(renumber);
+    let (start, phrases) = group(plan.terms.count, &anchored);
+    // The last range is empty, past the last key, and gives the end of the last term's phrases.
+    for range in start.windows(2) {
+        let of_term = &phrases[range[0] as usize..range[1] as usize];
+        let at = plan.phrases.len();
+        for &(query, position) in of_term {
             let Query(_, from, to) = plan.queries[query as usize];
+            plan.phrases.extend([query, position, to - from]);
             let steps = plan.steps[from as usize..to as usize].iter();
-            let number = |step: &u32| step & !TERM_BITS | new_number[(step & TERM_BITS) as usize];
-            let columns = steps.map(|step| number(step) - FIRST_TERM as u32);
-            plan.block_steps[(to - from) as usize].extend(columns);
+            plan.phrases
+                .extend(steps.map(|&step| new_number[step as usize]));
         }
-        plan.block_queries = block_terms.len() + block_queries.len();
-
-        // Then a tally for each check, for each term with one of its own, a spare, and each run by blocks; and
-        // the answers. A term whose own tally goes by blocks isn't an anchor, so its place among the others
-        // stays empty.
-        let checked = checks.iter().map(|&(query, _)| query);
-        let blocks = block_term_answers.into_iter().chain(block_queries);
-        let tally_answers = checked.chain(query_count..answers).chain(blocks);
-        let tally = |answer| Tally(answer, AtomicU32::new(NONE));
-        plan.tallies = tally_answers.map(tally).collect();
-        let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
-        let blank = |_| Slot(Mutex::new(Answer { count, sum, ids }));
-        plan.answers = (0..answers).map(blank).collect();
-
-        // Last, where each term's checks are, and its own tally, or the spare for a term without one, which
-        // nothing reads.
-        let spare = checks.len() as u32 + term_tallies;
-        let list = |t| AnchorList(starts[t], starts[term_count + t], spare);
-        plan.anchor_lists = (0..=term_count).map(list).collect();
-        for term in tallied.into_iter().map(|term| term as usize) {
-            plan.anchor_lists[new_number[term] as usize].2 = checks.len() as u32 + term_tally[term];
+        let mut near = 0;
+        if let ([_], &[_, position, len, ref terms @ ..]) = (of_term, &plan.phrases[at..]) {
+            let before = u32::from(position + 1 == len);
+            let term = terms.get((position + 1).wrapping_sub(2 * before) as usize);
+            near = term.map_or(0, |term| term | before << 31);
         }
-    });
+        plan.phrase_start.push((at as u32, near));
+    }
+    plan.phrases.extend([0; 8]);
+
+    // Then a term's checks, the short ones of all terms first. A short check holds up to 3 other terms.
+    let (term_count, answers) = (plan.terms.count, query_count + term_tallies + 1);
+    for (term, (_, check)) in &mut checks {
+        check.terms = check.terms.map(|term| new_number[term as usize]);
+        let long = check.terms[3] != 0 || check.terms[..3].iter().any(|&t| t > PACKED_MAX);
+        *term = new_number[*term as usize] + u32::from(long) * term_count as u32;
+    }
+    let (starts, checks) = group(2 * term_count, &checks);
+    let or = |word: u64, (at, term): (&u32, u32)| word | u64::from(term) << at;
+    let pack = |&(_, Check { truth, terms }): &(u32, Check)| {
+        PACKED_AT.iter().zip(terms).fold(u64::from(truth as u8), or)
+    };
+    let (short, long) = checks.split_at(starts[term_count] as usize);
+    plan.short_checks = short.iter().map(pack).collect();
+    plan.long_checks = long.iter().map(|&(_, check)| check).collect();
+
+    // Then what goes by blocks: the common terms alone, as runs of one step, and the queries, those of the
+    // same length together, so that the loop over a query's steps rarely mispredicts its exit. A step there
+    // holds a column's number for its term.
+    let length = |query: &u32| plan.queries[*query as usize].2 - plan.queries[*query as usize].1;
+    let longest = block_queries.iter().map(length).max().unwrap_or(0) as usize;
+    let keyed: Vec<_> = block_queries.iter().map(|q| (length(q), *q)).collect();
+    let (_, block_queries) = group(longest + 1, &keyed);
+    plan.block_steps = vec![vec![]; longest + 2];
+    let column = |term: &u32| new_number[*term as usize] - FIRST_TERM as u32;
+    plan.block_steps[1].extend(block_terms.iter().map(column));
+    for &query in &block_queries {
+        let Query(_, from, to) = plan.queries[query as usize];
+        let steps = plan.steps[from as usize..to as usize].iter();
+        let number = |step: &u32| step & !TERM_BITS | new_number[(step & TERM_BITS) as usize];
+        let columns = steps.map(|step| number(step) - FIRST_TERM as u32);
+        plan.block_steps[(to - from) as usize].extend(columns);
+    }
+    plan.block_queries = block_terms.len() + block_queries.len();
+
+    // Then a tally for each check, for each term with one of its own, a spare, and each run by blocks; and
+    // the answers. A term whose own tally goes by blocks isn't an anchor, so its place among the others
+    // stays empty.
+    let checked = checks.iter().map(|&(query, _)| query);
+    let blocks = block_term_answers.into_iter().chain(block_queries);
+    let tally_answers = checked.chain(query_count..answers).chain(blocks);
+    let tally = |answer| Tally(answer, AtomicU32::new(NONE));
+    plan.tallies = tally_answers.map(tally).collect();
+    let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
+    let blank = |_| Slot(Mutex::new(Answer { count, sum, ids }));
+    plan.answers = (0..answers).map(blank).collect();
+
+    // Last, where each term's checks are, and its own tally, or the spare for a term without one, which
+    // nothing reads.
+    let spare = checks.len() as u32 + term_tallies;
+    let list = |t| AnchorList(starts[t], starts[term_count + t], spare);
+    plan.anchor_lists = (0..=term_count).map(list).collect();
+    for term in tallied.into_iter().map(|term| term as usize) {
+        plan.anchor_lists[new_number[term] as usize].2 = checks.len() as u32 + term_tally[term];
+    }
 }
 
 // ---- The scan: what each thread keeps, and the stages of a document ----
@@ -1365,9 +1349,7 @@ fn wait_for_all(here: &AtomicUsize, threads: usize) {
 
 /// One thread's part of the scan and the answers. What it counted goes where every thread can read it once
 /// all are done. Then the totals, before any printing. Then threads claim batches of queries, and the last
-/// to finish writes them to the file in order. Inlined, as measurements say: out of line, or left to the
-/// compiler, the scan takes 0.3% more instructions.
-#[inline(always)]
+/// to finish writes them to the file in order.
 fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progress, threads: usize) {
     // It claims ranges of the corpus until none is left, and scans them.
     let mut scan = Scan::default();
@@ -1526,28 +1508,15 @@ pub extern "C" fn main() -> i32 {
         file
     });
     let mut plan = parse_queries(queries, threads, 1 << 16, helper.thread().clone());
-    // The threads for the scan start now, before the mappers hold up anything that maps memory, and from one
-    // thread of their own, so that this one needn't wait. They sleep until the plan is done.
-    let (gate, progress) = (RwLock::new(None), Progress::default());
-    let mut ready = gate.write().unwrap();
-    let work = || {
-        let ready = gate.read().unwrap();
-        let (plan, file) = ready.as_ref().expect("the plan is done");
-        scan_and_answer(docs, plan, file, &progress, threads)
-    };
-    thread::scope(|scope| {
-        scope.spawn(|| (1..threads).for_each(|_| drop(scope.spawn(&work))));
-        // The mappers start after the sample, as one thread makes the plan and the others are free for them. The
-        // sample's threads leave them and `make_plan`'s extra thread their stacks, as a new one would wait.
-        let df = sample_terms(docs, &plan.terms, threads.min(5));
-        helper.thread().unpark();
-        make_plan(&mut plan, docs, df);
-        let file = helper.join().expect("panics abort");
-        // One round of threads scans, then answers, as starting threads again costs more than a short wait.
-        *ready = Some((plan, file));
-        drop(ready);
-        work();
-    });
+    // The mappers start now, as one thread makes the plan and the others are free for them.
+    let df = sample_terms(docs, &plan.terms, threads.min(4));
+    helper.thread().unpark();
+    make_plan(&mut plan, docs, df);
+    let file = helper.join().expect("panics abort");
+    // One round of threads scans, then answers, as starting threads again costs more than a short wait.
+    let progress = Progress::default();
+    let work = || scan_and_answer(docs, &plan, &file, &progress, threads);
+    on_threads(threads, work);
     // Nothing is buffered, and the kernel frees all the memory faster than dropping it would.
     std::process::exit(0)
 }

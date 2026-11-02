@@ -493,7 +493,7 @@ extern "C" fn main() -> i32 {
     let arg = |at, default: &str| std::env::args().nth(at).unwrap_or_else(|| default.into());
     // `SD_THREADS` if set (the test sweep uses it), else what the container allows, capped at the
     // box's 12 threads.
-    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(6));
+    let allowed = thread::available_parallelism().map_or(1, |n| n.get().min(12));
     let threads = std::env::var("SD_THREADS").map_or(allowed, |v| v.parse().unwrap_or(allowed));
     let open = |name: &str| map(&File::open(arg(1, "/data") + "/" + name + ".csv").unwrap());
     let (records, lookup) = (open("records"), open("regions"));

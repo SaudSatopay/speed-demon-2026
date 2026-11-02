@@ -303,7 +303,7 @@ struct Row([i64; 8]);
 const EMPTY_ROW: Row = Row([0, i64::MAX, 0, i64::MIN, 0, 0, 0, 0]);
 
 /// Blocks per chunk: about as many records as a chunk's cache lines can overlap for.
-const BLOCKS: usize = 32;
+const BLOCKS: usize = 24;
 /// A block can hold at most 64 separators, and listing one writes 8 slots regardless.
 const LISTED: usize = BLOCKS * 64 + 16;
 /// Lists into `out` the positions just past the separators outside quotes in `blocks` blocks of `text`

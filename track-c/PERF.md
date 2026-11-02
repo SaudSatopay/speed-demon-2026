@@ -1,6 +1,6 @@
 # Track C: performance log
 
-**Current trial:** double parser batch size from 16 to 32 64-byte blocks. Quick 59/59, thread sweep 324/324 and constant-hash tiny 29/29 pass. Diagnostic counts: 291.1 -> 290.6 instructions/record and 1.24 -> 1.16 mispredicts/record; local peak cgroup creation is denied, so board measurement is needed for M and T.
+**Current trial:** raise parser batches from 16 to 24 64-byte blocks. Quick 59/59, thread sweep 324/324 and constant-hash tiny 29/29 pass. Diagnostic counts: 291.1 -> 290.3 instructions/record and 1.24 -> 1.18 mispredicts/record; local peak cgroup creation is denied, so board measurement is needed for M and T. The earlier 32-block sample (run-fb8503b60f50) was near baseline: T 0.019562 s, M 10,289,152 bytes, S342, K46.731.
 
 **Rejected trial (Nov 2):** lowering the default worker cap from 12 to 6 kept the same source size, S 342, but board run `run-e87543f88807` measured T 0.024166 s, M 9,973,760 bytes, K 42.31. The prior 12-worker best remains `run-d8ffdb6e4d14` at T 0.019 s, M 10.0 MB, S 367, K 47.28. The small memory change did not pay for the slower run.
 

@@ -41,9 +41,6 @@ const ID_SHIFT: u32 = 20;
 const BLOCK: usize = 1024;
 const BIG_BLOCK: usize = 32;
 
-/// Bytes of the log that a thread takes out of the address space at a time, at the end.
-const RELEASE: usize = 1 << 23;
-
 /// Spare bytes after the log, so that a load at a short fixed distance from a line needs no check of
 /// its own. Whatever a line holds, the farthest load ends 185 bytes after its start: at most 44 to the
 /// endpoint, two blocks to find its closing space, and 13 past that for the latency's load.
@@ -527,7 +524,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         order: Mutex::default(),
     };
     let digits: Vec<usize> = (0..1024).collect();
-    let (cursor, next_out, released) = (AtomicUsize::new(0), Mutex::new(0), AtomicUsize::new(0));
+    let (cursor, next_out) = (AtomicUsize::new(0), Mutex::new(0));
     // A lower bound on the log position of any line each thread may yet read.
     let reached: Vec<_> = (0..threads).map(|_| AtomicUsize::new(usize::MAX)).collect();
     // Tying a segment's size to the thread count makes the SD_THREADS test sweep move every cut, down to cuts
@@ -543,6 +540,7 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
         // records from the start, in pages that stay untouched until a large hour needs them.
         let finisher = me < 4;
         let mut scratch = Vec::with_capacity(usize::from(finisher) << 18);
+        let mut last = [0, 0];
         let next_segment = || loop {
             // Any segment that this thread takes from here on starts at or past this mark.
             reached[me].store(cursor.load(Relaxed), Release);
@@ -572,22 +570,25 @@ fn round(log: &[u8], out: &Path, threads: usize, share: usize) -> bool {
             let start = cursor.fetch_add(segment, Relaxed);
             // At the end, once more with the mark at the end, which lets go of the last hours.
             if start < end || reached[me].load(Relaxed) >= end && hour >= HOURS {
-                return (start < end).then_some([start, (start + segment).min(end)]);
+                // Exit would take the log's pages out of the address space one by one on the last thread,
+                // and the clock counts that, so each thread gives back each segment it's done with. A page
+                // that another thread's line still reaches just comes back from the file. On a small log
+                // a segment isn't whole pages: the call fails, and leaves them for exit.
+                // SAFETY: the log's pages come back from the file on the next read, with the same bytes.
+                unsafe {
+                    madvise(
+                        log[last[0]..].as_ptr().cast_mut(),
+                        last[1] - last[0],
+                        MADV_DONTNEED,
+                    )
+                };
+                last = [start, (start + segment).min(end)];
+                return (start < end).then_some(last);
             }
             // The wait gives up its core: a spinning thread would keep the one it waits for off a shared core.
             thread::yield_now();
         };
         parse(log, &table, &hours, next_segment);
-        // Exit would take the log's pages out of the address space one by one on the last thread, and
-        // the clock counts that, so whichever threads are done share the work first. From the log's
-        // start on, as threads still reading are near its end, and a page taken from them just comes back.
-        let claims = (0..).map(|_| released.fetch_add(RELEASE, Relaxed));
-        for at in claims.take_while(|&at| at < end) {
-            let page = log[at..].as_ptr().cast_mut();
-            // SAFETY: the log's pages come back from the file on the next read, with the same bytes. `at`
-            // is a multiple of a page, and a failure would only leave them for exit.
-            unsafe { madvise(page, RELEASE.min(end - at), MADV_DONTNEED) };
-        }
     };
     // This thread is one of them, so that no more threads than CPUs ever want to run: one that starts
     // on a busy CPU can wait there for a whole tick, and then it holds every hour up.

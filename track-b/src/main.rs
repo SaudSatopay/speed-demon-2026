@@ -1506,7 +1506,7 @@ pub extern "C" fn main() -> i32 {
     // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
     // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
-    // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
+    // faults. They start now but wait for the sample, whose new threads need the lock that this holds. An
     // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
     // One more thread starts them and creates the output, so that this one needn't wait for either.
     let helper = thread::spawn(move || {

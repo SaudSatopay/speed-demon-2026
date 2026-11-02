@@ -170,6 +170,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 125 | exp: the scout and the aligned mapping together (`c-ms`) | Step 124's T 0.0190 and step 126's M about 10.0. S 367. 7 runs, K 41.54 (T 0.0245) to 47.28, median 46.70: not better than either part. Rejected | run-a9eeadb78623 | 0.0192 | 10.09 | 83.46 |
 | 126 | Files mapped on a 2 MiB boundary (`c-map`), the final source | Locally page faults fell from 3,094 to 651 and T by 8%, if the box also maps cached huge folios of the file whole. 5 runs, K 46.46 to 47.12, median 47.01, T 0.0194, M 10.06, S 352. T didn't move against step 122, and K's gain is inside its noise, so the box doesn't seem to gain from it. Kept as the best median measured | run-e27dcd226db9 | 0.0194 | 10.06 | 83.61 |
 | 127 | exp: find called from the first pass when a name has no tag in its window, then back to c-map | c-scout gave T 0.0190 for 15 lines, and this asks `find` itself for 4. Median K 45.49 over 3 (44.62, 46.89, 45.49), T 0.0194 to 0.0209, against c-map 46.95 over 8. Rejected | run-d1f33d3aec37 | 0.0204 | 10.2 | — |
+| 128 | exp: bits two to a line, keys apart, 133,000 homes (c-sp1) | Measures the second fill: bits lines are half the size, so the same four huge pages hold far more homes | pending | — | — | — |
 
 ## Decision log
 
@@ -433,6 +434,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D129.** exp: judged over 3 samples against c-map 46.94
 
 **D130.** c-map stays the final source; c-fp rejected
+
+**D131.** Keep only if median beats 46.94 over 3
 
 ## What didn't work
 

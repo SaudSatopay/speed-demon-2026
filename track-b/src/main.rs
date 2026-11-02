@@ -585,6 +585,12 @@ struct Query(bool, u32, u32);
 /// next term's start.
 struct AnchorList(u32, u32, u32); // Where its short checks start, where its long ones do, and its own tally.
 
+/// A tally's place in the plan: the answer it goes into, and the last of that answer's ten smallest
+/// documents when this last saw them, which only falls, so that the documents past it need no lock. Those
+/// fill first, as threads work through the corpus together, and only a thread's own first ten ever get this
+/// far. What each thread has counted is in `Scan::hits`.
+struct Tally(u32, AtomicU32);
+
 /// The queries, and what the sample decided: how each term is stored, and what to check at each term's
 /// occurrences. The threads share this while they scan.
 #[derive(Default)]
@@ -607,9 +613,7 @@ struct Plan<'a> {
     shared_answer: Vec<u32>, // For each query, the answer of the term's tally that adds to it, or NONE.
     // The answers: the queries', in order, then one for each term with a tally, then a spare.
     answers: Vec<Slot>,
-    // The answer each tally goes into. Only a thread's own first ten documents of a tally ever take that
-    // answer's lock. What each thread has counted is in `Scan::hits`.
-    tallies: Vec<u32>,
+    tallies: Vec<Tally>,
 }
 
 /// Puts a document among the smallest of a tally's answer. Returns `TOO_BIG` if it's past the limit, as all
@@ -617,11 +621,13 @@ struct Plan<'a> {
 /// of line lets that check be inlined.
 #[cold]
 fn add_smallest(plan: &Plan, at: usize, doc: u32) -> u64 {
-    let mut answer = plan.answers[plan.tallies[at] as usize].0.lock().unwrap();
-    if doc >= answer.ids[SMALLEST - 1] {
+    let tally = &plan.tallies[at];
+    if doc >= tally.1.load(Relaxed) {
         return TOO_BIG;
     }
+    let mut answer = plan.answers[tally.0 as usize].0.lock().unwrap();
     insert_smallest(&mut answer.ids, doc);
+    tally.1.store(answer.ids[SMALLEST - 1], Relaxed);
     0
 }
 
@@ -827,7 +833,8 @@ fn make_plan(plan: &mut Plan, docs: &[u8], df: Vec<u32>) {
     let checked = checks.iter().map(|&(query, _)| query);
     let blocks = block_term_answers.into_iter().chain(block_queries);
     let tally_answers = checked.chain(query_count..answers).chain(blocks);
-    plan.tallies = tally_answers.collect();
+    let tally = |answer| Tally(answer, AtomicU32::new(NONE));
+    plan.tallies = tally_answers.map(tally).collect();
     let (count, sum, ids) = (0, 0, [NONE; SMALLEST]);
     let blank = |_| Slot(Mutex::new(Answer { count, sum, ids }));
     plan.answers = (0..answers).map(blank).collect();
@@ -1371,7 +1378,7 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
         // SAFETY: each thread's `hits` has every tally.
         let at_hits = |hits: &*const u64| unsafe { *hits.add(at) } & !TOO_BIG;
         let hits: u64 = scans.iter().map(at_hits).sum();
-        let mut answer = plan.answers[plan.tallies[at] as usize].0.lock().unwrap();
+        let mut answer = plan.answers[plan.tallies[at].0 as usize].0.lock().unwrap();
         answer.count += hits >> SUM_BITS;
         answer.sum += hits & ((1 << SUM_BITS) - 1);
     }
@@ -1453,18 +1460,23 @@ pub extern "C" fn main() -> i32 {
     // Sized for the spec's 50,000 queries, whose text holds about one distinct term per 23 bytes: at
     // `TERMS_PER_SET`, the table has room for all of their 75,000 or so.
     // Threads of their own map the corpus's pages ahead of the scan, whose threads would each stop for their
-    // faults. They wait for the parse, whose new threads need the lock that this holds. An old kernel
-    // doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
+    // faults. They start now but wait for the parse, whose new threads need the lock that this holds. An
+    // old kernel doesn't know this advice, MADV_POPULATE_READ, and the scan takes the faults as before.
     // One more thread starts them and creates the output, so that this one needn't wait for either.
     let helper = thread::spawn(move || {
+        let mut mappers = vec![];
+        for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
+            mappers.push(thread::spawn(move || {
+                thread::park();
+                // SAFETY: this only maps pages of the mapping, and a part starts at a page.
+                unsafe { madvise(part.as_ptr(), part.len(), 22) };
+            }));
+        }
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
         // Fresh pages for what the plan and the scan allocate, so that they needn't stop to fault them in.
         drop(std::hint::black_box(vec![1u8; 12 << 20]));
         thread::park();
-        for part in docs.chunks((docs.len() / 4 + 1).next_multiple_of(1 << 12)) {
-            // SAFETY: this only maps pages of the mapping, and a part starts at a page.
-            thread::spawn(move || unsafe { madvise(part.as_ptr(), part.len(), 22) });
-        }
+        mappers.iter().for_each(|mapper| mapper.thread().unpark());
         file
     });
     let mut plan = parse_queries(queries, threads, 1 << 16);

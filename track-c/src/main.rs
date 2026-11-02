@@ -295,25 +295,6 @@ fn find(text: &[u8], start: usize, len: usize) -> Option<usize> {
     None
 }
 
-/// Where a name with no tag in its first window should look: the first slot on its walk with its tag,
-/// or the first free one, which is where it will go if no other thread takes it. Just a guess for
-/// `add_records` to prefetch and compare, so that spilled names skip `find`, and new ones find their
-/// line owned. Slot 0 if its walk finds nothing.
-#[cold]
-fn scout(mut home: usize, hash: u16) -> usize {
-    for _ in 0..TRIES {
-        // SAFETY: a home is below `HOMES`, so 32 below the end of the tags, and the load needs no
-        // alignment.
-        let window = unsafe { std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast()) };
-        let hits = slots_with(window, hash.max(1)) | slots_with(window, 0);
-        if hits != 0 {
-            return (home + hits.trailing_zeros() as usize) * 64;
-        }
-        home = (home + 33 + usize::from(hash)) % HOMES;
-    }
-    0
-}
-
 /// A country's totals, one cache line: its count; lowest amount; id sum; highest amount; amount sum;
 /// name bytes; how many of its records repeat a name; and note bytes. That order keeps sums apart, or
 /// the compiler pairs their additions up as vector instructions, which take more than the two would.
@@ -448,10 +429,7 @@ fn add_records(text: &[u8], listed: &[u32], found: &mut [(u32, u32, u64)], rows:
             // name in 65,536 less than a check.
             let window = std::ptr::read_unaligned(MEMORY.tags.as_ptr().add(home).cast());
             let hits = slots_with(window, tag);
-            let mut guess = (home + hits.trailing_zeros() as usize) * 64;
-            if hits == 0 {
-                guess = scout(home, tag);
-            }
+            let guess = (home + hits.trailing_zeros() as usize) * 64;
             _mm_prefetch::<_MM_HINT_ET0>(words.byte_add(guess).cast());
             let cents = (cents as i32 ^ negative) - negative;
             *slot = (guess as u32, cents as u32, id_region);

@@ -203,6 +203,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 167 | c-ph2 sample 2 | second sample | pending | — | — | — |
 | 168 | c-kp line cuts with end release and tag hops, sample 1 | c-k1 S 341 and c-ph1 T 0.0192 combined; c-ph2 with no release lost, T 0.0228 | pending | — | — | — |
 | 169 | c-kp sample 2 | second sample | pending | — | — | — |
+| 170 | c-kp sample 3 | third sample | pending | — | — | — |
 
 ## Decision log
 
@@ -544,6 +545,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D168.** exp: judged over 3 samples against c-ph1 46.91
 
 **D169.** exp: judged over 3 samples against c-ph1 46.91
+
+**D170.** exp: judged over 3 samples against c-ph1 46.91
 
 ## What didn't work
 

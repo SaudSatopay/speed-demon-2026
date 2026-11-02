@@ -1484,9 +1484,14 @@ fn scan_and_answer(docs: &[u8], plan: &Plan, mut file: &File, progress: &Progres
 pub extern "C" fn main() -> i32 {
     // All of the heap comes from one contiguous region, grown a lot at a time, so that the kernel can
     // back it with huge pages, in far fewer page faults than threads' arenas and small mappings take.
-    // These are M_ARENA_MAX (1), M_MMAP_THRESHOLD (1 GiB) and M_TOP_PAD (64 MiB).
-    let (arenas, mmap_above, top_pad) = (-8, -3, -2);
-    for (param, value) in [(arenas, 1), (mmap_above, 1 << 30), (top_pad, 1 << 26)] {
+    // These are M_ARENA_MAX (1), M_MMAP_THRESHOLD (1 GiB), M_TOP_PAD (64 MiB) and M_TRIM_THRESHOLD (1 GiB).
+    let (arenas, mmap_above, top_pad, trim) = (-8, -3, -2, -1);
+    for (param, value) in [
+        (arenas, 1),
+        (mmap_above, 1 << 30),
+        (top_pad, 1 << 26),
+        (trim, 1 << 30),
+    ] {
         // SAFETY: no thread has started, and these only tune the allocator.
         unsafe { mallopt(param, value) };
     }
@@ -1514,6 +1519,8 @@ pub extern "C" fn main() -> i32 {
             }));
         }
         let file = File::create(format!("{out_dir}/results.txt")).expect("creating results.txt");
+        // Fresh pages for what the plan and the scan allocate, so that they needn't stop to fault them in.
+        drop(std::hint::black_box(vec![1u8; 12 << 20]));
         thread::park();
         mappers.iter().for_each(|mapper| mapper.thread().unpark());
         file

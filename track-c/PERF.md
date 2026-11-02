@@ -204,6 +204,7 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 | 159 | exp: name classes, a prefetch pass between the two passes, lines trimmed (c-l6) | Simpler than c-l5's lookahead | pending | — | — | — |
 | 160 | Back to c-s7, the final source | Name classes reached M 8.15 to 8.45 but T 0.0223 to 0.0239, K 43.06 to 44.53, against c-s7 K 46.73; see the HANDOVER in PROGRESS | pending | — | — | — |
 | 161 | c-l7: name classes, longer classes own their line in the first pass | Bisects why the c-l builds lost 12 percent of T; the suspect is asking for the line late | pending | — | — | — |
+| 162 | Back to c-s7, the final source | c-l7 asked to own the line in the first pass: T 0.0234, M 8.13, S 411, K 43.58, no better than c-l3, so the late request is not what costs the c-l builds their T | pending | — | — | — |
 
 ## Decision log
 
@@ -535,6 +536,8 @@ Every step cites the live-board run that measured it. Numbers marked *local* com
 **D163.** Final source restored; c-l1 to c-l6 and c-n48 rejected or measures
 
 **D164.** Decide on 3 samples against c-s7, which stays final
+
+**D165.** c-s7 stays final at feature freeze
 
 ## What didn't work
 
